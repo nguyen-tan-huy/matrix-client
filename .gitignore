@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Matrix session / sqlite store (device keys, access tokens) — never commit.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+matrix-egui-client-session.json
+
+# Local editor/OS cruft.
+.DS_Store
+*.swp

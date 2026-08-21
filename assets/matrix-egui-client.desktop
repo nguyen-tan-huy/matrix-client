@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Matrix
+Comment=Matrix chat client
+Exec=/home/huyhappy/.local/bin/matrix-egui-client
+Icon=mail-message-new
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupNotify=false
