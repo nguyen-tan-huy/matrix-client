@@ -2444,49 +2444,34 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
     );
 }
 
-/// Live `m.sticker` messages (`Command::SendMeme`, ours or anyone else's).
-/// Without this, a sticker never showed up in an already-open room at
-/// all — `register_new_message_handler` only listens for
+/// Live `m.sticker` messages from *other* people (`Command::SendMeme`
+/// handles ours directly — see its comment for why: this handler's typed
+/// event can't see the `m.relates_to` a thread-targeted sticker carries
+/// at all, `StickerEventContent` has no field for it, so it can never
+/// tell a thread reply from a plain one; `is_own` stickers are skipped
+/// here unconditionally rather than trying to guess). Without this
+/// handler at all, someone else's sticker never showed up in an
+/// already-open room — `register_new_message_handler` only listens for
 /// `m.room.message`, and stickers are a distinct event type, so sending
 /// one looked like it silently did nothing until the room was reloaded
 /// (the point it *would* show, via `convert.rs`'s existing
 /// `TimelineItemContent::Sticker` handling for the initial-load path).
-///
-/// The thread relation `Command::SendMeme` splices into the *outgoing*
-/// raw JSON isn't visible here at all — `StickerEventContent` has no
-/// typed `relates_to` field for serde to populate from the incoming
-/// event — so this can only ever route a sticker into the main timeline,
-/// never a thread panel. `Command::SendMeme` itself handles its own
-/// thread-targeted sends directly instead (it knows the relation it just
-/// sent) and records the event id in `own_thread_stickers`; this handler
-/// skips anything listed there so that same sticker doesn't also show up
-/// a second time, wrongly, in the main timeline. A sticker someone
-/// *else* sends into a thread still has no way to be routed correctly
-/// live here — it'll show in the main timeline until that thread is next
+/// A sticker someone else sends *into a thread* still can't be routed
+/// there live for the same reason `Command::SendMeme` has to handle its
+/// own — it shows in the main timeline instead until that thread is next
 /// opened/reloaded, which reads raw JSON and gets it right.
-fn register_sticker_handler(
-    client: &Client,
-    tx: UnboundedSender<Event>,
-    state: Arc<Mutex<WorkerState>>,
-) {
+fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
     client.add_event_handler(
         move |ev: matrix_sdk::ruma::events::sticker::OriginalSyncStickerEvent,
               room: matrix_sdk::room::Room,
               client: Client| {
             let tx = tx.clone();
-            let state = state.clone();
             async move {
-                if state
-                    .lock()
-                    .await
-                    .own_thread_stickers
-                    .remove(ev.event_id.as_str())
-                {
+                if client.user_id().is_some_and(|id| id == ev.sender) {
                     return;
                 }
 
                 let sender = ev.sender.to_string();
-                let is_own = client.user_id().map(|id| id == ev.sender).unwrap_or(false);
                 let sender_name = room
                     .get_member(&ev.sender)
                     .await
@@ -2509,7 +2494,7 @@ fn register_sticker_handler(
                     reply_to_event_id: None,
                     reply_to_preview: None,
                     thread_count: None,
-                    is_own,
+                    is_own: false,
                     mentions_me: false,
                     reactions: Vec::new(),
                 };
