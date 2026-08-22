@@ -100,6 +100,35 @@ fn raw_media_url(event: &matrix_sdk_ui::timeline::EventTimelineItem) -> Option<S
 pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<TimelineEvent> {
     let event = item.as_event()?;
 
+    // Excludes anything with an `m.thread` relation from the main
+    // timeline, checked generically on the *raw* event JSON regardless of
+    // event type — not just `m.room.message`, which is all the typed
+    // `event_filter` in `Command::LoadTimeline` can ever check (it only
+    // sees ruma's typed `Relation` enum, and that only exists on
+    // `RoomMessageEventContent`). A sticker sent into a thread has no
+    // typed `relates_to` field at all — `StickerEventContent` doesn't
+    // declare one, so ruma silently drops it while decoding, before any
+    // typed check could ever see it, no matter where that check lives.
+    // Reading the raw JSON here instead — the same way Element itself
+    // does — is what actually lets a thread-targeted sticker (or any
+    // other non-`m.room.message` event a thread might one day carry) stay
+    // out of the main room view, matching Element's own behavior exactly
+    // instead of only handling the one event type ruma gives typed
+    // support for.
+    let has_thread_relation = event
+        .latest_json()
+        .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+        .and_then(|v| {
+            v.pointer("/content/m.relates_to/rel_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .as_deref()
+        == Some("m.thread");
+    if has_thread_relation {
+        return None;
+    }
+
     let sender = event.sender().to_string();
     let is_own = client
         .user_id()

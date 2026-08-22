@@ -1130,7 +1130,9 @@ function renderMemePicker(pickerEl, roomId, threadId) {
     } else {
       if (!state.imageRequested.has(img.url)) requestImage(img.url);
     }
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      showToast(`sending :${img.shortcode}:${threadId ? " into thread" : ""}...`);
       send("SendMeme", { room_id: roomId, thread_id: threadId, url: img.url, shortcode: img.shortcode });
       pickerEl.style.display = "none";
     });

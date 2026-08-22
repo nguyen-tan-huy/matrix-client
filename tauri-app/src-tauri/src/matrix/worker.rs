@@ -335,14 +335,6 @@ struct WorkerState {
     /// room_id -> event_id last confirmed read via `Command::MarkRoomRead`,
     /// persisted to `read_state.json` — see that file's doc comment.
     confirmed_read: HashMap<String, String>,
-    /// Event IDs of our own thread-targeted `Command::SendMeme` stickers,
-    /// already pushed as a correctly-routed `Event::ThreadReply` by the
-    /// command handler itself (since `register_sticker_handler`'s typed
-    /// event can't see the thread relation at all — see its doc comment).
-    /// `register_sticker_handler` checks this and skips anything listed
-    /// here, removing it once seen, so that same sticker doesn't *also*
-    /// land a second time as a stray main-timeline message.
-    own_thread_stickers: std::collections::HashSet<String>,
 }
 
 /// Dedicated runtime for `FetchImage`/`PlayVideo`. A room with many images
@@ -395,7 +387,6 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         thread_timelines: HashMap::new(),
         thread_reply_cursors: HashMap::new(),
         confirmed_read: load_read_state(),
-        own_thread_stickers: std::collections::HashSet::new(),
     }));
 
     while let Some(cmd) = rx.recv().await {
@@ -585,7 +576,7 @@ async fn handle(
             register_new_message_handler(&client, tx.clone());
             register_redaction_handler(&client, tx.clone());
             register_reaction_handler(&client, tx.clone());
-            register_sticker_handler(&client, tx.clone(), state.clone());
+            register_sticker_handler(&client, tx.clone());
             crate::matrix::verification::register_verification_handler(&client, tx.clone());
 
             tracing::info!("starting sync loop");
@@ -1441,87 +1432,87 @@ async fn handle(
         }
 
         Command::SendMeme { room_id, thread_id, url, shortcode } => {
+            tracing::info!(room_id, ?thread_id, url, shortcode, "SendMeme: command received");
             let client = get_client(&state).await?;
             let room = client
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
 
-            let mut content = serde_json::json!({
-                "body": shortcode,
-                "url": url,
-                "info": {},
-            });
-            // Stickers have no typed relation support in this SDK version
-            // (`StickerEventContent` carries no `m.relates_to` at all), so
-            // this is spliced in as raw JSON instead — same
-            // fallback-relation shape a real thread reply gets, marked
-            // `is_falling_back: true` since sending a sticker isn't "reply
-            // to this specific message", just "post into this thread".
-            if let Some(thread_id) = &thread_id {
-                content["m.relates_to"] = serde_json::json!({
-                    "rel_type": "m.thread",
-                    "event_id": thread_id,
-                    "is_falling_back": true,
-                    "m.in_reply_to": { "event_id": thread_id },
+            if let Some(thread_id) = thread_id {
+                // A real `m.sticker` has no typed relation support at all
+                // in this SDK version (`StickerEventContent` doesn't
+                // declare an `m.relates_to` field, so serde silently
+                // drops anything spliced into that raw JSON key on
+                // deserialize) — not just in the live-echo handler, but
+                // in matrix-sdk-ui's own `Timeline` object too, which
+                // means the main timeline's own thread-reply filter (see
+                // `Command::LoadTimeline`'s `event_filter`, which only
+                // ever recognizes `m.room.message` + `Relation::Thread`)
+                // could never have excluded a thread-targeted sticker
+                // either — it would keep showing up in the main timeline
+                // no matter which of *our* handlers got fixed. Sending a
+                // typed `m.room.message` image instead — the exact same
+                // shape `Command::SendImage`'s own thread branch already
+                // uses — routes correctly everywhere that already
+                // understands `Relation::Thread` properly: this filter,
+                // `register_new_message_handler`'s live echo, and the
+                // `/relations` thread reload path.
+                use matrix_sdk::ruma::events::relation::Thread;
+                use matrix_sdk::ruma::events::room::message::{
+                    ImageMessageEventContent, MessageType, Relation, RoomMessageEventContent,
+                };
+                let mxc_url = matrix_sdk::ruma::OwnedMxcUri::from(url);
+                let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
+                let mut content = RoomMessageEventContent::new(MessageType::Image(
+                    ImageMessageEventContent::plain(shortcode, mxc_url),
+                ));
+                content.relates_to = Some(Relation::Thread(Thread::without_fallback(root_event_id)));
+                room.send(content).await?;
+            } else {
+                let content = serde_json::json!({
+                    "body": shortcode.clone(),
+                    "url": url.clone(),
+                    "info": {},
                 });
-            }
-
-            let response = room.send_raw("m.sticker", content).await?;
-
-            // Push the event ourselves rather than relying on
-            // `register_sticker_handler`'s live echo to route it —
-            // that handler's typed event can't see the `m.relates_to`
-            // spliced in above at all (`StickerEventContent` doesn't
-            // declare that field, so serde just drops it on
-            // deserialize), so it can never tell a thread-targeted
-            // sticker from a plain one. Doing it here instead, where the
-            // relation is still known, means `register_sticker_handler`
-            // can just skip every `is_own` sticker unconditionally (see
-            // its doc comment) — no race between "did our own emit above
-            // finish before the live echo arrived", which a
-            // remember-this-event-id flag would still have been exposed
-            // to (the echo can arrive on the sync task before this
-            // command handler gets back to recording anything).
-            let sender = client.user_id().map(|id| id.to_string()).unwrap_or_default();
-            let sender_name = match client.user_id() {
-                Some(id) => room
-                    .get_member(id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.display_name().map(|n| n.to_string()))
-                    .unwrap_or_else(|| sender.clone()),
-                None => sender.clone(),
-            };
-            let event = crate::models::TimelineEvent {
-                event_id: response.event_id.to_string(),
-                sender,
-                sender_name,
-                body: shortcode,
-                msg_type: "image".to_string(),
-                media_url: Some(url),
-                media_mime: None,
-                media_encryption: None,
-                thumbnail_url: None,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0),
-                reply_to_event_id: None,
-                reply_to_preview: None,
-                thread_count: None,
-                is_own: true,
-                mentions_me: false,
-                reactions: Vec::new(),
-            };
-            match thread_id {
-                Some(thread_id) => {
-                    tx.send(Event::ThreadReply { room_id, thread_root_id: thread_id, event })
-                        .ok();
-                }
-                None => {
-                    tx.send(Event::NewMessage { room_id, event }).ok();
-                }
+                let response = room.send_raw("m.sticker", content).await?;
+                // `register_sticker_handler` skips our own sends
+                // unconditionally (see its doc comment), so push this one
+                // ourselves — same reasoning as the thread branch not
+                // needing to (there, `register_new_message_handler`
+                // already does this for a typed `Relation::Thread` image).
+                let sender = client.user_id().map(|id| id.to_string()).unwrap_or_default();
+                let sender_name = match client.user_id() {
+                    Some(id) => room
+                        .get_member(id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|m| m.display_name().map(|n| n.to_string()))
+                        .unwrap_or_else(|| sender.clone()),
+                    None => sender.clone(),
+                };
+                let event = crate::models::TimelineEvent {
+                    event_id: response.event_id.to_string(),
+                    sender,
+                    sender_name,
+                    body: shortcode,
+                    msg_type: "image".to_string(),
+                    media_url: Some(url),
+                    media_mime: None,
+                    media_encryption: None,
+                    thumbnail_url: None,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                    reply_to_event_id: None,
+                    reply_to_preview: None,
+                    thread_count: None,
+                    is_own: true,
+                    mentions_me: false,
+                    reactions: Vec::new(),
+                };
+                tx.send(Event::NewMessage { room_id, event }).ok();
             }
         }
 
@@ -2132,10 +2123,19 @@ async fn parse_raw_message_event(
     // frontend specifically checks for to render an `<img>` — it just
     // showed the filename as plain text instead, indistinguishable from
     // the image never having loaded at all.
+    // A sticker's content has no `msgtype` field at all (just `body`/
+    // `url`/`info` directly) — without checking the event's own top-level
+    // `type` too, one always fell into the generic `(_, Some(_)) =>
+    // "file"` case below, which the frontend renders as a filename link
+    // rather than the actual picture (its own "does this filename look
+    // like an image" fallback never matches, since a sticker's `body` is
+    // a shortcode like "cat-wave", not "cat-wave.png").
+    let is_sticker = value.get("type").and_then(|v| v.as_str()) == Some("m.sticker");
     let msg_type = match (msgtype, &media_url) {
         (Some("m.notice"), _) => "notice".to_string(),
         (Some("m.image"), Some(_)) => "image".to_string(),
         (Some("m.video"), Some(_)) => "video".to_string(),
+        (None, Some(_)) if is_sticker => "image".to_string(),
         (_, Some(_)) => "file".to_string(),
         (Some(t), None) if t == "m.image" || t == "m.video" || t == "m.file" => {
             tracing::debug!(
