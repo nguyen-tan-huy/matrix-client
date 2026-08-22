@@ -1693,10 +1693,6 @@ async fn refresh_rooms(
             Some(timeline) => timeline.latest_event().await,
             None => None,
         };
-        let latest_event_id = match &timeline_latest {
-            Some(event) => event.event_id().map(|id| id.to_owned()),
-            None => room.latest_event().and_then(|e| e.event_id()),
-        };
         let (last_message, last_message_ts) = match &timeline_latest {
             Some(event) => (
                 event.content().as_message().map(|m| m.body().to_string()),
@@ -1731,31 +1727,32 @@ async fn refresh_rooms(
             // right after opening the app (or before any new activity)
             // it reads 0 even for rooms that were already unread before
             // launch. `unread_notification_counts()` comes straight from
-            // the server's sync response field and is present/restored
-            // from the very first sync (and the persisted store), so it's
-            // what actually shows unread state on cold start. Take
-            // whichever is higher so encrypted-room precision still wins
-            // once live sync has had a chance to recompute it.
-            //
-            // Except: if the latest event in the room is exactly the one
-            // `MarkRoomRead` last confirmed read (persisted in
-            // `read_state.json`, so this also holds across a restart),
-            // trust that instead — both of the above can still read the
-            // stale pre-receipt count for a while, since the server only
-            // echoes the lower count back on some *later* sync response,
-            // which may not have happened yet (or may not have happened
-            // before the app was closed last time).
+            // the server's sync response field, and is what actually
+            // shows unread state on cold start *for a room that's never
+            // been marked read* — but it turns out NOT to reliably
+            // persist the lower (post-receipt) count across a restart
+            // (confirmed empirically: a room correctly read this session,
+            // with a `read_state.json` entry to prove it, still reads a
+            // stale nonzero `notification_count` on the very next
+            // restart) — so for any room `MarkRoomRead` has *ever*
+            // confirmed read (an entry here, regardless of whether it
+            // still matches the current latest event — matching it
+            // exactly would need `Room::latest_event()`/a loaded
+            // `Timeline`, neither reliably available for a room that
+            // hasn't been opened this session, which is exactly the case
+            // right after a restart), trust `num_unread_messages()` alone
+            // instead: it correctly starts at 0 and only counts events
+            // this session's sync actually processes, including the
+            // catch-up sync right after a restart, so a genuinely new
+            // message that arrived while the app was closed still shows
+            // up once that catch-up completes — just not calling the
+            // stale server count as reinforcement anymore.
             unread_count: {
-                let confirmed = confirmed_read.get(room.room_id().as_str());
-                let already_read = matches!(
-                    (latest_event_id.as_ref(), confirmed),
-                    (Some(latest_id), Some(confirmed)) if latest_id.as_str() == confirmed
-                );
-                if already_read {
-                    0
+                let num_unread = room.num_unread_messages();
+                if confirmed_read.contains_key(room.room_id().as_str()) {
+                    num_unread
                 } else {
-                    room.num_unread_messages()
-                        .max(room.unread_notification_counts().notification_count)
+                    num_unread.max(room.unread_notification_counts().notification_count)
                 }
             },
             is_encrypted: room.is_encrypted().await.unwrap_or(false),
