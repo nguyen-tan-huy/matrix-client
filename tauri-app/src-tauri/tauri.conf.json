@@ -1,0 +1,20 @@
+{
+  "productName": "Matrix",
+  "version": "0.1.0",
+  "identifier": "com.example.matrixtauriclient",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Matrix",
+        "width": 1100,
+        "height": 720,
+        "decorations": false
+      }
+    ]
+  }
+}

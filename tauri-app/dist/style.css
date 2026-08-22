@@ -1,0 +1,581 @@
+/* Light by default, dark when the OS says so — both follow the same
+ * pastel accent/danger hues, only the background/text/border pair swaps. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --bg-alt: #f2f2f4;
+  --border: #dcdce0;
+  --text: #111114;
+  --text-weak: #767680;
+  --accent: #93b7e6;
+  --accent-strong: #6f9bd1;
+  --danger: #e6919c;
+  --radius: 8px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0d10;
+    --bg-alt: #19181d;
+    --border: #322f38;
+    --text: #f5f4f7;
+    --text-weak: #9a95a5;
+    --accent-strong: #a8cbf5;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
+  font-size: 14px;
+}
+
+button, input {
+  font-family: inherit;
+  font-size: inherit;
+  background: var(--bg-alt);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+}
+
+button {
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { color: var(--text-weak); cursor: default; }
+
+#login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+.login-box { width: 320px; }
+.login-box h2 { text-align: center; font-weight: normal; }
+.login-box label { display: block; margin-top: 10px; color: var(--text-weak); font-size: 12px; }
+.login-box input { width: 100%; margin-top: 2px; }
+.login-box button { width: 100%; margin-top: 14px; }
+.login-error { color: var(--danger); margin-top: 10px; font-size: 12px; }
+.login-sep { text-align: center; color: var(--text-weak); margin: 14px 0; font-size: 12px; }
+
+#chat-screen {
+  display: none;
+  height: 100%;
+}
+#chat-screen.active { display: flex; }
+#login-screen.hidden { display: none; }
+
+#room-list {
+  width: 360px;
+  min-width: 160px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.resizer {
+  width: 4px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: var(--border);
+}
+.resizer:hover, .resizer.dragging { background: var(--accent); }
+#room-list-header {
+  padding: 8px;
+  color: var(--text-weak);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+#room-list-header-actions { display: flex; gap: 4px; }
+.small-btn { font-size: 11px; padding: 2px 6px; }
+#space-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+#space-picker:empty { display: none; border: none; padding: 0; }
+#space-picker button { font-size: 11px; padding: 2px 6px; white-space: nowrap; }
+#space-picker button.selected {
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+  background: rgba(147, 183, 230, 0.18);
+  font-weight: bold;
+}
+#room-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
+#room-filter { flex: 1; margin: 0; }
+#btn-unread-only { flex-shrink: 0; }
+#btn-unread-only.selected {
+  border-color: var(--accent-strong);
+  color: var(--accent-strong);
+  background: rgba(147, 183, 230, 0.18);
+  font-weight: bold;
+}
+#room-list-items {
+  overflow-y: auto;
+  flex: 1;
+}
+.room-row {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 6px;
+}
+.room-row:hover { background: var(--bg-alt); }
+.room-row.selected { background: var(--bg-alt); border-left: 2px solid var(--accent); }
+.room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-name.unread { font-weight: bold; }
+.room-preview { color: var(--text-weak); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-badge {
+  background: var(--danger);
+  color: #6b3540;
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.invite-row {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.invite-row .actions { margin-top: 6px; display: flex; gap: 6px; }
+.invite-row button { font-size: 12px; padding: 2px 6px; }
+
+#main-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+#timeline-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-weight: bold;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+#timeline-header-actions { display: flex; gap: 6px; align-items: center; font-weight: normal; }
+#notification-mode { font-size: 11px; padding: 2px 4px; }
+#room-menu-wrap { position: relative; }
+#room-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 10;
+  min-width: 140px;
+}
+#room-menu button, #room-menu select { width: 100%; text-align: left; }
+
+#meme-picker-wrap, #thread-meme-picker-wrap { position: relative; }
+#meme-picker, #thread-meme-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+  max-width: 260px;
+  max-height: 220px;
+  overflow-y: auto;
+  z-index: 10;
+}
+.meme-cell-wrap { position: relative; }
+.meme-cell {
+  width: 36px;
+  height: 36px;
+  padding: 2px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.meme-cell-remove {
+  visibility: hidden;
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 15px;
+  height: 15px;
+  line-height: 13px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg);
+  color: var(--danger);
+  font-size: 11px;
+  cursor: pointer;
+}
+.meme-cell-wrap:hover .meme-cell-remove { visibility: visible; }
+.meme-cell-remove:hover { border-color: var(--danger); }
+.meme-cell:hover { border-color: var(--accent); background: var(--bg-alt); }
+.meme-cell img { max-width: 100%; max-height: 100%; }
+.meme-empty {
+  grid-column: 1 / -1;
+  width: 200px;
+  padding: 8px;
+  color: var(--text-weak);
+  font-size: 11px;
+  text-align: center;
+}
+.meme-add-cell { color: var(--text-weak); font-size: 16px; font-weight: bold; }
+.meme-add-cell:hover { color: var(--accent); }
+.meme-add-form {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 200px;
+  font-size: 11px;
+}
+.meme-add-form input[type="text"] { width: 100%; }
+.meme-add-form label { display: flex; align-items: center; gap: 4px; color: var(--text-weak); }
+.meme-add-form label input { width: auto; }
+.meme-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
+#summary-box {
+  margin: 6px 12px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+#summary-box .summary-title { font-weight: bold; color: var(--text-weak); }
+#timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+#timeline-placeholder {
+  color: var(--text-weak);
+  text-align: center;
+  margin-top: 40px;
+}
+#load-more-row { text-align: center; color: var(--text-weak); font-size: 12px; padding: 4px; }
+#load-more-row button { font-size: 11px; }
+/* Message content leads, sender is secondary, own messages sit on the
+ * right — a chat-bubble layout rather than a flat sender-first list. */
+.msg-row {
+  display: flex;
+  margin-bottom: 8px;
+}
+.msg-row.own { justify-content: flex-end; }
+.msg-row.other { justify-content: flex-start; }
+.msg-row.grouped { margin-bottom: 2px; }
+
+.msg-col {
+  display: flex;
+  flex-direction: column;
+  position: relative; /* anchors `.actions`, positioned absolutely — see its comment */
+  /* A percentage max-width on `.bubble` itself wouldn't resolve here —
+   * `.msg-col` has no definite width of its own to be a percentage of
+   * (it shrinks to fit its content, which is circular). `.msg-row` does
+   * have one (it fills the timeline), so the cap lives here instead. */
+  max-width: 62%;
+  min-width: 0;
+}
+.msg-row.own .msg-col { align-items: flex-end; }
+.msg-row.other .msg-col { align-items: flex-start; }
+
+.bubble {
+  max-width: 100%;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  position: relative; /* anchors `.reaction-trigger` / `.reaction-picker` */
+}
+.bubble.own { background: rgba(147, 183, 230, 0.25); border-color: var(--accent); }
+.bubble.other { background: var(--bg-alt); }
+.bubble.mentioned {
+  background: rgba(230, 190, 110, 0.28);
+  border-color: #d9a94a;
+  border-left: 3px solid #d9a94a;
+}
+
+/* Group chats mix messages from many people — the sender name needs to
+ * stand out (bold, its own color) rather than blend in as secondary
+ * metadata, and the message content sits indented under it so a whole
+ * run of consecutive messages from one person visibly "belongs" to the
+ * name above rather than reading as a flat, ownerless list. */
+.bubble.other { padding-left: calc(10px + 1cm); }
+.bubble .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-1cm); }
+.bubble .body { white-space: pre-wrap; word-wrap: break-word; }
+.bubble .body p { margin: 0 0 4px 0; }
+.bubble .body p:last-child { margin-bottom: 0; }
+.bubble .body code { background: var(--bg); padding: 0 3px; }
+.bubble .body pre { background: var(--bg); padding: 6px; overflow-x: auto; }
+.bubble .body a { color: var(--accent-strong); }
+.bubble img { max-width: 280px; max-height: 280px; display: block; cursor: pointer; }
+.image-placeholder {
+  width: 200px;
+  padding: 24px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-weak);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+.image-placeholder.failed { cursor: pointer; color: var(--danger); border-color: var(--danger); }
+.image-placeholder.failed:hover { background: rgba(230, 145, 156, 0.2); }
+.bubble .body.notice { color: var(--text-weak); font-style: italic; }
+.bubble .body.deleted { color: var(--text-weak); font-style: italic; }
+.bubble .reply-preview {
+  color: var(--text-weak);
+  font-size: 12px;
+  border-left: 2px solid var(--border);
+  padding-left: 6px;
+  margin-bottom: 4px;
+  cursor: pointer;
+}
+.bubble .reply-preview:hover { border-left-color: var(--accent-strong); color: var(--text); }
+.bubble .meta { color: var(--text-weak); font-size: 10px; text-align: right; margin-top: 3px; }
+
+/* Flash when jumping to a message (reply-preview or a shared matrix.to
+ * link) — a glowing outline alone was too easy to miss, especially right
+ * after switching rooms, so this also pulses the bubble's own background. */
+.jump-highlight .bubble { animation: jump-flash 2.2s ease-out; }
+@keyframes jump-flash {
+  0%, 15% { box-shadow: 0 0 0 3px var(--accent); background-color: rgba(147, 183, 230, 0.5); }
+  100% { box-shadow: 0 0 0 3px transparent; background-color: transparent; }
+}
+.thread-badge {
+  margin-top: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--accent-strong);
+  color: var(--accent-strong);
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-block;
+}
+.thread-badge:hover { background: rgba(147, 183, 230, 0.25); }
+
+/* A small badge overlapping the bubble's bottom-right corner, not a row
+ * inside it — same floating spot `.reaction-trigger` uses for a bubble
+ * with no reactions yet, so reacting to a message never shifts anything
+ * else in the bubble around or adds a chunk of dead space around a
+ * single pill. */
+.reactions {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 3px;
+  position: absolute;
+  bottom: -9px;
+  right: 8px;
+}
+.reaction-pill {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.reaction-pill:hover { border-color: var(--accent); }
+.reaction-pill.mine {
+  border-color: var(--accent-strong);
+  background: var(--bg);
+  color: var(--accent-strong);
+}
+/* Hidden until hover, same as `.reaction-trigger` — only the pills
+ * themselves (the actual reaction data) stay always visible. */
+.reaction-add {
+  visibility: hidden;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-weak);
+  cursor: pointer;
+}
+.msg-row:hover .reaction-add { visibility: visible; }
+.reaction-add:hover { border-color: var(--accent); color: var(--accent); }
+.reaction-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 4px;
+  display: flex;
+  gap: 2px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  z-index: 10;
+}
+/* Floating corner icon for a bubble with no reactions yet — costs no
+ * layout space (only ever shown on hover, same idea as `.actions`),
+ * instead of `renderReactions`'s old always-there empty pill row. */
+.reaction-trigger {
+  visibility: hidden;
+  position: absolute;
+  bottom: -9px;
+  right: 8px;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-weak);
+  cursor: pointer;
+}
+.msg-row:hover .reaction-trigger { visibility: visible; }
+.reaction-trigger:hover { border-color: var(--accent); color: var(--accent); }
+
+.reaction-picker button {
+  font-size: 15px;
+  padding: 2px 5px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.reaction-picker button:hover { background: var(--bg-alt); }
+
+/* A side gutter, not a row below the bubble — and hidden via `visibility`
+ * rather than `display`, so its space stays reserved at all times. Toggling
+ * `display` made every hover shift the whole message list vertically
+ * (whatever was below jumped up when the actions row collapsed back to
+ * nothing); `visibility` just fades the same fixed-size gutter in and out
+ * in place. */
+/* Absolutely positioned relative to `.msg-col`, just outside the bubble's
+ * own box — so stacking several text labels vertically (needed for them
+ * to fit at all in a narrow container like the thread panel) can never
+ * inflate a short one-line message's row height, and hovering can never
+ * shift anything below it either, no matter how it's toggled. */
+.msg-row .actions {
+  visibility: hidden;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  font-size: 11px;
+  color: var(--text-weak);
+}
+.msg-row.other .actions { left: 100%; align-items: flex-start; margin-left: 6px; }
+.msg-row.own .actions { right: 100%; align-items: flex-end; margin-right: 6px; }
+.msg-row:hover .actions { visibility: visible; }
+.msg-row .actions a { color: var(--text-weak); cursor: pointer; text-decoration: underline; white-space: nowrap; }
+.msg-row .actions a:hover { color: var(--accent-strong); }
+
+#reply-indicator, #edit-indicator {
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text-weak);
+  display: flex;
+  justify-content: space-between;
+}
+#reply-indicator a, #edit-indicator a { color: var(--text-weak); cursor: pointer; text-decoration: underline; }
+
+#mention-suggestions, #thread-mention-suggestions {
+  margin: 0 12px;
+  border: 1px solid var(--border);
+  max-height: 140px;
+  overflow-y: auto;
+}
+.mention-item { padding: 4px 8px; cursor: pointer; font-size: 12px; }
+.mention-item:hover, .mention-item.active { background: var(--bg-alt); }
+
+#pending-image-preview { padding: 6px 12px; }
+#pending-image-preview img, #thread-pending-image-preview img { max-height: 120px; display: block; }
+#pending-image-preview .actions, #thread-pending-image-preview .actions { margin-top: 4px; display: flex; gap: 6px; }
+
+#compose-row {
+  border-top: 1px solid var(--border);
+  padding: 8px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+#compose-input { flex: 1; }
+
+#side-panel {
+  width: 340px;
+  min-width: 220px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#side-panel-header {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: bold;
+}
+#side-panel-body { overflow-y: auto; flex: 1; padding: 8px; }
+/* Same look as a message bubble in the timeline — bold, per-sender
+ * colored name up top, content indented under it — instead of reading as
+ * a plain flat list unrelated to the chat UI it's previewing. */
+.thread-row {
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  padding: 6px 10px 6px calc(10px + 0.5cm);
+  margin-bottom: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.thread-row:hover { border-color: var(--accent); }
+.thread-row .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-0.5cm); }
+.thread-row .unread-dot { color: #7bc99a; }
+.thread-row-body { white-space: pre-wrap; word-wrap: break-word; }
+.thread-row-meta { color: var(--text-weak); margin-top: 3px; }
+.thread-room-name { color: var(--text-weak); font-size: 11px; margin: 8px 0 2px; }
+
+.dialog-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  display: flex; align-items: center; justify-content: center;
+}
+.dialog-box {
+  background: var(--bg); border: 1px solid var(--border);
+  padding: 16px; width: 320px;
+  border-radius: var(--radius);
+}
+.dialog-box h3 { margin-top: 0; font-weight: normal; }
+.dialog-box label { display: block; margin-top: 10px; font-size: 12px; color: var(--text-weak); }
+.dialog-box input[type=text], .dialog-box input:not([type]) { width: 100%; margin-top: 2px; }
+.dialog-box .checkbox-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.dialog-box .checkbox-row input { width: auto; }
+.dialog-box .actions { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }

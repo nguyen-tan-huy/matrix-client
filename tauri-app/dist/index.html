@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Matrix</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-box">
+    <h2>matrix login</h2>
+    <label>homeserver</label>
+    <input id="login-homeserver" value="https://matrix.org" />
+    <label>username</label>
+    <input id="login-username" />
+    <label>password</label>
+    <input id="login-password" type="password" />
+    <div id="login-error" class="login-error" style="display:none;"></div>
+    <button id="login-submit">sign in</button>
+    <div class="login-sep">— or —</div>
+    <button id="login-oauth">continue with sso / oauth</button>
+  </div>
+</div>
+
+<div id="chat-screen">
+  <div id="room-list">
+    <div id="room-list-header">
+      <span>CHATS</span>
+      <div id="room-list-header-actions">
+        <button id="btn-security" class="small-btn" title="security">[sec]</button>
+        <button id="btn-create-room" class="small-btn" title="create room or space">[+]</button>
+        <button id="btn-global-threads" class="small-btn" title="threads with new replies, across all rooms">[ threads ]</button>
+      </div>
+    </div>
+    <div id="space-picker"></div>
+    <div id="room-filter-row">
+      <input id="room-filter" placeholder="search rooms..." />
+      <button id="btn-unread-only" class="small-btn" title="show only rooms with unread messages">[ unread ]</button>
+    </div>
+    <div id="room-list-items"></div>
+  </div>
+  <div id="resizer-left" class="resizer"></div>
+  <div id="main-panel">
+    <div id="timeline-header">
+      <span id="timeline-title">select a conversation</span>
+      <div id="timeline-header-actions" style="display:none;">
+        <button id="btn-mark-read" class="small-btn" title="mark this room as read">[ mark read ]</button>
+        <button id="btn-room-threads" class="small-btn">[ threads ]</button>
+        <div id="room-menu-wrap">
+          <button id="btn-room-menu" class="small-btn">[ ⋯ ]</button>
+          <div id="room-menu" style="display:none;">
+            <button id="btn-invite" class="small-btn">[ invite ]</button>
+            <button id="btn-leave-room" class="small-btn">[ leave ]</button>
+            <select id="notification-mode">
+              <option value="all">🔔 all</option>
+              <option value="mentions">🔔 mentions</option>
+              <option value="mute">🔇 mute</option>
+            </select>
+            <button id="btn-summarize" class="small-btn">[ summarize ]</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="summary-box" style="display:none;"></div>
+    <div id="timeline">
+      <div id="timeline-placeholder">select a conversation</div>
+    </div>
+    <div id="reply-indicator" style="display:none;"></div>
+    <div id="edit-indicator" style="display:none;"></div>
+    <div id="mention-suggestions" style="display:none;"></div>
+    <div id="pending-image-preview" style="display:none;"></div>
+    <div id="compose-row" style="display:none;">
+      <button id="btn-attach" class="small-btn" title="send an image">📎</button>
+      <div id="meme-picker-wrap">
+        <button id="btn-meme" class="small-btn" title="send a custom emoji/meme">🐸</button>
+        <div id="meme-picker" style="display:none;"></div>
+      </div>
+      <input id="compose-input" placeholder="message... (@ to mention)" />
+      <button id="compose-send">send</button>
+      <input type="file" id="file-input" accept="image/*" style="display:none;" />
+      <input type="file" id="import-keys-file-input" accept=".txt" style="display:none;" />
+    </div>
+  </div>
+  <div id="resizer-right" class="resizer" style="display:none;"></div>
+  <div id="side-panel" style="display:none;"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

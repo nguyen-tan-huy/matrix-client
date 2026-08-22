@@ -1,6 +1,7 @@
-/target
+**/target
 **/*.rs.bk
 *.pdb
+node_modules/
 
 # Matrix session / sqlite store (device keys, access tokens) — never commit.
 *.db
