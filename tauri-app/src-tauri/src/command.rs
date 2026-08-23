@@ -34,6 +34,13 @@ pub enum Command {
     ListThreads {
         room_id: String,
     },
+    /// Loads the next (older-activity) page of a room's thread list,
+    /// continuing from wherever `ListThreads`'s first page (or the
+    /// previous `LoadMoreThreads` call) left off. Mirrors
+    /// `LoadMoreThreadReplies`/`PaginateBack`.
+    LoadMoreThreads {
+        room_id: String,
+    },
     /// Fetches the room's joined member list, for the @mention autocomplete
     /// in the compose box.
     ListMembers {
@@ -155,6 +162,17 @@ pub enum Command {
     /// can't decode (HEIC/HEIF from an iPhone, TIFF, ...) — those would
     /// otherwise just render as the browser's broken-image icon.
     OpenMediaExternally {
+        mxc_uri: String,
+        filename: String,
+        media_encryption: Option<String>,
+    },
+    /// Downloads an attachment (image/video/file) via `client.media()` and
+    /// saves it into the user's Downloads folder (falling back to home if
+    /// the OS has no such directory configured), rather than the temp file
+    /// `PlayVideo`/`OpenMediaExternally` use — this is a real "save a copy"
+    /// action, so the file needs to survive past this session. Answered
+    /// with `Event::MediaDownloaded` or `Event::Error`.
+    DownloadMedia {
         mxc_uri: String,
         filename: String,
         media_encryption: Option<String>,

@@ -35,7 +35,7 @@ html, body {
   font-size: 14px;
 }
 
-button, input {
+button, input, textarea {
   font-family: inherit;
   font-size: inherit;
   background: var(--bg-alt);
@@ -136,9 +136,20 @@ button:disabled { color: var(--text-weak); cursor: default; }
   justify-content: space-between;
   align-items: baseline;
   gap: 6px;
+  /* Same reasoning as `.msg-row` (see its comment) — an account with
+   * thousands of rooms means thousands of these, and without this,
+   * WebKitGTK re-does style/layout/paint for every one of them on every
+   * re-render even though only a screenful is ever visible. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 37px;
 }
 .room-row:hover { background: var(--bg-alt); }
 .room-row.selected { background: var(--bg-alt); border-left: 2px solid var(--accent); }
+/* Arrow-key highlight while navigating search results from the room-filter
+ * box — distinct from `.selected` (the actually-open room), which stays a
+ * solid left border so the two don't get visually confused when they
+ * land on different rows at once. */
+.room-row.kbd-active { outline: 1px solid var(--accent-strong); outline-offset: -1px; }
 .room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-name.unread { font-weight: bold; }
 .room-preview { color: var(--text-weak); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -289,6 +300,17 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .msg-row {
   display: flex;
   margin-bottom: 8px;
+  /* Nothing here virtualizes the timeline — every loaded message stays in
+   * the DOM forever, and a room you've paginated back through a lot (or
+   * one with a long-running session) can end up with hundreds of rows.
+   * WebKitGTK's compositor recalculates style/layout/paint for all of them
+   * on every scroll tick without this, which is what "khựng khựng" scroll
+   * actually is. `content-visibility: auto` skips that work entirely for
+   * rows currently off-screen — `contain-intrinsic-size` is just the
+   * placeholder height used for scrollbar math before a row's real size is
+   * known. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 56px;
 }
 .msg-row.own { justify-content: flex-end; }
 .msg-row.other { justify-content: flex-start; }
@@ -348,6 +370,39 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 .image-placeholder.failed { cursor: pointer; color: var(--danger); border-color: var(--danger); }
 .image-placeholder.failed:hover { background: rgba(230, 145, 156, 0.2); }
+.media-wrap { position: relative; display: inline-block; }
+.media-wrap .download-btn { position: absolute; top: 4px; right: 4px; }
+.media-attachment {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+}
+.media-attachment-action {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.media-attachment-action:hover { border-color: var(--accent-strong); }
+.download-btn {
+  flex: none;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text-weak);
+  cursor: pointer;
+}
+.download-btn:hover { color: var(--accent-strong); border-color: var(--accent-strong); }
 .bubble .body.notice { color: var(--text-weak); font-style: italic; }
 .bubble .body.deleted { color: var(--text-weak); font-style: italic; }
 .bubble .reply-preview {
@@ -524,9 +579,37 @@ button:disabled { color: var(--text-weak); cursor: default; }
   padding: 8px;
   display: flex;
   gap: 6px;
-  align-items: center;
+  /* Bottom-aligned, not centered — once the textarea grows past one line
+   * (see `.compose-textarea`) the attach/send buttons should stay level
+   * with its last line, the same way every chat app anchors its send
+   * button, rather than drifting to the vertical center of a tall box. */
+  align-items: flex-end;
 }
-#compose-input { flex: 1; }
+/* Wraps the toolbar + textarea as one flex item so the attach/meme/send
+ * buttons on either side of it don't have to know it's two rows, not one. */
+.compose-editor-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.compose-toolbar { display: flex; gap: 2px; }
+.compose-toolbar .md-btn { font-size: 11px; padding: 1px 6px; }
+.compose-textarea {
+  width: 100%;
+  resize: none;
+  overflow-y: auto;
+  /* One line's worth of padding-adjusted height to start — `input`s the
+   * rest of the app uses land here too, so a bare, un-typed-into box reads
+   * as the same height as before this became a `<textarea>`. Grows with
+   * `autoResizeTextarea()` as content is typed, capped so a long paste
+   * doesn't swallow the whole timeline. */
+  min-height: 30px;
+  max-height: 160px;
+  line-height: 1.4;
+  font-family: inherit;
+}
 
 #side-panel {
   width: 340px;
@@ -579,3 +662,12 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .dialog-box .checkbox-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
 .dialog-box .checkbox-row input { width: auto; }
 .dialog-box .actions { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
+.shortcut-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.shortcut-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.shortcut-table .shortcut-keys {
+  white-space: nowrap;
+  font-family: monospace;
+  color: var(--accent-strong);
+  font-weight: bold;
+  padding-right: 10px;
+}

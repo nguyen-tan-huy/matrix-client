@@ -31,6 +31,7 @@
         <button id="btn-security" class="small-btn" title="security">[sec]</button>
         <button id="btn-create-room" class="small-btn" title="create room or space">[+]</button>
         <button id="btn-global-threads" class="small-btn" title="threads with new replies, across all rooms">[ threads ]</button>
+        <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ ? ]</button>
       </div>
     </div>
     <div id="space-picker"></div>
@@ -76,7 +77,16 @@
         <button id="btn-meme" class="small-btn" title="send a custom emoji/meme">🐸</button>
         <div id="meme-picker" style="display:none;"></div>
       </div>
-      <input id="compose-input" placeholder="message... (@ to mention)" />
+      <div class="compose-editor-wrap">
+        <div class="compose-toolbar" id="compose-toolbar">
+          <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
+          <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
+          <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
+          <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
+          <button type="button" class="md-btn" data-md="link" title="link (Ctrl+K)">link</button>
+        </div>
+        <textarea id="compose-input" class="compose-textarea" rows="1" placeholder="message... (@ to mention, **bold**, *italic*, `code` — shift+enter for a new line)"></textarea>
+      </div>
       <button id="compose-send">send</button>
       <input type="file" id="file-input" accept="image/*" style="display:none;" />
       <input type="file" id="import-keys-file-input" accept=".txt" style="display:none;" />

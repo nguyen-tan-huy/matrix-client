@@ -52,9 +52,23 @@ pub enum Event {
         /// stops issuing further `LoadMoreThreadReplies` requests for it.
         reached_start: bool,
     },
+    /// The first page of a room's thread list — response to
+    /// `Command::ListThreads`. Replaces whatever the UI had for this room
+    /// (a fresh load, not an append — see `ThreadsListAppend` for that).
     ThreadsList {
         room_id: String,
         threads: Vec<TimelineEvent>,
+        /// True once the room's oldest thread has been reached — the UI
+        /// stops issuing further `LoadMoreThreads` requests for it (and
+        /// doesn't show a "load more" control for it in the first place).
+        reached_end: bool,
+    },
+    /// A further (older-activity) page of a room's thread list — response
+    /// to `Command::LoadMoreThreads`. Mirrors `Event::ThreadEventsPrepend`.
+    ThreadsListAppend {
+        room_id: String,
+        threads: Vec<TimelineEvent>,
+        reached_end: bool,
     },
     /// A room's joined members, for the @mention autocomplete. `members` is
     /// `(user_id, display_name)` pairs.
@@ -127,6 +141,11 @@ pub enum Event {
     ImageFetchFailed {
         key: String,
         error: String,
+    },
+    /// `Command::DownloadMedia` succeeded — `path` is the full path the
+    /// file was saved to, for a "saved to ..." toast.
+    MediaDownloaded {
+        path: String,
     },
 
     /// A Space's child room IDs — response to `Command::ListSpaceChildren`.

@@ -18,6 +18,16 @@ const state = {
   spaceChildren: {}, // space_room_id -> [room_id]
   roomFilter: "",
   unreadOnly: false,
+  // Index into the currently-visible (filtered) room list, i.e. the row
+  // arrow-key navigation currently has "selected" — separate from
+  // `selectedRoom` since a keyboard highlight moving through search
+  // results shouldn't open each room it passes over. -1 = nothing
+  // highlighted (mouse-only use never touches this).
+  roomListActiveIndex: -1,
+  // Room IDs in the order they're actually rendered by the last
+  // `renderRooms()` call (post filter/space/unread-only), kept in sync so
+  // arrow-key navigation and Enter-to-open agree with what's on screen.
+  visibleRoomIds: [],
   timelines: {}, // room_id -> [TimelineEvent]
   // Rooms whose full timeline has actually been requested via
   // `LoadTimeline`/gotten an `Event::Timeline` reply — *not* the same as
@@ -53,6 +63,11 @@ const state = {
 
   rightPanel: null, // {kind:'threads-list', scope: roomId|null} | {kind:'thread', roomId, root, events} | {kind:'security'}
   threadsByRoom: {}, // room_id -> [TimelineEvent] (thread roots)
+  // room_id -> true once `Command::ListThreads`/`LoadMoreThreads` has
+  // reached that room's oldest thread — stops issuing further
+  // `LoadMoreThreads` requests for it, and hides its "load more" row.
+  threadsListReachedEnd: new Set(),
+  threadsListPaginationInFlight: new Set(),
   unreadThreads: new Set(), // "room_id|thread_root_id"
   threadCompose: { sending: false },
   threadPaginationReachedStart: new Set(),
@@ -82,6 +97,7 @@ const el = {
   btnSecurity: document.getElementById("btn-security"),
   btnCreateRoom: document.getElementById("btn-create-room"),
   btnGlobalThreads: document.getElementById("btn-global-threads"),
+  btnShortcuts: document.getElementById("btn-shortcuts"),
   timelineTitle: document.getElementById("timeline-title"),
   timelineHeaderActions: document.getElementById("timeline-header-actions"),
   btnMarkRead: document.getElementById("btn-mark-read"),
@@ -100,6 +116,7 @@ const el = {
   pendingImagePreview: document.getElementById("pending-image-preview"),
   composeRow: document.getElementById("compose-row"),
   composeInput: document.getElementById("compose-input"),
+  composeToolbar: document.getElementById("compose-toolbar"),
   composeSend: document.getElementById("compose-send"),
   btnAttach: document.getElementById("btn-attach"),
   btnMeme: document.getElementById("btn-meme"),
@@ -153,9 +170,52 @@ function enterChat() {
 // Room list / spaces / create room
 // =========================================================================
 
+// Debounced — `renderRooms()` rebuilds every visible row from scratch, and
+// on an account with thousands of rooms that's real work (not just paint;
+// see `.room-row`'s `content-visibility` for the paint side of this).
+// Running it on every single keystroke made fast typing itself feel
+// laggy, one rebuild behind each character. A short debounce lets a burst
+// of keystrokes settle before paying for the rebuild once.
+let roomFilterDebounceTimer = null;
 el.roomFilter.addEventListener("input", () => {
   state.roomFilter = el.roomFilter.value;
-  renderRooms();
+  clearTimeout(roomFilterDebounceTimer);
+  roomFilterDebounceTimer = setTimeout(() => {
+    // A fresh search invalidates whichever row was keyboard-highlighted —
+    // the result set is about to change under it. `renderRooms()` clamps
+    // this back down to -1 if it turns out there are no matches at all,
+    // so arrow keys work immediately without an extra keypress to "enter"
+    // the list.
+    state.roomListActiveIndex = 0;
+    renderRooms();
+  }, 120);
+});
+
+el.roomFilter.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    if (state.visibleRoomIds.length === 0) return;
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    const base = state.roomListActiveIndex === -1 ? (delta === 1 ? -1 : 0) : state.roomListActiveIndex;
+    state.roomListActiveIndex =
+      (base + delta + state.visibleRoomIds.length) % state.visibleRoomIds.length;
+    renderRooms();
+    el.roomListItems
+      .querySelector(".room-row.kbd-active")
+      ?.scrollIntoView({ block: "nearest" });
+  } else if (e.key === "Enter") {
+    const roomId = state.visibleRoomIds[state.roomListActiveIndex] ?? state.visibleRoomIds[0];
+    if (roomId) selectRoom(roomId);
+  } else if (e.key === "Escape") {
+    if (el.roomFilter.value) {
+      el.roomFilter.value = "";
+      state.roomFilter = "";
+      state.roomListActiveIndex = -1;
+      renderRooms();
+    } else {
+      el.roomFilter.blur();
+    }
+  }
 });
 
 el.btnUnreadOnly.addEventListener("click", () => {
@@ -164,26 +224,70 @@ el.btnUnreadOnly.addEventListener("click", () => {
   renderRooms();
 });
 
+/** Vietnamese-aware "search ignoring accents" — `normalize("NFD")` peels
+ * off every combining diacritic (Latin base letters only) but leaves "đ"
+ * alone, since it's its own base codepoint rather than "d" + a combining
+ * mark, so that gets a manual substitution first. */
+function stripDiacritics(s) {
+  return s
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+function normalizeForSearch(s) {
+  return stripDiacritics(s).toLowerCase();
+}
+
+/** Space picker ("tags") — the `[ all ]` / space-name row of filter tabs
+ * above the room search box. Uses a roving `tabindex` (one real tab stop,
+ * Left/Right moves it) rather than every button being tabbable, the
+ * standard pattern for a tab-like button group — see its keydown handler
+ * below. */
 function renderSpacePicker() {
   const spaces = state.rooms.filter((r) => r.is_space && !r.is_invite);
   el.spacePicker.innerHTML = "";
   if (spaces.length === 0) return;
 
-  const allBtn = document.createElement("button");
-  allBtn.textContent = "[ all ]";
-  allBtn.className = state.selectedSpace === null ? "selected" : "";
-  allBtn.addEventListener("click", () => selectSpace(null));
-  el.spacePicker.appendChild(allBtn);
+  const entries = [{ id: null, label: "[ all ]", title: "all rooms" }, ...spaces.map((s) => ({
+    id: s.room_id,
+    label: s.name,
+    title: s.name,
+  }))];
 
-  for (const space of spaces) {
+  for (const entry of entries) {
     const btn = document.createElement("button");
-    btn.textContent = space.name;
-    btn.title = space.name;
-    btn.className = state.selectedSpace === space.room_id ? "selected" : "";
-    btn.addEventListener("click", () => selectSpace(space.room_id));
+    btn.textContent = entry.label;
+    btn.title = entry.title;
+    const isSelected = state.selectedSpace === entry.id;
+    btn.className = isSelected ? "selected" : "";
+    btn.tabIndex = isSelected ? 0 : -1;
+    btn.dataset.spaceId = entry.id ?? "";
+    btn.addEventListener("click", () => selectSpace(entry.id));
     el.spacePicker.appendChild(btn);
   }
 }
+
+// Left/Right cycles the space tabs and switches immediately (tablist
+// behavior, not "move focus then press Enter/Space to activate" — with
+// only a handful of spaces, activating on arrow alone is faster and
+// matches how the room-list arrow keys below work too).
+el.spacePicker.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  const buttons = [...el.spacePicker.querySelectorAll("button")];
+  if (buttons.length === 0) return;
+  const currentIndex = Math.max(
+    0,
+    buttons.findIndex((b) => b.dataset.spaceId === (state.selectedSpace ?? "")),
+  );
+  const delta = e.key === "ArrowRight" ? 1 : -1;
+  const next = buttons[(currentIndex + delta + buttons.length) % buttons.length];
+  selectSpace(next.dataset.spaceId || null);
+  // `selectSpace` re-renders the picker (fresh buttons), so re-query
+  // rather than reuse `next` before restoring keyboard focus to it.
+  el.spacePicker.querySelector(`[data-space-id="${CSS.escape(next.dataset.spaceId)}"]`)?.focus();
+});
 
 function selectSpace(spaceId) {
   state.selectedSpace = spaceId;
@@ -196,8 +300,9 @@ function selectSpace(spaceId) {
 function renderRooms() {
   renderSpacePicker();
   el.roomListItems.innerHTML = "";
-  const filter = state.roomFilter.trim().toLowerCase();
+  const filter = normalizeForSearch(state.roomFilter.trim());
   const spaceFilter = state.selectedSpace ? state.spaceChildren[state.selectedSpace] : null;
+  state.visibleRoomIds = [];
 
   for (const room of state.rooms) {
     if (room.is_invite) {
@@ -212,12 +317,18 @@ function renderRooms() {
       continue;
     }
     if (room.is_space) continue;
-    if (filter && !room.name.toLowerCase().includes(filter)) continue;
+    if (filter && !normalizeForSearch(room.name).includes(filter)) continue;
     if (spaceFilter && !spaceFilter.includes(room.room_id)) continue;
     if (state.unreadOnly && !(room.unread_count > 0)) continue;
 
+    const rowIndex = state.visibleRoomIds.length;
+    state.visibleRoomIds.push(room.room_id);
+
     const row = document.createElement("div");
-    row.className = "room-row" + (room.room_id === state.selectedRoom ? " selected" : "");
+    row.className =
+      "room-row" +
+      (room.room_id === state.selectedRoom ? " selected" : "") +
+      (rowIndex === state.roomListActiveIndex ? " kbd-active" : "");
 
     const nameEl = document.createElement("div");
     nameEl.className = "room-name" + (room.unread_count > 0 ? " unread" : "");
@@ -231,7 +342,16 @@ function renderRooms() {
       row.appendChild(badge);
     }
     row.addEventListener("click", () => selectRoom(room.room_id));
+    row.addEventListener("mouseenter", () => {
+      state.roomListActiveIndex = rowIndex;
+      el.roomListItems.querySelector(".room-row.kbd-active")?.classList.remove("kbd-active");
+      row.classList.add("kbd-active");
+    });
     el.roomListItems.appendChild(row);
+  }
+
+  if (state.roomListActiveIndex >= state.visibleRoomIds.length) {
+    state.roomListActiveIndex = state.visibleRoomIds.length - 1;
   }
 
   if (state.unreadOnly && el.roomListItems.children.length === 0) {
@@ -292,6 +412,12 @@ function closeDialog() {
 
 function selectRoom(roomId) {
   state.selectedRoom = roomId;
+  // Keep the keyboard highlight in sync with the actual selection, so a
+  // mouse click doesn't leave a stale `.kbd-active` outline sitting on
+  // whatever row arrow keys last visited, and so arrow keys right after a
+  // mouse click resume from the room that's now open rather than there.
+  const idx = state.visibleRoomIds.indexOf(roomId);
+  if (idx !== -1) state.roomListActiveIndex = idx;
   state.rightPanel = null;
   el.roomMenu.style.display = "none";
   cancelReply();
@@ -666,10 +792,14 @@ function renderMessage(event, ctx, opts = {}) {
       });
       bubble.appendChild(placeholder);
     } else if (cached) {
+      const wrap = document.createElement("div");
+      wrap.className = "media-wrap";
       const img = document.createElement("img");
       img.alt = event.body || "image";
       img.src = cached;
-      bubble.appendChild(img);
+      wrap.appendChild(img);
+      wrap.appendChild(makeDownloadButton(event));
+      bubble.appendChild(wrap);
     } else {
       // A bare `<img src="">` on a not-yet-loaded (or failed) image shows
       // the browser's own broken-image icon plus the alt text — which is
@@ -693,6 +823,44 @@ function renderMessage(event, ctx, opts = {}) {
       bubble.appendChild(placeholder);
       if (!state.imageRequested.has(event.media_url)) requestImage(event.media_url);
     }
+  } else if (event.msg_type === "video" && event.media_url) {
+    if (event.media_encryption) state.imageEncryption[event.media_url] = event.media_encryption;
+    const attachment = document.createElement("div");
+    attachment.className = "media-attachment";
+
+    const play = document.createElement("button");
+    play.className = "media-attachment-action";
+    play.textContent = `▶ ${event.body || "video"}`;
+    play.title = "play video";
+    play.addEventListener("click", () => {
+      send("PlayVideo", {
+        mxc_uri: event.media_url,
+        filename: event.body || "video.mp4",
+        media_encryption: state.imageEncryption[event.media_url] || null,
+      });
+    });
+    attachment.appendChild(play);
+    attachment.appendChild(makeDownloadButton(event));
+    bubble.appendChild(attachment);
+  } else if (event.msg_type === "file" && event.media_url) {
+    if (event.media_encryption) state.imageEncryption[event.media_url] = event.media_encryption;
+    const attachment = document.createElement("div");
+    attachment.className = "media-attachment";
+
+    const open = document.createElement("button");
+    open.className = "media-attachment-action";
+    open.textContent = `📎 ${event.body || "file"}`;
+    open.title = "open file";
+    open.addEventListener("click", () => {
+      send("OpenMediaExternally", {
+        mxc_uri: event.media_url,
+        filename: event.body || "file",
+        media_encryption: state.imageEncryption[event.media_url] || null,
+      });
+    });
+    attachment.appendChild(open);
+    attachment.appendChild(makeDownloadButton(event));
+    bubble.appendChild(attachment);
   } else if (event.msg_type === "deleted") {
     const body = document.createElement("div");
     body.className = "body deleted";
@@ -836,6 +1004,26 @@ function requestImage(mxcUri) {
   });
 }
 
+/** Small "⬇" button that saves an attachment (image/video/file) to the
+ * user's Downloads folder via `Command::DownloadMedia`, distinct from
+ * `PlayVideo`/`OpenMediaExternally`'s temp-file-then-open behavior — this
+ * one is meant to leave a real copy behind. */
+function makeDownloadButton(event) {
+  const btn = document.createElement("button");
+  btn.className = "download-btn";
+  btn.title = "download";
+  btn.textContent = "⬇";
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    send("DownloadMedia", {
+      mxc_uri: event.media_url,
+      filename: event.body || "download",
+      media_encryption: state.imageEncryption[event.media_url] || null,
+    });
+  });
+  return btn;
+}
+
 // WebKitGTK (this app's webview) has no built-in decoder for these —
 // showing them as an `<img>` just gets the browser's own broken-image
 // icon. PNG/JPEG/GIF/BMP/WEBP all decode fine and aren't listed here.
@@ -950,9 +1138,13 @@ function startEdit(roomId, threadId, event) {
   state.pendingEdit = { roomId, threadId, eventId: event.event_id };
   if (threadId) {
     const box = document.getElementById("thread-compose-input");
-    if (box) box.value = event.body || "";
+    if (box) {
+      box.value = event.body || "";
+      autoResizeTextarea(box);
+    }
   } else {
     el.composeInput.value = event.body || "";
+    autoResizeTextarea(el.composeInput);
   }
   renderEditIndicator();
 }
@@ -971,6 +1163,7 @@ function renderEditIndicator() {
   document.getElementById("cancel-edit").addEventListener("click", () => {
     cancelEdit();
     el.composeInput.value = "";
+    autoResizeTextarea(el.composeInput);
   });
 }
 
@@ -1052,6 +1245,177 @@ function buildMentionHtml(body, mentions) {
 }
 
 // =========================================================================
+// Compose editor — markdown shortcuts/toolbar, auto-grow
+// =========================================================================
+// A small hand-rolled markdown editor (keyboard shortcuts + a toolbar that
+// wrap the current selection in the right syntax) rather than a full
+// WYSIWYG rich-text widget — consistent with this app's plain-JS,
+// no-bundler setup and with `renderMarkdown`'s own "just enough for chat
+// formatting" scope. Shared by the main compose box and the thread
+// panel's own copy (rebuilt from scratch on every side-panel re-render).
+
+const MD_WRAPPERS = {
+  bold: { before: "**", after: "**" },
+  italic: { before: "*", after: "*" },
+  code: { before: "`", after: "`" },
+};
+
+/** Wraps the current selection in `before`/`after` — or, if it's already
+ * wrapped in exactly that, unwraps it instead, so e.g. pressing Ctrl+B on
+ * already-bold text un-bolds it rather than nesting `****`. */
+function toggleWrap(textarea, before, after) {
+  const { value, selectionStart: start, selectionEnd: end } = textarea;
+  const selected = value.slice(start, end);
+  const already =
+    value.slice(start - before.length, start) === before &&
+    value.slice(end, end + after.length) === after;
+
+  let newValue, newStart, newEnd;
+  if (already) {
+    newValue = value.slice(0, start - before.length) + selected + value.slice(end + after.length);
+    newStart = start - before.length;
+    newEnd = newStart + selected.length;
+  } else {
+    newValue = value.slice(0, start) + before + selected + after + value.slice(end);
+    newStart = start + before.length;
+    newEnd = newStart + selected.length;
+  }
+  textarea.value = newValue;
+  textarea.setSelectionRange(newStart, newEnd);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
+/** Fences the selection off as a code block — with nothing selected,
+ * leaves the cursor ready to type inside a fresh empty one. */
+function insertCodeBlock(textarea) {
+  const { value, selectionStart: start, selectionEnd: end } = textarea;
+  const selected = value.slice(start, end);
+  const needsLeadingNewline = start > 0 && value[start - 1] !== "\n";
+  const needsTrailingNewline = end < value.length && value[end] !== "\n";
+  const block = `${needsLeadingNewline ? "\n" : ""}\`\`\`\n${selected}\n\`\`\`${needsTrailingNewline ? "\n" : ""}`;
+  textarea.value = value.slice(0, start) + block + value.slice(end);
+  const cursor = start + (needsLeadingNewline ? 1 : 0) + 4 + selected.length;
+  textarea.setSelectionRange(cursor, cursor);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
+/** Wraps the selection as a markdown link with the cursor left right after
+ * the `(`, ready to type the URL — same UX GitHub's own comment box uses.
+ * With nothing selected, leaves the cursor inside the `[]` instead. */
+function insertLink(textarea) {
+  const { value, selectionStart: start, selectionEnd: end } = textarea;
+  const selected = value.slice(start, end);
+  textarea.value = value.slice(0, start) + `[${selected}]()` + value.slice(end);
+  const cursor = selected ? start + selected.length + 3 : start + 1;
+  textarea.setSelectionRange(cursor, cursor);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
+/** Same bare-URL shape `renderMarkdown` itself auto-links — kept in sync
+ * with that regex on purpose, so "does pasting this turn into a link"
+ * matches "does typing this turn into a link" once sent. */
+function isLikelyUrl(text) {
+  return /^https?:\/\/\S+$/i.test(text);
+}
+
+/** Turns the current selection into a markdown link to `url`, replacing
+ * it outright rather than inserting alongside it. */
+function wrapSelectionAsLink(textarea, url) {
+  const { value, selectionStart: start, selectionEnd: end } = textarea;
+  const selected = value.slice(start, end);
+  const linked = `[${selected}](${url})`;
+  textarea.value = value.slice(0, start) + linked + value.slice(end);
+  const cursor = start + linked.length;
+  textarea.setSelectionRange(cursor, cursor);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function applyMarkdownAction(textarea, action) {
+  if (action === "codeblock") return insertCodeBlock(textarea);
+  if (action === "link") return insertLink(textarea);
+  const wrapper = MD_WRAPPERS[action];
+  if (wrapper) toggleWrap(textarea, wrapper.before, wrapper.after);
+}
+
+/** Grows a compose `<textarea>` to fit its content up to `.compose-textarea`'s
+ * `max-height` (see CSS), then scrolls internally past that — a one-line
+ * "hey" doesn't reserve space for a paragraph, but a pasted paragraph
+ * doesn't swallow the whole timeline either. */
+function autoResizeTextarea(textarea) {
+  textarea.style.height = "auto";
+  textarea.style.height = textarea.scrollHeight + "px";
+}
+
+/** Wires the shared compose-editor keyboard behavior onto one `<textarea>`:
+ * Enter sends (Shift+Enter inserts a literal newline instead), Ctrl+B/I/E/K
+ * apply markdown, Ctrl+Shift+E fences a code block, and the box auto-grows
+ * as it's typed into. `isSuggestionsOpen()` lets the mention-autocomplete
+ * dropdown claim Enter for itself (pick a suggestion, not send) — same
+ * priority the old plain `<input>` gave it. */
+function wireComposeEditor(textarea, { onSend, isSuggestionsOpen }) {
+  textarea.addEventListener("input", () => autoResizeTextarea(textarea));
+  // Pasting a URL onto a text selection turns the selection into a link to
+  // that URL — `[selected text](url)` — instead of just overwriting it
+  // with the raw address, the same "paste a link onto a selection" UX
+  // GitHub/Slack/Notion all share. A paste with nothing selected (or that
+  // isn't a bare URL) falls through to the browser's own default paste
+  // untouched.
+  textarea.addEventListener("paste", (e) => {
+    if (textarea.selectionStart === textarea.selectionEnd) return;
+    const pasted = (e.clipboardData || window.clipboardData)?.getData("text/plain")?.trim();
+    if (!pasted || !isLikelyUrl(pasted)) return;
+    e.preventDefault();
+    // Also stops the document-level paste handler (image-paste detection)
+    // from seeing this event — it has nothing to do here since this is
+    // plain text, but without this it still fires its "no image, trying
+    // clipboard API..." fallback toast right after the link is inserted.
+    e.stopPropagation();
+    wrapSelectionAsLink(textarea, pasted);
+    textarea.focus();
+  });
+  textarea.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      if (isSuggestionsOpen()) return;
+      e.preventDefault();
+      onSend();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "e") {
+      e.preventDefault();
+      // Also keeps this from bubbling to the app-wide shortcut handler —
+      // it has no binding on Ctrl+Shift+E, but Ctrl+K below collides with
+      // that handler's "focus room search" (same key most editors use for
+      // "insert link" too); stopping propagation here is what lets the
+      // compose box's meaning win while it has focus.
+      e.stopPropagation();
+      insertCodeBlock(textarea);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
+      const action = { b: "bold", i: "italic", e: "code", k: "link" }[e.key.toLowerCase()];
+      if (action) {
+        e.preventDefault();
+        e.stopPropagation();
+        applyMarkdownAction(textarea, action);
+      }
+    }
+  });
+}
+
+/** Wires the B/I/code/link toolbar row above a compose box. */
+function wireMarkdownToolbar(toolbarEl, textarea) {
+  toolbarEl?.querySelectorAll("[data-md]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      applyMarkdownAction(textarea, btn.dataset.md);
+    });
+  });
+}
+
+// =========================================================================
 // Compose / send
 // =========================================================================
 
@@ -1063,6 +1427,7 @@ function sendCurrentMessage() {
   }
   if (!body || !state.selectedRoom) return;
   el.composeInput.value = "";
+  autoResizeTextarea(el.composeInput);
   el.mentionSuggestions.style.display = "none";
 
   if (state.pendingEdit && !state.pendingEdit.threadId) {
@@ -1099,9 +1464,11 @@ function sendCurrentMessage() {
   el.composeInput.focus();
 }
 el.composeSend.addEventListener("click", sendCurrentMessage);
-el.composeInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && el.mentionSuggestions.style.display === "none") sendCurrentMessage();
+wireComposeEditor(el.composeInput, {
+  onSend: sendCurrentMessage,
+  isSuggestionsOpen: () => el.mentionSuggestions.style.display !== "none",
 });
+wireMarkdownToolbar(el.composeToolbar, el.composeInput);
 
 // ---- Custom emoji / meme picker (MSC2545 room image packs) ----
 // Shared between the main compose row and the thread panel's own copy
@@ -1298,6 +1665,96 @@ document.addEventListener("keydown", async (e) => {
   }
 });
 
+// =========================================================================
+// App-wide keyboard shortcuts
+// =========================================================================
+// Search-box-specific navigation (arrow keys / Escape) lives with the
+// search box itself above; space-tab navigation lives with the space
+// picker. This is only the shortcuts that make sense from anywhere:
+// jumping *to* the search box, switching rooms without touching the
+// mouse, and a cheat sheet to find out these exist at all.
+const SHORTCUTS = [
+  ["Ctrl+K or /", "focus room search"],
+  ["↑ / ↓ (in search)", "move through search results"],
+  ["Enter (in search)", "open the highlighted room"],
+  ["Esc (in search)", "clear search, then unfocus"],
+  ["← / → (in tags)", "switch space/tag"],
+  ["Alt+↑ / Alt+↓", "previous / next room in the list"],
+  ["Ctrl+Shift+U", "toggle unread-only filter"],
+  ["Esc", "close dialog / menu"],
+  ["?", "show this list"],
+  ["Shift+Enter (compose)", "new line instead of sending"],
+  ["Ctrl+B / Ctrl+I", "bold / italic selection"],
+  ["Ctrl+E / Ctrl+Shift+E", "inline code / code block"],
+  ["Ctrl+K (compose)", "insert link"],
+];
+
+function showShortcutsHelp() {
+  const rows = SHORTCUTS.map(
+    ([keys, desc]) => `<tr><td class="shortcut-keys">${escapeHtml(keys)}</td><td>${escapeHtml(desc)}</td></tr>`,
+  ).join("");
+  showDialog(`
+    <h3>keyboard shortcuts</h3>
+    <table class="shortcut-table">${rows}</table>
+    <div class="actions"><button id="dlg-cancel">close</button></div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+}
+el.btnShortcuts.addEventListener("click", showShortcutsHelp);
+
+/** True while the user is typing somewhere else — global shortcuts (`/`,
+ * `?`, ...) that reuse plain, easy-to-hit keys must not fire while that's
+ * happening, or every message containing "/" or "?" would get hijacked. */
+function isTypingContext(target) {
+  const tag = target?.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable;
+}
+
+document.addEventListener("keydown", (e) => {
+  const typing = isTypingContext(e.target);
+
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    el.roomFilter.focus();
+    el.roomFilter.select();
+    return;
+  }
+  if (e.key === "/" && !typing) {
+    e.preventDefault();
+    el.roomFilter.focus();
+    return;
+  }
+  if (e.key === "?" && !typing) {
+    e.preventDefault();
+    showShortcutsHelp();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "u") {
+    e.preventDefault();
+    el.btnUnreadOnly.click();
+    return;
+  }
+  if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+    e.preventDefault();
+    if (state.visibleRoomIds.length === 0) return;
+    const currentIndex = state.visibleRoomIds.indexOf(state.selectedRoom);
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    const base = currentIndex === -1 ? (delta === 1 ? -1 : 0) : currentIndex;
+    const nextIndex = (base + delta + state.visibleRoomIds.length) % state.visibleRoomIds.length;
+    selectRoom(state.visibleRoomIds[nextIndex]);
+    return;
+  }
+  if (e.key === "Escape") {
+    if (document.getElementById("active-dialog")) {
+      e.preventDefault();
+      closeDialog();
+    } else if (el.roomMenu.style.display !== "none") {
+      e.preventDefault();
+      closeRoomMenu();
+    }
+  }
+});
+
 let toastTimer = null;
 function showToast(msg) {
   console.log("[paste]", msg);
@@ -1422,9 +1879,17 @@ el.btnRoomThreads.addEventListener("click", () => {
 });
 
 el.btnGlobalThreads.addEventListener("click", () => {
-  for (const room of state.rooms) {
-    if (room.is_space || room.is_invite) continue;
-    send("ListThreads", { room_id: room.room_id });
+  // This view only ever shows *unread* threads (see `unreadOnly` in
+  // `renderSidePanel`'s `threads-list` branch) — so a room with nothing in
+  // `state.unreadThreads` contributes nothing to it no matter what
+  // `ListThreads` comes back with. Used to fetch it for every room
+  // regardless (3000+ requests on a large account, almost all thrown
+  // away by that same filter); this only asks for the rooms that could
+  // actually show up, which `state.unreadThreads` already tracks live via
+  // `ThreadReply` sync events — no eager whole-account scan needed.
+  const roomsWithUnreadThreads = new Set([...state.unreadThreads].map((k) => k.split("|")[0]));
+  for (const roomId of roomsWithUnreadThreads) {
+    send("ListThreads", { room_id: roomId });
   }
   state.rightPanel = { kind: "threads-list", scope: null };
   renderSidePanel();
@@ -1554,6 +2019,18 @@ function renderSidePanel() {
         </div>`;
       }
     }
+    // Pagination only makes sense for one room's own (unfiltered) thread
+    // list — the all-rooms view is already narrowed to unread threads
+    // only, which `state.unreadThreads` tracks live rather than needing a
+    // deeper fetch. `rooms.length === 1` here whenever `rp.scope` is a
+    // room id, since the filter above already narrowed to just that room.
+    const scopedRoom = rp.scope !== null ? rooms[0] : null;
+    if (scopedRoom && !state.threadsListReachedEnd.has(rp.scope)) {
+      const loading = state.threadsListPaginationInFlight.has(rp.scope);
+      html += `<div id="threads-load-more-row" style="text-align:center;color:var(--text-weak);font-size:12px;padding:4px;">${
+        loading ? "loading more threads..." : '<button id="threads-load-more-btn" class="small-btn">load more threads</button>'
+      }</div>`;
+    }
     html += "</div>";
     el.sidePanel.innerHTML = html;
     document.getElementById("side-panel-close").addEventListener("click", () => {
@@ -1567,6 +2044,11 @@ function renderSidePanel() {
         const root = state.threadsByRoom[roomId]?.find((t) => t.event_id === eventId);
         if (root) openThread(roomId, root);
       });
+    });
+    document.getElementById("threads-load-more-btn")?.addEventListener("click", () => {
+      state.threadsListPaginationInFlight.add(rp.scope);
+      send("LoadMoreThreads", { room_id: rp.scope });
+      renderSidePanel();
     });
     return;
   }
@@ -1592,7 +2074,16 @@ function renderSidePanel() {
           <button id="thread-btn-meme" class="small-btn" title="send a custom emoji/meme">🐸</button>
           <div id="thread-meme-picker" style="display:none;"></div>
         </div>
-        <input id="thread-compose-input" placeholder="reply... (@ to mention)" style="flex:1;" />
+        <div class="compose-editor-wrap">
+          <div class="compose-toolbar" id="thread-compose-toolbar">
+            <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
+            <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
+            <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
+            <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
+            <button type="button" class="md-btn" data-md="link" title="link (Ctrl+K)">link</button>
+          </div>
+          <textarea id="thread-compose-input" class="compose-textarea" rows="1" placeholder="reply... (@ to mention, **bold**, *italic*, \`code\`)"></textarea>
+        </div>
         <button id="thread-compose-send">send</button>
       </div>`;
     el.sidePanel.innerHTML = html;
@@ -1631,6 +2122,7 @@ function renderSidePanel() {
       const body = input.value.trim();
       if (!body) return;
       input.value = "";
+      autoResizeTextarea(input);
       threadSuggestionsEl.style.display = "none";
       const { ids, html } = buildMentionHtml(body, state.threadComposeMentions);
       state.threadComposeMentions = [];
@@ -1662,9 +2154,11 @@ function renderSidePanel() {
       input.focus();
     };
     document.getElementById("thread-compose-send").addEventListener("click", sendThreadMsg);
-    document.getElementById("thread-compose-input").addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && threadSuggestionsEl.style.display === "none") sendThreadMsg();
+    wireComposeEditor(threadInputEl, {
+      onSend: sendThreadMsg,
+      isSuggestionsOpen: () => threadSuggestionsEl.style.display !== "none",
     });
+    wireMarkdownToolbar(document.getElementById("thread-compose-toolbar"), threadInputEl);
     document.getElementById("thread-btn-attach").addEventListener("click", () => {
       const input = document.createElement("input");
       input.type = "file";
@@ -1894,9 +2388,27 @@ function handleBackendEvent(evt) {
       }
       break;
     case "ThreadsList":
+      // A fresh first page — replaces whatever was there before, same as
+      // reopening the panel from scratch (e.g. re-clicking "[ threads ]").
       state.threadsByRoom[data.room_id] = data.threads;
+      if (data.reached_end) state.threadsListReachedEnd.add(data.room_id);
+      else state.threadsListReachedEnd.delete(data.room_id);
+      state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
       break;
+    case "ThreadsListAppend": {
+      const existing = state.threadsByRoom[data.room_id] || [];
+      // Threads already known (e.g. one that got a live reply and moved
+      // itself into `threadsByRoom` via `ThreadReply` before this page
+      // loaded) shouldn't show up twice.
+      const existingIds = new Set(existing.map((t) => t.event_id));
+      const fresh = data.threads.filter((t) => !existingIds.has(t.event_id));
+      state.threadsByRoom[data.room_id] = [...existing, ...fresh];
+      if (data.reached_end) state.threadsListReachedEnd.add(data.room_id);
+      state.threadsListPaginationInFlight.delete(data.room_id);
+      if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
+      break;
+    }
     case "Members":
       state.roomMembers[data.room_id] = data.members;
       break;
@@ -1982,6 +2494,9 @@ function handleBackendEvent(evt) {
       patchMessagesWithMedia(data.key);
       break;
     }
+    case "MediaDownloaded":
+      showToast(`saved to ${data.path}`);
+      break;
     case "SpaceChildren":
       state.spaceChildren[data.space_room_id] = data.room_ids;
       renderRooms();

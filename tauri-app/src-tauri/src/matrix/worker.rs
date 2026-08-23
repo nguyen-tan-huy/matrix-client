@@ -332,9 +332,32 @@ struct WorkerState {
     /// entirely before the first page loads; `Some(None)` once the oldest
     /// reply has been reached (nothing left to paginate).
     thread_reply_cursors: HashMap<(String, String), Option<String>>,
+    /// room_id -> `/threads` pagination cursor for that room's *next*
+    /// (older-activity) page of threads — same idea as
+    /// `thread_reply_cursors`, but for the room-level thread list itself
+    /// (`Command::ListThreads`/`LoadMoreThreads`) rather than one thread's
+    /// replies. Absent from the map entirely before the first page loads;
+    /// `Some(None)` once the room's oldest thread has been reached.
+    thread_list_cursors: HashMap<String, Option<String>>,
     /// room_id -> event_id last confirmed read via `Command::MarkRoomRead`,
     /// persisted to `read_state.json` — see that file's doc comment.
     confirmed_read: HashMap<String, String>,
+    /// room_id -> (display name, is-encrypted), as last computed by
+    /// `refresh_rooms`. This is what keeps `refresh_rooms` fast on an
+    /// account with thousands of rooms — recomputing `Room::display_name()`
+    /// (a real member-list/store lookup for any room without an explicit
+    /// `m.room.name`, e.g. most DMs) and `Room::is_encrypted()` for every
+    /// single room on every refresh was the actual O(rooms) cost. Now
+    /// those two are only ever recomputed for a room that's actually in
+    /// the current call's dirty set (see `refresh_rooms`'s `dirty`
+    /// parameter) — everything else is served straight from here.
+    room_summary_cache: HashMap<String, (String, bool)>,
+    /// Room IDs that changed since the last `refresh_rooms` call — filled
+    /// in by the sync callback (see `Command::StartSync`) and drained by
+    /// its debouncer task, which passes exactly this set through so a
+    /// burst of activity in a handful of rooms doesn't force a full
+    /// re-scan of every room in the account.
+    dirty_rooms: std::collections::HashSet<String>,
 }
 
 /// Dedicated runtime for `FetchImage`/`PlayVideo`. A room with many images
@@ -386,6 +409,9 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         room_timelines: HashMap::new(),
         thread_timelines: HashMap::new(),
         thread_reply_cursors: HashMap::new(),
+        thread_list_cursors: HashMap::new(),
+        room_summary_cache: HashMap::new(),
+        dirty_rooms: std::collections::HashSet::new(),
         confirmed_read: load_read_state(),
     }));
 
@@ -581,14 +607,27 @@ async fn handle(
 
             tracing::info!("starting sync loop");
 
-            let tx2 = tx.clone();
-            let tx3 = tx.clone();
+            // `refresh_rooms` recomputes `display_name()`/`is_encrypted()`
+            // (both real, `.await`-ed lookups — see `room_summary_cache`'s
+            // doc comment) only for whichever rooms are in its `dirty` set,
+            // reusing the cache for everything else. Calling it straight
+            // from the sync callback for *every room the response touched*
+            // (as this used to, indirectly, by rescanning the whole
+            // account each time) meant one full scan per sync response —
+            // during the initial backfill of a large account, dozens of
+            // responses land in quick succession, turning startup into
+            // O(ticks × rooms) and stalling the room list for a long time.
+            // The callback now just records which room IDs changed into
+            // `state.dirty_rooms`; the debouncer task below drains
+            // whatever accumulated there and coalesces however many ticks
+            // land within its window into a single scan of just those
+            // rooms.
             let state2 = state.clone();
+            let tx3 = tx.clone();
             tokio::spawn(async move {
                 let tick = std::sync::atomic::AtomicU64::new(0);
                 let result = client
                     .sync_with_callback(SyncSettings::default(), move |resp| {
-                        let tx2 = tx2.clone();
                         let state2 = state2.clone();
                         let tick = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         tracing::debug!(
@@ -600,9 +639,14 @@ async fn handle(
                             "sync response received"
                         );
                         async move {
-                            if let Err(e) = refresh_rooms(&state2, &tx2).await {
-                                tracing::warn!(error = %e, "refresh_rooms failed after sync tick");
-                            }
+                            let changed = resp
+                                .rooms
+                                .join
+                                .keys()
+                                .chain(resp.rooms.leave.keys())
+                                .chain(resp.rooms.invite.keys())
+                                .map(|id| id.to_string());
+                            state2.lock().await.dirty_rooms.extend(changed);
                             matrix_sdk::LoopCtrl::Continue
                         }
                     })
@@ -613,8 +657,27 @@ async fn handle(
                 }
             });
 
+            let state3 = state.clone();
+            let tx4 = tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    let dirty = {
+                        let mut guard = state3.lock().await;
+                        std::mem::take(&mut guard.dirty_rooms)
+                    };
+                    if !dirty.is_empty() {
+                        if let Err(e) = refresh_rooms(&state3, &tx4, Some(&dirty)).await {
+                            tracing::warn!(error = %e, "refresh_rooms failed after sync tick");
+                        }
+                    }
+                }
+            });
+
             // Kick an initial room list refresh immediately after starting.
-            refresh_rooms(&state, &tx).await?;
+            // `dirty: None` here means "everything" — the cache starts
+            // empty, so this is the one unavoidable full scan.
+            refresh_rooms(&state, &tx, None).await?;
         }
 
         Command::LoadTimeline { room_id } => {
@@ -860,9 +923,68 @@ async fn handle(
 
         Command::ListThreads { room_id } => {
             let client = get_client(&state).await?;
-            match list_all_threads(&client, &room_id).await {
-                Ok(threads) => {
-                    tx.send(Event::ThreadsList { room_id, threads }).ok();
+            match fetch_threads_page(&client, &room_id, None).await {
+                Ok((threads, next_batch)) => {
+                    let reached_end = next_batch.is_none();
+                    state
+                        .lock()
+                        .await
+                        .thread_list_cursors
+                        .insert(room_id.clone(), next_batch);
+                    tx.send(Event::ThreadsList {
+                        room_id,
+                        threads,
+                        reached_end,
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(e.to_string())).ok();
+                }
+            }
+        }
+
+        // Continues a room's thread list from wherever `Command::ListThreads`'s
+        // first page (or the previous `LoadMoreThreads` call) left off —
+        // mirrors `LoadMoreThreadReplies`/`PaginateBack`.
+        Command::LoadMoreThreads { room_id } => {
+            let client = get_client(&state).await?;
+            let cursor = state
+                .lock()
+                .await
+                .thread_list_cursors
+                .get(&room_id)
+                .cloned()
+                .flatten();
+
+            let Some(from) = cursor else {
+                // Either never loaded a first page (shouldn't happen — the
+                // UI only calls this after `ListThreads`) or already hit
+                // the room's oldest thread. Either way, nothing more to
+                // fetch.
+                tx.send(Event::ThreadsListAppend {
+                    room_id,
+                    threads: Vec::new(),
+                    reached_end: true,
+                })
+                .ok();
+                return Ok(());
+            };
+
+            match fetch_threads_page(&client, &room_id, Some(from)).await {
+                Ok((threads, next_batch)) => {
+                    let reached_end = next_batch.is_none();
+                    state
+                        .lock()
+                        .await
+                        .thread_list_cursors
+                        .insert(room_id.clone(), next_batch);
+                    tx.send(Event::ThreadsListAppend {
+                        room_id,
+                        threads,
+                        reached_end,
+                    })
+                    .ok();
                 }
                 Err(e) => {
                     tx.send(Event::Error(e.to_string())).ok();
@@ -1144,7 +1266,10 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             room.join().await?;
-            refresh_rooms(&state, &tx).await?;
+            // Only this one room actually changed — everyone else's
+            // cached name/encryption is still good (see `refresh_rooms`'s
+            // `dirty` parameter).
+            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
         }
 
         Command::DeclineInvite { room_id } => {
@@ -1153,7 +1278,7 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             room.leave().await?;
-            refresh_rooms(&state, &tx).await?;
+            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
         }
 
         Command::InviteUser { room_id, user_id } => {
@@ -1176,7 +1301,7 @@ async fn handle(
                 guard.room_timelines.remove(&room_id);
                 guard.thread_timelines.retain(|(rid, _), _| rid != &room_id);
             }
-            refresh_rooms(&state, &tx).await?;
+            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
         }
 
         Command::MarkRoomRead { room_id } => {
@@ -1209,7 +1334,13 @@ async fn handle(
                 guard.confirmed_read.insert(room_id.clone(), event_id.to_string());
                 save_read_state(&guard.confirmed_read);
             }
-            refresh_rooms(&state, &tx).await?;
+            // `MarkRoomRead` fires on essentially every message received
+            // while a room is open (see the frontend's live-message
+            // handler), making it by far the most frequent trigger of all
+            // these — scoping it to just this one room is what keeps
+            // reading messages in an active room from ever touching the
+            // other 2999.
+            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
         }
 
         Command::CreateRoom {
@@ -1234,8 +1365,13 @@ async fn handle(
                 );
             }
 
-            client.create_room(request).await?;
-            refresh_rooms(&state, &tx).await?;
+            let response = client.create_room(request).await?;
+            refresh_rooms(
+                &state,
+                &tx,
+                Some(&std::collections::HashSet::from([response.room_id().to_string()])),
+            )
+            .await?;
         }
 
         Command::ListSpaceChildren { space_room_id } => {
@@ -1572,6 +1708,38 @@ async fn handle(
             }
         }
 
+        Command::DownloadMedia { mxc_uri, filename, media_encryption } => {
+            let client = get_client(&state).await?;
+            match download_media_bytes(&client, &mxc_uri, media_encryption.as_deref()).await {
+                Ok(bytes) => {
+                    let dir = directories::UserDirs::new()
+                        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
+                        .unwrap_or_else(std::env::temp_dir);
+                    if let Err(e) = std::fs::create_dir_all(&dir) {
+                        tx.send(Event::Error(format!("failed to prepare downloads folder: {e}")))
+                            .ok();
+                    } else {
+                        let path = unique_download_path(&dir, &sanitize_filename(&filename));
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => {
+                                tx.send(Event::MediaDownloaded {
+                                    path: path.display().to_string(),
+                                })
+                                .ok();
+                            }
+                            Err(e) => {
+                                tx.send(Event::Error(format!("failed to save download: {e}")))
+                                    .ok();
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("download failed: {e}"))).ok();
+                }
+            }
+        }
+
         Command::FetchImage { key, mxc_uri, media_encryption } => {
             let client = get_client(&state).await?;
             match download_media_bytes(&client, &mxc_uri, media_encryption.as_deref()).await {
@@ -1657,14 +1825,28 @@ async fn get_client(state: &Arc<Mutex<WorkerState>>) -> anyhow::Result<Client> {
         .ok_or_else(|| anyhow::anyhow!("not logged in"))
 }
 
+/// Rebuilds the room list. `dirty` is the set of room IDs whose
+/// `display_name()`/`is_encrypted()` actually need recomputing this call —
+/// `None` means "everything" (only used for the one unavoidable full scan
+/// right after `StartSync`, when the cache is still empty). Every other
+/// room reuses whatever's in `room_summary_cache` from the last time it
+/// was computed. See that field's doc comment for why this matters: those
+/// two calls are the real O(rooms) cost here, and on an account with
+/// thousands of rooms, redoing them for all of them on every refresh (the
+/// original behavior) is what made the room list slow to begin with.
 async fn refresh_rooms(
     state: &Arc<Mutex<WorkerState>>,
     tx: &UnboundedSender<Event>,
+    dirty: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<()> {
     let client = get_client(state).await?;
-    let (confirmed_read, room_timelines) = {
+    let (confirmed_read, room_timelines, mut summary_cache) = {
         let guard = state.lock().await;
-        (guard.confirmed_read.clone(), guard.room_timelines.clone())
+        (
+            guard.confirmed_read.clone(),
+            guard.room_timelines.clone(),
+            guard.room_summary_cache.clone(),
+        )
     };
     let mut summaries = Vec::new();
 
@@ -1675,11 +1857,33 @@ async fn refresh_rooms(
             _ => continue, // left/banned rooms: skip
         };
 
-        let name = room
-            .display_name()
-            .await
-            .map(|n| n.to_string())
-            .unwrap_or_else(|_| room.room_id().to_string());
+        let room_id_str = room.room_id().to_string();
+        // Recompute for a room this call was actually told changed, or
+        // one that's never been seen before (nothing to reuse yet) — every
+        // other room is served straight from the cache.
+        let needs_recompute = match dirty {
+            Some(dirty) => dirty.contains(&room_id_str),
+            None => true,
+        } || !summary_cache.contains_key(&room_id_str);
+
+        let (name, is_encrypted) = if needs_recompute {
+            let name = room
+                .display_name()
+                .await
+                .map(|n| n.to_string())
+                .unwrap_or_else(|_| room.room_id().to_string());
+            let is_encrypted = room.is_encrypted().await.unwrap_or(false);
+            summary_cache.insert(room_id_str.clone(), (name.clone(), is_encrypted));
+            (name, is_encrypted)
+        } else {
+            // `needs_recompute` is false only when this key is present, so
+            // the fallback here is unreachable in practice — just avoids
+            // an `.unwrap()`.
+            summary_cache
+                .get(&room_id_str)
+                .cloned()
+                .unwrap_or_else(|| (room_id_str.clone(), false))
+        };
 
         // `Room::latest_event()` (matrix-sdk-base's own cache) is
         // reliably empty in this app — it's never populated without the
@@ -1755,7 +1959,7 @@ async fn refresh_rooms(
                     num_unread.max(room.unread_notification_counts().notification_count)
                 }
             },
-            is_encrypted: room.is_encrypted().await.unwrap_or(false),
+            is_encrypted,
             is_invite,
             is_space: room.is_space(),
         });
@@ -1767,6 +1971,7 @@ async fn refresh_rooms(
             .cmp(&a.is_invite)
             .then(b.last_message_ts.cmp(&a.last_message_ts))
     });
+    state.lock().await.room_summary_cache = summary_cache;
     tx.send(Event::Rooms(summaries)).ok();
     Ok(())
 }
@@ -1839,59 +2044,65 @@ fn notification_mode_from_str(
 /// `next_batch` is empty — ported from the Tauri version's
 /// commands/threads.rs. Finds threads regardless of how far back the user
 /// has scrolled locally.
-async fn list_all_threads(
+/// Fetches one page of a room's thread list via `/threads` (most recent
+/// activity first, per the server's own ordering), returning that page
+/// plus a cursor for the next (older) one. Used to be a loop that fetched
+/// *every* page up front — fine for a room with a handful of threads, but
+/// a real account can have hundreds, and paying for the full history just
+/// to open the thread list once made it feel like the room had frozen.
+/// Now it's the same one-page-at-a-time shape as
+/// `fetch_thread_replies_page` below — the UI asks for more explicitly
+/// via `Command::LoadMoreThreads`.
+async fn fetch_threads_page(
     client: &Client,
     room_id: &str,
-) -> anyhow::Result<Vec<crate::models::TimelineEvent>> {
+    from: Option<String>,
+) -> anyhow::Result<(Vec<crate::models::TimelineEvent>, Option<String>)> {
     use matrix_sdk::ruma::api::client::threads::get_threads;
     use matrix_sdk::ruma::UInt;
 
     let parsed_room_id = RoomId::parse(room_id)?;
-    let mut all = Vec::new();
-    let mut from: Option<String> = None;
+    let mut request = get_threads::v1::Request::new(parsed_room_id.clone());
+    request.from = from;
+    request.limit = Some(UInt::from(50u32));
+    request.include = get_threads::v1::IncludeThreads::All;
 
-    loop {
-        let mut request = get_threads::v1::Request::new(parsed_room_id.clone());
-        request.from = from.clone();
-        request.limit = Some(UInt::from(50u32));
-        request.include = get_threads::v1::IncludeThreads::All;
+    let response = client.send(request, None).await?;
 
-        let response = client.send(request, None).await?;
-
-        let room = client.get_room(&parsed_room_id);
-        for raw in &response.chunk {
-            if let Some(event) = parse_thread_root(client, room.as_ref(), room_id, raw).await {
-                all.push(event);
-            }
-        }
-
-        match response.next_batch {
-            Some(next) if !next.is_empty() => from = Some(next),
-            _ => break,
+    let room = client.get_room(&parsed_room_id);
+    let mut page = Vec::new();
+    for raw in &response.chunk {
+        if let Some(event) = parse_thread_root(client, room.as_ref(), room_id, raw).await {
+            page.push(event);
         }
     }
+    // Only sorts within this one page — the server already hands back
+    // pages in recency order, so this just normalizes ties, not
+    // re-establishing order across pages the way the old full-history sort
+    // effectively did.
+    page.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-    async fn parse_thread_root(
-        client: &Client,
-        room: Option<&matrix_sdk::Room>,
-        room_id: &str,
-        raw: &matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnyTimelineEvent>,
-    ) -> Option<crate::models::TimelineEvent> {
-        let value: serde_json::Value = raw.deserialize_as().ok()?;
-        // Same raw-`/threads`-bypasses-decryption issue as `/relations` —
-        // see `decrypt_if_needed`'s doc comment.
-        let value = match room {
-            Some(room) => decrypt_if_needed(room, raw.cast_ref(), value).await,
-            None => value,
-        };
-        let mut event = parse_raw_message_event(client, room_id, &value).await?;
-        // Thread roots should always show a reply count button, even at 0.
-        event.thread_count = event.thread_count.or(Some(0));
-        Some(event)
-    }
+    let next_batch = response.next_batch.filter(|n| !n.is_empty());
+    Ok((page, next_batch))
+}
 
-    all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    Ok(all)
+async fn parse_thread_root(
+    client: &Client,
+    room: Option<&matrix_sdk::Room>,
+    room_id: &str,
+    raw: &matrix_sdk::ruma::serde::Raw<matrix_sdk::ruma::events::AnyTimelineEvent>,
+) -> Option<crate::models::TimelineEvent> {
+    let value: serde_json::Value = raw.deserialize_as().ok()?;
+    // Same raw-`/threads`-bypasses-decryption issue as `/relations` —
+    // see `decrypt_if_needed`'s doc comment.
+    let value = match room {
+        Some(room) => decrypt_if_needed(room, raw.cast_ref(), value).await,
+        None => value,
+    };
+    let mut event = parse_raw_message_event(client, room_id, &value).await?;
+    // Thread roots should always show a reply count button, even at 0.
+    event.thread_count = event.thread_count.or(Some(0));
+    Some(event)
 }
 
 /// Fetches every reply in one thread via `/relations` (see `LoadThread`'s
@@ -2312,6 +2523,28 @@ fn sanitize_filename(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Picks `dir/name`, or `dir/name (1)`, `dir/name (2)`, ... the first one
+/// that doesn't already exist — so downloading the same attachment twice
+/// (or one that happens to share a filename with something already in
+/// Downloads) doesn't silently clobber the earlier file.
+fn unique_download_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    if !path.exists() {
+        return path;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (name.to_string(), String::new()),
+    };
+    for n in 1..10_000 {
+        let candidate = dir.join(format!("{stem} ({n}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(name)
 }
 
 fn chrono_like_timestamp() -> u128 {
