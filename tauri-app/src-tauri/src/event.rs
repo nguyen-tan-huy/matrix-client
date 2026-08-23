@@ -160,9 +160,12 @@ pub enum Event {
         room_id: String,
         mode: String,
     },
-    /// The user clicked a desktop notification shown for `Command::ShowNotification`.
+    /// The user clicked a notification shown for `Command::ShowNotification`
+    /// (desktop) or tapped one on Android (routed back in via
+    /// `Command::HandleNotificationClick`).
     NotificationClicked {
         room_id: String,
+        thread_id: Option<String>,
     },
     /// The current reaction state of one message — response to
     /// `Command::ToggleReaction`, and also pushed live when someone else's

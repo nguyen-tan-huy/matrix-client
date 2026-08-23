@@ -2,6 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
 <title>Matrix</title>
 <link rel="stylesheet" href="style.css" />
 </head>
@@ -44,6 +45,7 @@
   <div id="resizer-left" class="resizer"></div>
   <div id="main-panel">
     <div id="timeline-header">
+      <button id="btn-back-to-rooms" class="small-btn" title="back to room list">[ ‹ ]</button>
       <span id="timeline-title">select a conversation</span>
       <div id="timeline-header-actions" style="display:none;">
         <button id="btn-mark-read" class="small-btn" title="mark this room as read">[ mark read ]</button>
@@ -64,8 +66,11 @@
       </div>
     </div>
     <div id="summary-box" style="display:none;"></div>
-    <div id="timeline">
-      <div id="timeline-placeholder">select a conversation</div>
+    <div id="timeline-wrap">
+      <div id="timeline">
+        <div id="timeline-placeholder">select a conversation</div>
+      </div>
+      <button id="btn-jump-latest" class="jump-latest-btn" style="display:none;" title="jump to latest message">↓</button>
     </div>
     <div id="reply-indicator" style="display:none;"></div>
     <div id="edit-indicator" style="display:none;"></div>

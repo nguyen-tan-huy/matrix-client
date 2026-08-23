@@ -98,6 +98,7 @@ const el = {
   btnCreateRoom: document.getElementById("btn-create-room"),
   btnGlobalThreads: document.getElementById("btn-global-threads"),
   btnShortcuts: document.getElementById("btn-shortcuts"),
+  btnBackToRooms: document.getElementById("btn-back-to-rooms"),
   timelineTitle: document.getElementById("timeline-title"),
   timelineHeaderActions: document.getElementById("timeline-header-actions"),
   btnMarkRead: document.getElementById("btn-mark-read"),
@@ -110,6 +111,7 @@ const el = {
   btnSummarize: document.getElementById("btn-summarize"),
   summaryBox: document.getElementById("summary-box"),
   timeline: document.getElementById("timeline"),
+  btnJumpLatest: document.getElementById("btn-jump-latest"),
   replyIndicator: document.getElementById("reply-indicator"),
   editIndicator: document.getElementById("edit-indicator"),
   mentionSuggestions: document.getElementById("mention-suggestions"),
@@ -164,6 +166,14 @@ function enterChat() {
   state.screen = "chat";
   el.loginScreen.classList.add("hidden");
   el.chatScreen.classList.add("active");
+  // The room list otherwise just sits blank until the first "Rooms" event
+  // — which needs a full initial sync to complete first, easily a few
+  // seconds (longer on a flaky connection, e.g. the retry-heavy path
+  // right after an Android OAuth login) — with nothing to tell the user
+  // whether that's still in progress or the app is just stuck.
+  // `renderRooms()` overwrites this `innerHTML` outright the moment real
+  // data shows up, so nothing further needs to clear it back out.
+  el.roomListItems.innerHTML = `<div style="padding:12px;color:var(--text-weak);font-size:12px;text-align:center;">loading rooms...</div>`;
 }
 
 // =========================================================================
@@ -412,6 +422,10 @@ function closeDialog() {
 
 function selectRoom(roomId) {
   state.selectedRoom = roomId;
+  // Narrow (phone-width) layout shows one pane at a time — see the
+  // `#chat-screen.room-open` rules in style.css. Harmless no-op class on
+  // desktop widths, where CSS never looks at it.
+  el.chatScreen.classList.add("room-open");
   // Keep the keyboard highlight in sync with the actual selection, so a
   // mouse click doesn't leave a stale `.kbd-active` outline sitting on
   // whatever row arrow keys last visited, and so arrow keys right after a
@@ -445,6 +459,9 @@ function selectRoom(roomId) {
 function closeRoomMenu() {
   el.roomMenu.style.display = "none";
 }
+el.btnBackToRooms.addEventListener("click", () => {
+  el.chatScreen.classList.remove("room-open");
+});
 el.btnRoomMenu.addEventListener("click", (e) => {
   e.stopPropagation();
   el.roomMenu.style.display = el.roomMenu.style.display === "none" ? "flex" : "none";
@@ -551,6 +568,7 @@ function renderTimeline() {
     p.id = "timeline-placeholder";
     p.textContent = "no messages yet";
     el.timeline.appendChild(p);
+    updateJumpLatestVisibility();
     return;
   }
   let prev = null;
@@ -560,6 +578,7 @@ function renderTimeline() {
     prev = event;
   }
   el.timeline.scrollTop = el.timeline.scrollHeight;
+  updateJumpLatestVisibility();
 }
 
 /** Consecutive messages from the same sender, close together in time and
@@ -614,6 +633,7 @@ function appendMessage(roomId, event) {
   const grouped = isGrouped(events[events.length - 2], event);
   el.timeline.appendChild(renderMessage(event, { roomId, threadId: null }, { grouped }));
   if (wasNearBottom) el.timeline.scrollTop = el.timeline.scrollHeight;
+  updateJumpLatestVisibility();
 }
 
 function paginateBack(roomId) {
@@ -630,6 +650,31 @@ function paginateBack(roomId) {
 
 el.timeline.addEventListener("scroll", () => {
   if (el.timeline.scrollTop < 80) paginateBack(state.selectedRoom);
+  updateJumpLatestVisibility();
+});
+
+/** Shows/hides the floating "jump to latest message" button (works the
+ * same way — tap/click, no hover needed — on every platform this ships
+ * on) based on how far the timeline is scrolled from its bottom. Called
+ * after anything that can move the scroll position or add content:
+ * scrolling itself, a fresh `renderTimeline()`, and a new message
+ * arriving via `appendMessage()` while scrolled up to read history. */
+function updateJumpLatestVisibility() {
+  const farFromBottom =
+    el.timeline.scrollHeight - el.timeline.scrollTop - el.timeline.clientHeight > 300;
+  el.btnJumpLatest.style.display = farFromBottom ? "flex" : "none";
+}
+
+el.btnJumpLatest.addEventListener("click", () => {
+  // Not `behavior: "smooth"` — confirmed on Android, an animated scroll
+  // through many rows that use `content-visibility: auto` (every
+  // `.msg-row`, see its CSS) visibly glitches there: rows becoming
+  // visible mid-animation render with stale/overlapping content for a
+  // frame or two, since that WebView's layout doesn't keep up with each
+  // intermediate scroll position the way it does with a single instant
+  // jump. A plain `scrollTop` assignment resolves in one paint instead.
+  el.timeline.scrollTop = el.timeline.scrollHeight;
+  updateJumpLatestVisibility();
 });
 
 /** Looks for an already-loaded message by event ID — everywhere a reply
@@ -912,6 +957,19 @@ function renderMessage(event, ctx, opts = {}) {
     });
     bubble.appendChild(trigger);
   }
+
+  // `.actions` only ever reveals on `:hover` (see its CSS) — there's no
+  // hover on a touchscreen, so on mobile it was simply never reachable at
+  // all. A tap on the bubble toggles it there instead (see the
+  // `.actions-open` mobile-only CSS); harmless everywhere else, since
+  // nothing there reads that class. Skipped when the tap actually landed
+  // on a real interactive element inside the bubble (a link, the reply
+  // preview, an image, a button) so it doesn't fight with that element's
+  // own click behavior.
+  bubble.addEventListener("click", (e) => {
+    if (e.target.closest("a, button, img")) return;
+    row.classList.toggle("actions-open");
+  });
 
   col.appendChild(bubble);
 
@@ -1345,6 +1403,16 @@ function applyMarkdownAction(textarea, action) {
  * "hey" doesn't reserve space for a paragraph, but a pasted paragraph
  * doesn't swallow the whole timeline either. */
 function autoResizeTextarea(textarea) {
+  // An empty textarea should always sit at its CSS `min-height` (one
+  // line), not grow to fit the placeholder — some WebView builds
+  // (confirmed on Android) compute `scrollHeight` against the wrapped
+  // placeholder text when there's no value, which ballooned the compose
+  // box to several lines tall on phone widths (long placeholder + larger
+  // mobile font-size wraps a lot) even before anything was typed.
+  if (!textarea.value) {
+    textarea.style.height = "";
+    return;
+  }
   textarea.style.height = "auto";
   textarea.style.height = textarea.scrollHeight + "px";
 }
@@ -2375,6 +2443,11 @@ function handleBackendEvent(evt) {
       // copy of the badge on the root) — patch just that one row instead
       // of a full `renderTimeline()`.
       rerenderMessageInPlace(data.room_id, data.thread_root_id);
+      // `openHere` (declared above) covers "thread panel already showing
+      // this exact thread" the same way `maybeNotify` covers "room already
+      // open and focused" for `NewMessage` — skip the notification in
+      // either case, it's already right there on screen.
+      if (!openHere) maybeNotify(data.room_id, data.event, data.thread_root_id);
       break;
     }
     case "ThreadEvents":
@@ -2508,6 +2581,19 @@ function handleBackendEvent(evt) {
     case "NotificationClicked":
       selectRoom(data.room_id);
       window.focus?.();
+      if (data.thread_id) {
+        // The root event may not be loaded locally yet (e.g. the app was
+        // fully backgrounded when the reply came in) — a minimal stub is
+        // enough to open the panel with, `openThread` itself fetches the
+        // real thread content via `LoadThread` right after.
+        const root = findEvent(data.room_id, data.thread_id) || {
+          event_id: data.thread_id,
+          sender_name: "",
+          body: "",
+          timestamp: Date.now(),
+        };
+        openThread(data.room_id, root);
+      }
       break;
     case "Reactions": {
       const ev = findEvent(data.room_id, data.event_id);
@@ -2630,7 +2716,7 @@ setupResizer(document.getElementById("resizer-right"), el.sidePanel, { fromRight
  * switching away to another app should still notify), and respect the
  * room's notification mode once known (defaults to "all" for a room whose
  * mode hasn't been fetched yet, same as the room list's own default). */
-function maybeNotify(roomId, event) {
+function maybeNotify(roomId, event, threadId = null) {
   if (event.is_own) return;
   if (roomId === state.selectedRoom && document.hasFocus()) return;
 
@@ -2642,7 +2728,7 @@ function maybeNotify(roomId, event) {
   const title = room ? `${event.sender_name} (${room.name})` : event.sender_name;
   const body =
     event.msg_type === "image" ? "sent an image" : truncate(event.body || "", 120);
-  send("ShowNotification", { room_id: roomId, title, body });
+  send("ShowNotification", { room_id: roomId, thread_id: threadId, title, body });
 }
 
 /** Jumps to and briefly highlights the message a reply-preview points at.
@@ -2735,4 +2821,12 @@ function openMatrixToLink(roomId, eventId) {
 }
 
 // ---- Boot ----
-send("CheckSession");
+// No `send("CheckSession")` here anymore — the Rust worker now runs that
+// check itself the instant it starts (see `matrix/worker.rs::run`), and
+// whatever it finds reaches this page through the normal `poll_events`
+// loop regardless of whether this script's own boot code just ran. It
+// has to work that way: on Android, this script re-running at all isn't
+// guaranteed on every app open (confirmed on a real device — the native
+// host process restarting doesn't reliably mean the WebView's page came
+// back up fresh with it), so a boot-time `send` from here could simply
+// never fire, leaving a perfectly valid stored session unchecked.

@@ -3,38 +3,78 @@ name = "matrix-tauri-client"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "matrix_tauri_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
 tokio = { version = "1", features = ["full"] }
 
+# rustls instead of native-tls: one TLS stack on every target, including
+# Android (no OS-provided TLS lib to link against there, unlike
+# native-tls's schannel/security-framework/openssl per-platform backends).
 matrix-sdk = { version = "0.7", default-features = false, features = [
-    "native-tls",
+    "rustls-tls",
     "e2e-encryption",
     "sqlite",
     "sso-login",
 ] }
 matrix-sdk-ui = { version = "0.7", default-features = false, features = [
-    "native-tls",
+    "rustls-tls",
     "e2e-encryption",
 ] }
 
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
-directories = "5"
-open = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mime = "0.3"
 base64 = "0.22"
-arboard = { version = "3.6.1", features = ["image-data"] }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-ksni = { version = "0.3", features = ["tokio"] }
+
+# Desktop-only: single-instance guard, clipboard-image read (`arboard`),
+# native OS notifications (`notify-rust`), and browser/file "open"
+# (`open`) crate — none of these support Android/iOS. Mobile equivalents
+# are pulled in below via Tauri's own plugins instead.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = "2"
+directories = "5"
+open = "5"
+arboard = { version = "3.6.1", features = ["image-data"] }
 notify-rust = { version = "4.18", features = ["tokio"] }
+
+# Linux-only real tray (see src/tray.rs for why: Tauri's own tray-icon
+# backend on Linux, libappindicator, has no left-click "Activate" event).
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["tokio"] }
+
+# Mobile-only: official cross-platform replacements for the desktop-only
+# crates above.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+# OAuth/SSO redirect catcher — see `matrix/oidc_callback.rs`. Desktop
+# spins up a loopback HTTP server and waits for the browser to redirect
+# to it, which only works as long as the app's process stays alive the
+# whole time the user is in the browser. Mobile OSes can and do kill a
+# backgrounded app process at any point (confirmed on Android/MIUI — the
+# desktop mechanism just silently never completes when that happens), so
+# mobile instead registers a custom URL scheme the browser redirects to,
+# which Android/iOS deliver via an Intent/Activity launch that resumes
+# (or cold-starts) the app either way.
+tauri-plugin-deep-link = "2"
+# Neither the Android NDK nor iOS ships a linkable libsqlite3 the way
+# desktop OSes do — matrix-sdk-sqlite's `rusqlite` needs to compile its
+# own copy from source there instead of dynamically linking one. Pinning
+# the same version matrix-sdk-sqlite (0.7.1) pulls in makes Cargo unify
+# the two into one build with this feature turned on, rather than two
+# separate `rusqlite` copies.
+rusqlite = { version = "0.30", features = ["bundled"] }

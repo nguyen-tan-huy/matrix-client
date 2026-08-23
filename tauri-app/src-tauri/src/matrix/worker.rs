@@ -177,9 +177,7 @@ fn data_dir() -> std::path::PathBuf {
     // collide with crypto/state data an *old* device already wrote there,
     // which is exactly what caused OAuth login to hang forever with no
     // error (traced back to this, not anything OAuth- or Tauri-specific).
-    directories::ProjectDirs::from("com", "example", "matrix-tauri-client")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("./matrix-tauri-client-data"))
+    crate::platform::data_dir()
 }
 
 fn session_file() -> std::path::PathBuf {
@@ -404,6 +402,7 @@ fn timeline_runtime() -> &'static tokio::runtime::Runtime {
 /// runtimes (see `image_runtime`/`timeline_runtime`) so heavy traffic on
 /// one never delays the others.
 pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>) {
+    tracing::info!("worker: run() starting");
     let state = Arc::new(Mutex::new(WorkerState {
         client: None,
         room_timelines: HashMap::new(),
@@ -414,6 +413,31 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         dirty_rooms: std::collections::HashSet::new(),
         confirmed_read: load_read_state(),
     }));
+
+    // Normally the frontend asks for this itself (`send("CheckSession")`
+    // right as `app.js` starts running) — but on Android, the native host
+    // process restarting (killed and relaunched, confirmed happening
+    // constantly on a real MIUI/HyperOS device) doesn't reliably mean the
+    // WebView's page/JS actually reloaded with it; when it doesn't, that
+    // boot-time `send` never fires again and the stored session — still
+    // perfectly valid on disk — never gets checked, leaving the user
+    // stuck on the login screen for no visible reason every time. Running
+    // the same check unconditionally here instead, right as the worker
+    // itself starts (which — unlike the WebView reload — reliably does
+    // happen fresh on every native process start), doesn't depend on the
+    // frontend's cooperation at all: whatever it emits reaches `app.js`
+    // through the same `poll_events` loop everything else does, whether
+    // or not the page's own boot script happened to run this time.
+    {
+        let state = state.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle(Command::CheckSession, state, tx.clone()).await {
+                tracing::error!(error = %err, "startup check_session failed");
+                let _ = tx.send(Event::Error(err.to_string()));
+            }
+        });
+    }
 
     while let Some(cmd) = rx.recv().await {
         let state = state.clone();
@@ -443,6 +467,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
             _ => {
                 tokio::spawn(async move {
                     if let Err(err) = handle(cmd, state, tx.clone()).await {
+                        tracing::error!(error = %err, "command failed");
                         let _ = tx.send(Event::Error(err.to_string()));
                     }
                 });
@@ -459,15 +484,45 @@ async fn handle(
     match cmd {
         Command::CheckSession => {
             let path = session_file();
+            tracing::info!(path = %path.display(), exists = path.exists(), "check_session: looking for stored session");
             if !path.exists() {
                 tx.send(Event::SessionChecked(false)).ok();
                 return Ok(());
             }
             let raw = std::fs::read_to_string(&path)?;
             let stored: StoredSession = serde_json::from_str(&raw)?;
-            let client = build_client_with_timeout(&stored.homeserver).await?;
+
+            // This runs automatically the instant the app launches — on
+            // Android specifically (confirmed on a Xiaomi/HyperOS device,
+            // same root cause as the OAuth token-exchange retry above),
+            // that can be before the OS has actually finished bringing the
+            // process's network access back up, so the very first request
+            // this makes (`build_client`'s homeserver discovery) fails with
+            // a DNS/connect error despite a perfectly valid stored session.
+            // Previously that error just propagated out of this whole
+            // command via `?` — no `SessionChecked` event either way, so
+            // the frontend never learned the check even happened and sat
+            // on the login screen forever with no explanation, session
+            // file intact and unused. A few quick retries bridges the gap;
+            // desktop always succeeds on the first attempt regardless.
+            let mut attempt = 0;
+            let client = loop {
+                match build_client_with_timeout(&stored.homeserver).await {
+                    Ok(client) => break client,
+                    Err(e) if attempt < 3 => {
+                        attempt += 1;
+                        tracing::warn!(attempt, error = %e, "check_session: build_client failed, retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+                    }
+                    Err(e) => {
+                        tx.send(Event::SessionChecked(false)).ok();
+                        return Err(e);
+                    }
+                }
+            };
             client.restore_session(stored.session).await?;
             state.lock().await.client = Some(client);
+            tracing::info!("check_session: restored successfully");
             tx.send(Event::SessionChecked(true)).ok();
         }
 
@@ -536,7 +591,7 @@ async fn handle(
                             .await
                             {
                                 Ok(sso_url) => {
-                                    if let Err(e) = open::that(&sso_url) {
+                                    if let Err(e) = crate::platform::open_url(sso_url.as_str()) {
                                         tx.send(Event::LoginError(format!(
                                             "failed to open browser: {e}"
                                         )))
@@ -550,17 +605,46 @@ async fn handle(
                                             tracing::info!(
                                                 "oauth: got login token, exchanging for session"
                                             );
-                                            match with_timeout_str(
-                                                client
-                                                    .matrix_auth()
-                                                    .login_token(&login_token)
-                                                    .initial_device_display_name(
-                                                        "Matrix egui Client",
-                                                    )
-                                                    .send(),
-                                            )
-                                            .await
-                                            {
+                                            // Android (confirmed on a Xiaomi/HyperOS device):
+                                            // the app backgrounds itself to let the external
+                                            // browser complete the SSO redirect, and the OS
+                                            // hasn't necessarily restored this process's
+                                            // network access yet by the time the redirect
+                                            // deep-link brings it back to the foreground a
+                                            // moment later — the very first request after
+                                            // resuming fails with a DNS/connect error even
+                                            // though the exact same homeserver was reachable
+                                            // seconds earlier (both from this process, for
+                                            // `get_sso_login_url`, and from the browser that
+                                            // just logged in through it). A few quick retries
+                                            // bridges that gap; harmless on desktop, where
+                                            // this always just succeeds on the first try.
+                                            let mut attempt = 0;
+                                            let result = loop {
+                                                let outcome = with_timeout_str(
+                                                    client
+                                                        .matrix_auth()
+                                                        .login_token(&login_token)
+                                                        .initial_device_display_name(
+                                                            "Matrix egui Client",
+                                                        )
+                                                        .send(),
+                                                )
+                                                .await;
+                                                attempt += 1;
+                                                if outcome.is_ok() || attempt >= 4 {
+                                                    break outcome;
+                                                }
+                                                tracing::warn!(
+                                                    attempt,
+                                                    "oauth: token exchange failed, retrying"
+                                                );
+                                                tokio::time::sleep(std::time::Duration::from_millis(
+                                                    750 * attempt as u64,
+                                                ))
+                                                .await;
+                                            };
+                                            match result {
                                                 Ok(_) => {
                                                     tracing::info!(
                                                         "oauth: token exchange succeeded"
@@ -1462,25 +1546,63 @@ async fn handle(
 
             tx.send(Event::NotificationMode { room_id, mode }).ok();
         }
-        Command::ShowNotification { room_id, title, body } => {
-            let handle = notify_rust::Notification::new()
-                .summary(&title)
-                .body(&body)
-                .show_async()
-                .await;
-            if let Ok(handle) = handle {
-                // Waits until the notification is clicked/dismissed —
-                // this command's own spawned task (see the dispatch loop)
-                // just stays alive for that long, same as any other
-                // in-flight command; nothing else is blocked by it.
-                handle
-                    .wait_for_action_async(|response| {
-                        if matches!(response, notify_rust::NotificationResponse::Default) {
-                            tx.send(Event::NotificationClicked { room_id }).ok();
-                        }
-                    })
+        Command::ShowNotification { room_id, thread_id, title, body } => {
+            // Only the Linux (D-Bus/xdg) backend has an async API
+            // (`show_async`/`wait_for_action_async`) — Windows and macOS's
+            // backends in this crate are sync-only (`show`/
+            // `wait_for_response`), so those run on a blocking-pool thread
+            // instead, via `spawn_blocking`, to avoid parking one of the
+            // async runtime's own worker threads on `events.recv()`.
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+            {
+                let handle = notify_rust::Notification::new()
+                    .summary(&title)
+                    .body(&body)
+                    .show_async()
                     .await;
+                if let Ok(handle) = handle {
+                    // Waits until the notification is clicked/dismissed —
+                    // this command's own spawned task (see the dispatch
+                    // loop) just stays alive for that long, same as any
+                    // other in-flight command; nothing else is blocked by
+                    // it.
+                    handle
+                        .wait_for_action_async(|response| {
+                            if matches!(response, notify_rust::NotificationResponse::Default) {
+                                tx.send(Event::NotificationClicked { room_id, thread_id }).ok();
+                            }
+                        })
+                        .await;
+                }
             }
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let handle = notify_rust::Notification::new().summary(&title).body(&body).show();
+                    if let Ok(handle) = handle {
+                        let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
+                            if matches!(response, notify_rust::NotificationResponse::Default) {
+                                tx.send(Event::NotificationClicked { room_id, thread_id }).ok();
+                            }
+                        });
+                    }
+                })
+                .await;
+            }
+            // Mobile has no in-process click callback the way notify-rust
+            // does — tapping the notification instead re-launches the app
+            // via a `matrixtauriclient://notification?...` deep link (see
+            // `MainActivity.kt`'s `handleNotificationTap` and this file's
+            // `HandleNotificationClick` handler below), carrying room_id/
+            // thread_id as the notification's own `extra` data so that
+            // native-side redirect has something to work with.
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                let _ = crate::platform::show_notification(&room_id, thread_id.as_deref(), &title, &body);
+            }
+        }
+        Command::HandleNotificationClick { room_id, thread_id } => {
+            tx.send(Event::NotificationClicked { room_id, thread_id }).ok();
         }
 
         Command::ToggleReaction { room_id, event_id, emoji } => {
@@ -1672,7 +1794,7 @@ async fn handle(
                     if let Err(e) = std::fs::write(&path, &bytes) {
                         tx.send(Event::Error(format!("failed to save video: {e}")))
                             .ok();
-                    } else if let Err(e) = open::that(&path) {
+                    } else if let Err(e) = crate::platform::open_path(&path) {
                         tx.send(Event::Error(format!("failed to open video player: {e}")))
                             .ok();
                     }
@@ -1697,7 +1819,7 @@ async fn handle(
                     if let Err(e) = std::fs::write(&path, &bytes) {
                         tx.send(Event::Error(format!("failed to save file: {e}")))
                             .ok();
-                    } else if let Err(e) = open::that(&path) {
+                    } else if let Err(e) = crate::platform::open_path(&path) {
                         tx.send(Event::Error(format!("failed to open file: {e}")))
                             .ok();
                     }
@@ -1712,9 +1834,7 @@ async fn handle(
             let client = get_client(&state).await?;
             match download_media_bytes(&client, &mxc_uri, media_encryption.as_deref()).await {
                 Ok(bytes) => {
-                    let dir = directories::UserDirs::new()
-                        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
-                        .unwrap_or_else(std::env::temp_dir);
+                    let dir = crate::platform::download_dir();
                     if let Err(e) = std::fs::create_dir_all(&dir) {
                         tx.send(Event::Error(format!("failed to prepare downloads folder: {e}")))
                             .ok();

@@ -226,8 +226,22 @@ pub enum Command {
     /// `notify-rust`'s own `show_async()` from here avoids that entirely.
     ShowNotification {
         room_id: String,
+        /// Set when this notification is for a reply inside a thread —
+        /// clicking it should open that thread directly, not just the
+        /// room, same as clicking the thread badge on the message itself.
+        thread_id: Option<String>,
         title: String,
         body: String,
+    },
+    /// Not sent by the frontend directly — routed here from a
+    /// `matrixtauriclient://notification?...` deep link, itself fired by
+    /// tapping an Android notification (see `MainActivity.kt`'s
+    /// `handleNotificationTap`). Just forwards to the same
+    /// `Event::NotificationClicked` the desktop click path already sends,
+    /// so `app.js` only needs the one handler for both platforms.
+    HandleNotificationClick {
+        room_id: String,
+        thread_id: Option<String>,
     },
     /// Adds an emoji reaction to a message if the logged-in user hasn't
     /// already reacted with that emoji, or removes it if they have — same
