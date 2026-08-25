@@ -57,12 +57,32 @@ pub struct TimelineEvent {
     /// timeline items) a keyword/room-notify highlight. Drives the
     /// highlighted-message styling in the timeline.
     pub mentions_me: bool,
+    /// User IDs (`@user:server`) named in this message's `m.mentions` —
+    /// the *specific* people it tags, as opposed to `mentions_me` (which
+    /// only says whether the logged-in user happens to be one of them).
+    /// Drives rendering an `@DisplayName` occurrence in the body as a
+    /// pill instead of plain text, same as Element does — see `app.js`'s
+    /// `applyMentionPills`.
+    pub mentioned_user_ids: Vec<String>,
     /// Emoji reactions on this message, aggregated by emoji. Starts empty
     /// on initial load (fetched on demand — see `Command::ToggleReaction`
     /// and `Event::Reactions` — rather than eagerly for every message,
     /// which would mean an extra request per message just to render a
     /// list) and gets filled in once something reacts to it this session.
     pub reactions: Vec<ReactionSummary>,
+    /// For a thread root only (`thread_count.is_some()`): the display name
+    /// of whoever sent the thread's most recent reply, straight from the
+    /// server's bundled aggregation on that root event — no separate
+    /// `/relations` fetch needed just to preview it. `None` for every other
+    /// kind of event this model represents (a normal message, an actual
+    /// thread reply, or a thread root the server didn't bundle this for).
+    pub latest_reply_sender_name: Option<String>,
+    /// Same bundled-aggregation source as `latest_reply_sender_name` — the
+    /// most recent reply's body text.
+    pub latest_reply_body: Option<String>,
+    /// Same bundled-aggregation source as `latest_reply_sender_name` — the
+    /// most recent reply's `origin_server_ts`.
+    pub latest_reply_ts: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -73,6 +93,16 @@ pub struct ReactionSummary {
     /// highlighting the pill and determines whether clicking it removes
     /// vs. adds a reaction.
     pub by_me: bool,
+}
+
+/// One message found by `Command::SearchUserMessages` — a `TimelineEvent`
+/// plus which room it came from, since results are aggregated across every
+/// joined room rather than scoped to one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UserSearchHit {
+    pub room_id: String,
+    pub room_name: String,
+    pub event: TimelineEvent,
 }
 
 /// One image in a room's custom emoji/sticker pack (`im.ponies.room_emotes`

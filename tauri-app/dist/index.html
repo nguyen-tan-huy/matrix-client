@@ -29,10 +29,17 @@
     <div id="room-list-header">
       <span>CHATS</span>
       <div id="room-list-header-actions">
-        <button id="btn-security" class="small-btn" title="security">[sec]</button>
         <button id="btn-create-room" class="small-btn" title="create room or space">[+]</button>
+        <button id="btn-reload-rooms" class="small-btn" title="reload room list and unread counts">[ reload ]</button>
         <button id="btn-global-threads" class="small-btn" title="threads with new replies, across all rooms">[ threads ]</button>
-        <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ ? ]</button>
+        <div id="chats-menu-wrap">
+          <button id="btn-chats-menu" class="small-btn" title="more">[ ⋯ ]</button>
+          <div id="chats-menu" style="display:none;">
+            <button id="btn-security" class="small-btn" title="security">[ security ]</button>
+            <button id="btn-user-search" class="small-btn" title="find every message from one user, across all rooms">[ user msgs ]</button>
+            <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ shortcuts ]</button>
+          </div>
+        </div>
       </div>
     </div>
     <div id="space-picker"></div>
@@ -65,9 +72,8 @@
         </div>
       </div>
     </div>
-    <div id="summary-box" style="display:none;"></div>
     <div id="timeline-wrap">
-      <div id="timeline">
+      <div id="timeline" tabindex="-1">
         <div id="timeline-placeholder">select a conversation</div>
       </div>
       <button id="btn-jump-latest" class="jump-latest-btn" style="display:none;" title="jump to latest message">↓</button>
@@ -88,7 +94,7 @@
           <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
           <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
           <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
-          <button type="button" class="md-btn" data-md="link" title="link (Ctrl+K)">link</button>
+          <button type="button" class="md-btn" data-md="link" title="link">link</button>
         </div>
         <textarea id="compose-input" class="compose-textarea" rows="1" placeholder="message... (@ to mention, **bold**, *italic*, `code` — shift+enter for a new line)"></textarea>
       </div>

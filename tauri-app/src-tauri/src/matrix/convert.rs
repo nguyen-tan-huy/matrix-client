@@ -245,6 +245,7 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         });
 
     let (reply_to_event_id, reply_to_preview) = reply_preview(event);
+    let mentioned_user_ids = mentioned_user_ids_from_raw(event);
 
     Some(TimelineEvent {
         event_id: event.event_id()?.to_string(),
@@ -262,8 +263,118 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         reply_to_event_id,
         reply_to_preview,
         mentions_me: event.is_highlighted(),
+        mentioned_user_ids,
         reactions: Vec::new(),
+        // Only populated for the `/threads`-endpoint path (see
+        // `parse_thread_root` in `worker.rs`) that backs the threads-list
+        // panel — a thread root as it appears inline in the main timeline
+        // only ever shows its own reply-count button, not a preview of the
+        // latest reply, so there's nothing to fill in here.
+        latest_reply_sender_name: None,
+        latest_reply_body: None,
+        latest_reply_ts: None,
     })
+}
+
+/// Same "read it out of the raw event JSON" approach as `thread_count`
+/// just above — matrix-sdk-ui's typed `TimelineItemContent::Message`
+/// exposes `mentions()` too, but reading the raw JSON keeps this in one
+/// spot with `parse_raw_message_event`'s identical logic for the
+/// thread/search code paths (worker.rs), which have no typed item to call
+/// a method on at all. Also folds in any user pill found in
+/// `formatted_body` (see `user_ids_from_formatted_body`) that
+/// `m.mentions` alone missed, deduplicated.
+fn mentioned_user_ids_from_raw(event: &matrix_sdk_ui::timeline::EventTimelineItem) -> Vec<String> {
+    let Some(value) = event
+        .latest_json()
+        .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+    else {
+        return Vec::new();
+    };
+    mentioned_user_ids_from_content(value.get("content"))
+}
+
+/// Shared by every code path that has a raw `content` object handy
+/// (`mentioned_user_ids_from_raw` above and `worker.rs`'s
+/// `parse_raw_message_event`) — the two actual sources are `m.mentions`
+/// and any matrix.to user pill in `formatted_body`, deduplicated.
+pub(crate) fn mentioned_user_ids_from_content(content: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(content) = content else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = content
+        .pointer("/m.mentions/user_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(html) = content.get("formatted_body").and_then(|v| v.as_str()) {
+        for id in user_ids_from_formatted_body(html) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The HTML alternate body of a typed `MessageType`, when it has one —
+/// used by `register_new_message_handler` (worker.rs) to feed
+/// `user_ids_from_formatted_body` from a live `/sync` message, which only
+/// has this typed enum handy rather than the raw JSON the other two
+/// mentioned-user-ids call sites read from directly.
+pub(crate) fn formatted_html_of(
+    msgtype: &matrix_sdk::ruma::events::room::message::MessageType,
+) -> Option<&str> {
+    use matrix_sdk::ruma::events::room::message::MessageType;
+    match msgtype {
+        MessageType::Text(t) => t.formatted.as_ref(),
+        MessageType::Notice(n) => n.formatted.as_ref(),
+        MessageType::Emote(e) => e.formatted.as_ref(),
+        _ => None,
+    }
+    .map(|f| f.body.as_str())
+}
+
+/// Pulls `@user:server` IDs out of matrix.to user links
+/// (`https://matrix.to/#/@user:server` or, since `encodeURIComponent`
+/// escapes `@`/`:`, this app's own `%40user%3Aserver` shape) in a
+/// message's HTML body — a fallback source of "who's actually tagged
+/// here" for `mentioned_user_ids_from_content`. Needed because not every
+/// client sets the newer (MSC3952) `m.mentions` content field for a
+/// mention it otherwise renders as a pill — without this, a real tag from
+/// one of those just showed as plain "@Name" text here instead of a pill,
+/// even in a room where `m.mentions`-based ones worked fine. No general
+/// percent-decoder, just those two escapes — a Matrix user id's character
+/// set has little else that would ever end up percent-encoded in
+/// practice, and anything that fails to parse as a real user ID is
+/// dropped rather than guessed at.
+pub(crate) fn user_ids_from_formatted_body(html: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let needle = "matrix.to/#/";
+    let mut search_from = 0usize;
+    while let Some(rel) = html[search_from..].find(needle) {
+        let start = search_from + rel + needle.len();
+        let rest = &html[start..];
+        let Some(id_part) = rest.strip_prefix("%40").or_else(|| rest.strip_prefix('@')) else {
+            search_from = start;
+            continue;
+        };
+        let end = id_part
+            .find(|c: char| c == '"' || c == '\'' || c == '<' || c.is_whitespace())
+            .unwrap_or(id_part.len());
+        let raw = id_part[..end].replace("%3A", ":").replace("%3a", ":");
+        let id = format!("@{raw}");
+        if matrix_sdk::ruma::UserId::parse(&id).is_ok() && !ids.contains(&id) {
+            ids.push(id);
+        }
+        search_from = start + end;
+    }
+    ids
 }
 
 /// Pulls "what message is this replying to" out of a timeline item, when

@@ -76,8 +76,14 @@ pub enum Event {
         room_id: String,
         members: Vec<(String, String)>,
     },
+    /// Response to `Command::Summarize` — echoes `thread_root_id` back
+    /// (as opposed to just carrying `room_id` alone) so the UI knows
+    /// whether this answers the main-timeline summarize dialog or a
+    /// specific thread's, since either can be requested independently
+    /// and their results shouldn't cross-populate the wrong popup.
     Summary {
         room_id: String,
+        thread_root_id: Option<String>,
         text: String,
     },
     /// A message was redacted — either by us (`Command::DeleteMessage`,
@@ -118,6 +124,11 @@ pub enum Event {
     VerificationDone,
     VerificationCancelled(String),
     RecoveryStatus(String),
+    /// Response to `Command::SetLvxApiKey`/`GetLvxApiKeyStatus` — never
+    /// carries the actual key, just whether one is currently set.
+    LvxApiKeyStatus {
+        configured: bool,
+    },
     /// Result of `Command::ImportRoomKeys` — how many of the sessions in
     /// the file were new/usable vs. the file's total session count.
     RoomKeysImported {
@@ -179,6 +190,22 @@ pub enum Event {
     ImagePacks {
         room_id: String,
         images: Vec<crate::models::EmojiImage>,
+    },
+
+    /// Full results for `Command::SearchUserMessages`. `truncated` means
+    /// at least one room hit `search_user_messages`'s safety page cap
+    /// before running out of history within the requested date range —
+    /// results for that room may be missing older messages; narrowing the
+    /// date range avoids it.
+    UserMessagesSearchResult {
+        user_id: String,
+        results: Vec<crate::models::UserSearchHit>,
+        truncated: bool,
+    },
+    /// Response to `Command::ListAllUsers` — `(user_id, display_name)`
+    /// pairs, one per distinct joined member across every joined room.
+    AllUsers {
+        users: Vec<(String, String)>,
     },
 
     Error(String),

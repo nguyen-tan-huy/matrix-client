@@ -184,32 +184,64 @@ fn session_file() -> std::path::PathBuf {
     data_dir().join("session.json")
 }
 
-/// Where `MarkRoomRead` confirmations (room_id -> event_id read up to) are
-/// persisted. Needed because the read receipt itself is fire-and-forget:
-/// the server only echoes back an updated (lower) unread count on some
-/// *later* sync response, and if the app is closed before that round trip
-/// completes, the locally cached unread count is still the stale
-/// pre-receipt one — so a room correctly shown as read in this session
-/// reappears as unread on the next launch. Comparing against the actual
-/// latest event id (not just a room_id flag) means a genuinely new
-/// message after the confirmed one still shows up as unread, restart or
-/// not.
+/// Where confirmed-read room IDs (see `WorkerState::confirmed_read`) are
+/// persisted, so a room marked read right before the app quits — before the
+/// server's own confirmation of that has had a chance to round-trip through
+/// a sync response — doesn't show its old unread badge again on next
+/// launch.
 fn read_state_file() -> std::path::PathBuf {
     data_dir().join("read_state.json")
 }
 
-fn load_read_state() -> HashMap<String, String> {
+fn load_read_state() -> std::collections::HashSet<String> {
     std::fs::read_to_string(read_state_file())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-fn save_read_state(state: &HashMap<String, String>) {
+fn save_read_state(state: &std::collections::HashSet<String>) {
     if let Ok(json) = serde_json::to_string(state) {
         let _ = std::fs::create_dir_all(data_dir());
         let _ = std::fs::write(read_state_file(), json);
     }
+}
+
+/// General app config, set from the UI (see `Command::SetLvxApiKey`)
+/// rather than only via environment variable — the security panel's
+/// "LVX API key" field.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    lvx_api_key: Option<String>,
+}
+
+fn config_file() -> std::path::PathBuf {
+    data_dir().join("config.json")
+}
+
+fn load_config() -> AppConfig {
+    std::fs::read_to_string(config_file())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &AppConfig) {
+    if let Ok(json) = serde_json::to_string(config) {
+        let _ = std::fs::create_dir_all(data_dir());
+        let _ = std::fs::write(config_file(), json);
+    }
+}
+
+/// The API key `Command::Summarize` actually sends to Longvan's LLM proxy
+/// — whichever the user set via the security panel (persisted in
+/// `config.json`), falling back to the `LVX_API_KEY` environment variable
+/// for anyone who'd rather set it that way instead.
+fn lvx_api_key() -> Option<String> {
+    load_config()
+        .lvx_api_key
+        .filter(|k| !k.is_empty())
+        .or_else(|| std::env::var("LVX_API_KEY").ok())
 }
 
 /// `build_client` wrapped in a hard overall timeout. Homeserver discovery
@@ -337,9 +369,6 @@ struct WorkerState {
     /// replies. Absent from the map entirely before the first page loads;
     /// `Some(None)` once the room's oldest thread has been reached.
     thread_list_cursors: HashMap<String, Option<String>>,
-    /// room_id -> event_id last confirmed read via `Command::MarkRoomRead`,
-    /// persisted to `read_state.json` — see that file's doc comment.
-    confirmed_read: HashMap<String, String>,
     /// room_id -> (display name, is-encrypted), as last computed by
     /// `refresh_rooms`. This is what keeps `refresh_rooms` fast on an
     /// account with thousands of rooms — recomputing `Room::display_name()`
@@ -356,6 +385,25 @@ struct WorkerState {
     /// burst of activity in a handful of rooms doesn't force a full
     /// re-scan of every room in the account.
     dirty_rooms: std::collections::HashSet<String>,
+    /// Rooms confirmed read via `Command::MarkRoomRead`, persisted to
+    /// `read_state.json` (see that file's doc comment) so it survives a
+    /// restart. The read receipt sent to the server is fire-and-forget:
+    /// the server only reflects a lower `notification_count` in a *later*
+    /// sync response for that room, and if the app quits before that
+    /// response lands, the locally cached (stale, pre-receipt) count is
+    /// what gets persisted to the sqlite store and reloaded on next
+    /// launch — a room correctly marked read still shows its old unread
+    /// badge, possibly forever if nothing else happens in it. An entry
+    /// here overrides that stale count to 0. It's removed the moment this
+    /// room shows up in a live sync response again (see `Command::StartSync`'s
+    /// debouncer, which clears it before draining into `dirty_rooms`) —
+    /// at that point the server has necessarily sent *something* new for
+    /// the room (our own receipt being echoed back, if nothing else), so
+    /// its `unread_notification_counts()` is fresh and can be trusted
+    /// directly again. That's what keeps this from becoming the same
+    /// permanent, never-invalidated override that caused the badge to
+    /// hide genuinely new messages before.
+    confirmed_read: std::collections::HashSet<String>,
 }
 
 /// Dedicated runtime for `FetchImage`/`PlayVideo`. A room with many images
@@ -456,7 +504,9 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
             | Command::PaginateBack { .. }
             | Command::LoadThread { .. }
             | Command::LoadMoreThreadReplies { .. }
-            | Command::ListThreads { .. } => {
+            | Command::ListThreads { .. }
+            | Command::SearchUserMessages { .. }
+            | Command::ListAllUsers => {
                 let cmd_for_task = cmd;
                 timeline_runtime().spawn(async move {
                     if let Err(err) = handle(cmd_for_task, state, tx.clone()).await {
@@ -748,7 +798,20 @@ async fn handle(
                     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     let dirty = {
                         let mut guard = state3.lock().await;
-                        std::mem::take(&mut guard.dirty_rooms)
+                        let dirty = std::mem::take(&mut guard.dirty_rooms);
+                        // These rooms just showed up in an actual sync
+                        // response, so their `unread_notification_counts()`
+                        // is fresh — safe to drop any `confirmed_read`
+                        // override now and trust the server's count
+                        // directly again (see that field's doc comment).
+                        let mut any_removed = false;
+                        for room_id in &dirty {
+                            any_removed |= guard.confirmed_read.remove(room_id);
+                        }
+                        if any_removed {
+                            save_read_state(&guard.confirmed_read);
+                        }
+                        dirty
                     };
                     if !dirty.is_empty() {
                         if let Err(e) = refresh_rooms(&state3, &tx4, Some(&dirty)).await {
@@ -761,6 +824,10 @@ async fn handle(
             // Kick an initial room list refresh immediately after starting.
             // `dirty: None` here means "everything" — the cache starts
             // empty, so this is the one unavoidable full scan.
+            refresh_rooms(&state, &tx, None).await?;
+        }
+
+        Command::RefreshRooms => {
             refresh_rooms(&state, &tx, None).await?;
         }
 
@@ -1233,54 +1300,132 @@ async fn handle(
             }
         }
 
-        Command::Summarize { room_id } => {
+        Command::Summarize { room_id, thread_root_id } => {
             let client = get_client(&state).await?;
-            let timeline = state
-                .lock()
-                .await
-                .room_timelines
-                .get(&room_id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("timeline not loaded"))?;
 
-            let items = timeline.items().await;
-            let events = convert_items(&client, &items).await;
+            let events = match &thread_root_id {
+                Some(thread_id) => {
+                    // `thread_timelines` isn't actually thread-scoped — see
+                    // the comment in `Command::LoadThread` — it's just
+                    // whichever live `Timeline` the room already has, kept
+                    // around for `SendMessage`'s reply routing. Summarizing
+                    // needs the thread's own replies specifically, so fetch
+                    // the whole thread directly via `/relations` instead,
+                    // the same way `LoadThread`/`LoadMoreThreadReplies` do —
+                    // independent of how much the open thread panel has
+                    // paginated in so far.
+                    let room = client
+                        .get_room(RoomId::parse(&room_id)?.as_ref())
+                        .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+                    let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
+
+                    let mut pages: Vec<Vec<crate::models::TimelineEvent>> = Vec::new();
+                    let mut from = None;
+                    loop {
+                        let (page, next_batch) =
+                            fetch_thread_replies_page(&client, &room, &room_id, &root_event_id, from)
+                                .await;
+                        let has_more = next_batch.is_some();
+                        pages.push(page);
+                        if !has_more {
+                            break;
+                        }
+                        from = next_batch;
+                    }
+
+                    let mut events = Vec::new();
+                    if let Ok(raw_root) = room.event(&root_event_id).await {
+                        if let Ok(value) = raw_root.event.deserialize_as::<serde_json::Value>() {
+                            if let Some(root) = parse_raw_message_event(&client, &room_id, &value).await {
+                                events.push(root);
+                            }
+                        }
+                    }
+                    // `pages` was filled newest-page-first (each page itself
+                    // oldest-to-newest — see `fetch_thread_replies_page`), so
+                    // reversing the page order puts everything in overall
+                    // chronological order after the root.
+                    for page in pages.into_iter().rev() {
+                        events.extend(page);
+                    }
+                    events
+                }
+                None => {
+                    let timeline = state
+                        .lock()
+                        .await
+                        .room_timelines
+                        .get(&room_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("timeline not loaded"))?;
+                    let items = timeline.items().await;
+                    convert_items(&client, &items).await
+                }
+            };
+
             let transcript = events
                 .iter()
                 .map(|e| format!("{}: {}", e.sender_name, e.body))
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY not set"))?;
+            // Longvan's internal LLM proxy — an OpenAI-compatible
+            // `/v1/chat/completions` endpoint, not Anthropic's Messages
+            // API, hence the different auth header/request/response
+            // shape from what this used to call directly against
+            // api.anthropic.com.
+            let api_key = lvx_api_key().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no LVX API key configured — set one in [ sec ] → LVX API key, or the LVX_API_KEY env var"
+                )
+            })?;
 
             let http = reqwest::Client::new();
             let response = http
-                .post("https://api.anthropic.com/v1/messages")
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .post("https://llm.ai.longvan.vn/v1/chat/completions")
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
                 .json(&serde_json::json!({
-                    "model": "claude-sonnet-4-6",
+                    "model": "lvx-1-fast",
                     "max_tokens": 400,
+                    "stream": false,
                     "messages": [{
                         "role": "user",
                         "content": format!(
-                            "Summarize the key points and action items of this chat transcript, in a few sentences:\n\n{transcript}"
+                            "Summarize the key points and action items of this chat transcript. \
+                             Respond in Vietnamese, regardless of what language the transcript itself is in. \
+                             The transcript may contain markdown links in the form [text](url) — whenever a \
+                             point you're summarizing corresponds to one of those, keep the real URL and \
+                             reference it the same way, as a markdown link, rather than just naming it in \
+                             plain text; don't invent a URL for anything that didn't have one in the \
+                             transcript:\n\n{transcript}"
                         )
                     }]
                 }))
                 .send()
                 .await?;
 
-            let body: serde_json::Value = response.json().await?;
-            let text = body["content"]
-                .as_array()
-                .and_then(|blocks| blocks.iter().find_map(|b| b["text"].as_str()))
-                .unwrap_or("(no summary returned)")
-                .to_string();
+            // Checked explicitly rather than just parsing whatever comes
+            // back as JSON and letting a missing `choices[0]` silently
+            // fall through to "(no summary returned)" — an error response
+            // (bad/expired key, wrong model name, rate limit, ...) is
+            // still valid JSON, just shaped like `{"error": {...}}`
+            // instead of a completion, which read as "the API said
+            // nothing" instead of surfacing what actually went wrong.
+            let status = response.status();
+            let body_text = response.text().await?;
+            if !status.is_success() {
+                anyhow::bail!("LVX summarize request failed ({status}): {body_text}");
+            }
+            let body: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+                anyhow::anyhow!("LVX summarize: response wasn't valid JSON ({e}): {body_text}")
+            })?;
+            let text = body["choices"][0]["message"]["content"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("(no summary returned — raw response: {body_text})"));
 
-            tx.send(Event::Summary { room_id, text }).ok();
+            tx.send(Event::Summary { room_id, thread_root_id, text }).ok();
         }
 
         Command::DeleteMessage { room_id, event_id } => {
@@ -1415,7 +1560,7 @@ async fn handle(
                     .await?;
 
                 let mut guard = state.lock().await;
-                guard.confirmed_read.insert(room_id.clone(), event_id.to_string());
+                guard.confirmed_read.insert(room_id.clone());
                 save_read_state(&guard.confirmed_read);
             }
             // `MarkRoomRead` fires on essentially every message received
@@ -1689,6 +1834,38 @@ async fn handle(
             tx.send(Event::ImagePacks { room_id, images }).ok();
         }
 
+        Command::SearchUserMessages { user_id, from_ts, to_ts } => {
+            let client = get_client(&state).await?;
+            let (results, truncated) = search_user_messages(&client, &user_id, from_ts, to_ts).await;
+            tx.send(Event::UserMessagesSearchResult {
+                user_id,
+                results,
+                truncated,
+            })
+            .ok();
+        }
+
+        Command::ListAllUsers => {
+            let client = get_client(&state).await?;
+            let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for room in client.rooms() {
+                if room.state() != matrix_sdk::RoomState::Joined || room.is_space() {
+                    continue;
+                }
+                let Ok(members) = room.members(matrix_sdk::RoomMemberships::JOIN).await else {
+                    continue;
+                };
+                for member in members {
+                    by_id
+                        .entry(member.user_id().to_string())
+                        .or_insert_with(|| member.name().to_string());
+                }
+            }
+            let mut users: Vec<(String, String)> = by_id.into_iter().collect();
+            users.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            tx.send(Event::AllUsers { users }).ok();
+        }
+
         Command::SendMeme { room_id, thread_id, url, shortcode } => {
             tracing::info!(room_id, ?thread_id, url, shortcode, "SendMeme: command received");
             let client = get_client(&state).await?;
@@ -1768,7 +1945,11 @@ async fn handle(
                     thread_count: None,
                     is_own: true,
                     mentions_me: false,
+                    mentioned_user_ids: Vec::new(),
                     reactions: Vec::new(),
+                    latest_reply_sender_name: None,
+                    latest_reply_body: None,
+                    latest_reply_ts: None,
                 };
                 tx.send(Event::NewMessage { room_id, event }).ok();
             }
@@ -1918,6 +2099,23 @@ async fn handle(
                 }
             }
         }
+
+        Command::SetLvxApiKey { api_key } => {
+            let mut config = load_config();
+            config.lvx_api_key = if api_key.is_empty() { None } else { Some(api_key) };
+            save_config(&config);
+            tx.send(Event::LvxApiKeyStatus {
+                configured: config.lvx_api_key.is_some(),
+            })
+            .ok();
+        }
+
+        Command::GetLvxApiKeyStatus => {
+            tx.send(Event::LvxApiKeyStatus {
+                configured: lvx_api_key().is_some(),
+            })
+            .ok();
+        }
         Command::ImportRoomKeys { bytes, passphrase } => {
             let client = get_client(&state).await?;
             match crate::matrix::verification::import_room_keys(&client, &bytes, &passphrase)
@@ -1960,12 +2158,12 @@ async fn refresh_rooms(
     dirty: Option<&std::collections::HashSet<String>>,
 ) -> anyhow::Result<()> {
     let client = get_client(state).await?;
-    let (confirmed_read, room_timelines, mut summary_cache) = {
+    let (room_timelines, mut summary_cache, confirmed_read) = {
         let guard = state.lock().await;
         (
-            guard.confirmed_read.clone(),
             guard.room_timelines.clone(),
             guard.room_summary_cache.clone(),
+            guard.confirmed_read.clone(),
         )
     };
     let mut summaries = Vec::new();
@@ -2045,39 +2243,16 @@ async fn refresh_rooms(
             name,
             last_message,
             last_message_ts,
-            // `num_unread_messages()` is computed client-side as sync
-            // responses stream in — more precise for encrypted rooms, but
-            // it only counts events processed *during this session*, so
-            // right after opening the app (or before any new activity)
-            // it reads 0 even for rooms that were already unread before
-            // launch. `unread_notification_counts()` comes straight from
-            // the server's sync response field, and is what actually
-            // shows unread state on cold start *for a room that's never
-            // been marked read* — but it turns out NOT to reliably
-            // persist the lower (post-receipt) count across a restart
-            // (confirmed empirically: a room correctly read this session,
-            // with a `read_state.json` entry to prove it, still reads a
-            // stale nonzero `notification_count` on the very next
-            // restart) — so for any room `MarkRoomRead` has *ever*
-            // confirmed read (an entry here, regardless of whether it
-            // still matches the current latest event — matching it
-            // exactly would need `Room::latest_event()`/a loaded
-            // `Timeline`, neither reliably available for a room that
-            // hasn't been opened this session, which is exactly the case
-            // right after a restart), trust `num_unread_messages()` alone
-            // instead: it correctly starts at 0 and only counts events
-            // this session's sync actually processes, including the
-            // catch-up sync right after a restart, so a genuinely new
-            // message that arrived while the app was closed still shows
-            // up once that catch-up completes — just not calling the
-            // stale server count as reinforcement anymore.
-            unread_count: {
-                let num_unread = room.num_unread_messages();
-                if confirmed_read.contains_key(room.room_id().as_str()) {
-                    num_unread
-                } else {
-                    num_unread.max(room.unread_notification_counts().notification_count)
-                }
+            // Server-reported count, unless this room is in
+            // `confirmed_read` (see that field's doc comment) — forced to
+            // 0 while it's present, which only lasts until the room next
+            // shows up in an actual live sync response (cleared by
+            // `Command::StartSync`'s debouncer), so it can never
+            // permanently mask real unread state.
+            unread_count: if confirmed_read.contains(room.room_id().as_str()) {
+                0
+            } else {
+                room.unread_notification_counts().notification_count
             },
             is_encrypted,
             is_invite,
@@ -2204,6 +2379,129 @@ async fn fetch_threads_page(
 
     let next_batch = response.next_batch.filter(|n| !n.is_empty());
     Ok((page, next_batch))
+}
+
+/// Scans every joined (non-space) room's history via `/messages` for
+/// events sent by `user_id`, most recent first — backs
+/// `Command::SearchUserMessages`. Uses `room.messages()` rather than a
+/// `matrix-sdk-ui` `Timeline` (like the main view does) since that decrypts
+/// automatically and needs no live `Timeline` object per room, which would
+/// be wasteful to spin up just for a search across possibly hundreds of
+/// rooms. The server-side `senders` filter narrows the request itself
+/// where the homeserver honors it; the sender is also checked again
+/// client-side since that's not guaranteed by the spec.
+///
+/// Deliberately not lazy/paginated from the UI's side — an earlier version
+/// only scanned a handful of rooms per call with a "load more" button, but
+/// that made it easy to miss a sender's older messages in a room you never
+/// got around to clicking "load more" into. This scans every room's full
+/// history in one call instead (bounded only by `from_ts`/`to_ts`, if
+/// given, or by `MAX_PAGES_PER_ROOM` as a last-resort safety net against
+/// one very active room turning an unbounded search into an effectively
+/// endless scan) — slower up front, but nothing is silently left out.
+/// `from_ts`/`to_ts` are `origin_server_ts` millisecond bounds (inclusive);
+/// either or both may be absent for an open-ended search.
+async fn search_user_messages(
+    client: &Client,
+    user_id: &str,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+) -> (Vec<crate::models::UserSearchHit>, bool) {
+    use matrix_sdk::room::MessagesOptions;
+    use matrix_sdk::ruma::api::client::filter::RoomEventFilter;
+    use matrix_sdk::ruma::UInt;
+
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES_PER_ROOM: usize = 40;
+
+    let Ok(target) = matrix_sdk::ruma::OwnedUserId::try_from(user_id) else {
+        return (Vec::new(), false);
+    };
+
+    let mut results = Vec::new();
+    let mut truncated = false;
+
+    for room in client.rooms() {
+        if room.state() != matrix_sdk::RoomState::Joined || room.is_space() {
+            continue;
+        }
+        let room_id = room.room_id().to_string();
+        let mut room_name: Option<String> = None;
+        let mut from = None;
+
+        'paging: for page_idx in 0..MAX_PAGES_PER_ROOM {
+            let mut filter = RoomEventFilter::default();
+            filter.senders = Some(vec![target.clone()]);
+            filter.types = Some(vec!["m.room.message".to_string(), "m.sticker".to_string()]);
+
+            let mut options = MessagesOptions::backward();
+            options.limit = UInt::from(PAGE_SIZE);
+            options.filter = filter;
+            options.from = from.clone();
+
+            let response = match room.messages(options).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, room_id, "SearchUserMessages: /messages failed");
+                    break;
+                }
+            };
+
+            for raw in &response.chunk {
+                let Ok(value) = raw.event.deserialize_as::<serde_json::Value>() else {
+                    continue;
+                };
+                // Checked before the sender match below (and not skipped
+                // along with a non-matching sender) since `/messages`
+                // returns events in strict time order regardless of
+                // sender — once *any* event in the page is older than
+                // `from_ts`, everything after it (this page and every
+                // later one) is guaranteed older too, so this is safe to
+                // treat as "this room is done" rather than just "this
+                // event doesn't count".
+                let ts = value.get("origin_server_ts").and_then(|v| v.as_i64());
+                if let (Some(from_ts), Some(ts)) = (from_ts, ts) {
+                    if ts < from_ts {
+                        break 'paging;
+                    }
+                }
+                if value.get("sender").and_then(|v| v.as_str()) != Some(target.as_str()) {
+                    continue;
+                }
+                if let (Some(to_ts), Some(ts)) = (to_ts, ts) {
+                    if ts > to_ts {
+                        continue;
+                    }
+                }
+                if let Some(event) = parse_raw_message_event(client, &room_id, &value).await {
+                    if room_name.is_none() {
+                        room_name = Some(
+                            room.display_name()
+                                .await
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|_| room_id.clone()),
+                        );
+                    }
+                    results.push(crate::models::UserSearchHit {
+                        room_id: room_id.clone(),
+                        room_name: room_name.clone().unwrap(),
+                        event,
+                    });
+                }
+            }
+
+            from = response.end;
+            if from.is_none() {
+                break;
+            }
+            if page_idx + 1 == MAX_PAGES_PER_ROOM {
+                truncated = true;
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.event.timestamp.cmp(&a.event.timestamp));
+    (results, truncated)
 }
 
 async fn parse_thread_root(
@@ -2502,23 +2800,29 @@ async fn parse_raw_message_event(
         .unwrap_or(false);
 
     let mentions_me = mentions_user(content, client.user_id());
+    let mentioned_user_ids = crate::matrix::convert::mentioned_user_ids_from_content(content);
 
-    let sender_name = match matrix_sdk::ruma::OwnedUserId::try_from(sender_str.as_str()) {
-        Ok(user_id) => match matrix_sdk::ruma::RoomId::parse(room_id)
-            .ok()
-            .and_then(|rid| client.get_room(&rid))
-        {
-            Some(room) => room
-                .get_member(&user_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.display_name().map(|n| n.to_string()))
-                .unwrap_or_else(|| sender_str.clone()),
-            None => sender_str.clone(),
-        },
-        Err(_) => sender_str.clone(),
+    let sender_name = resolve_sender_name(client, room_id, &sender_str).await;
+
+    // A thread root's bundled aggregation (same `unsigned.m.relations.m.thread`
+    // block `thread_count` above comes from) also carries the thread's most
+    // recent reply inline — no extra `/relations` round trip needed just to
+    // show a "first message / last message" preview for a thread that isn't
+    // open. Only ever present alongside `thread_count`, so these three stay
+    // `None` for every other event this function parses (a normal timeline
+    // message, an actual thread reply, ...) — harmless, just unused there.
+    let latest_event = value.pointer("/unsigned/m.relations/m.thread/latest_event");
+    let latest_reply_sender_name = match latest_event.and_then(|e| e.get("sender")).and_then(|v| v.as_str()) {
+        Some(latest_sender) => Some(resolve_sender_name(client, room_id, latest_sender).await),
+        None => None,
     };
+    let latest_reply_body = latest_event
+        .and_then(|e| e.pointer("/content/body"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let latest_reply_ts = latest_event
+        .and_then(|e| e.get("origin_server_ts"))
+        .and_then(|v| v.as_i64());
 
     Some(crate::models::TimelineEvent {
         event_id,
@@ -2536,8 +2840,36 @@ async fn parse_raw_message_event(
         reply_to_event_id,
         reply_to_preview: None,
         mentions_me,
+        mentioned_user_ids,
         reactions: Vec::new(),
+        latest_reply_sender_name,
+        latest_reply_body,
+        latest_reply_ts,
     })
+}
+
+/// Resolves a sender's room-specific display name (falling back to their
+/// bare user id if they have none set, or the room/id can't be resolved at
+/// all) — factored out since both a message's own sender and, for a
+/// thread root, its bundled latest-reply sender need the exact same
+/// lookup.
+async fn resolve_sender_name(client: &Client, room_id: &str, sender_str: &str) -> String {
+    match matrix_sdk::ruma::OwnedUserId::try_from(sender_str) {
+        Ok(user_id) => match matrix_sdk::ruma::RoomId::parse(room_id)
+            .ok()
+            .and_then(|rid| client.get_room(&rid))
+        {
+            Some(room) => room
+                .get_member(&user_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.display_name().map(|n| n.to_string()))
+                .unwrap_or_else(|| sender_str.to_string()),
+            None => sender_str.to_string(),
+        },
+        Err(_) => sender_str.to_string(),
+    }
 }
 
 /// Whether `content."m.mentions".user_ids` names `user_id` — used for
@@ -2759,6 +3091,25 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     .user_id()
                     .zip(ev.content.mentions.as_ref())
                     .is_some_and(|(uid, mentions)| mentions.user_ids.contains(uid));
+                // `m.mentions` (the modern, spec'd source) plus, since
+                // not every client sets that field for a mention it still
+                // renders as a pill, anything a matrix.to user link in
+                // the formatted body implies too — same union
+                // `parse_raw_message_event`'s raw-JSON path gets via
+                // `mentioned_user_ids_from_content`.
+                let mut mentioned_user_ids: Vec<String> = ev
+                    .content
+                    .mentions
+                    .as_ref()
+                    .map(|m| m.user_ids.iter().map(|id| id.to_string()).collect())
+                    .unwrap_or_default();
+                if let Some(html) = crate::matrix::convert::formatted_html_of(&ev.content.msgtype) {
+                    for id in crate::matrix::convert::user_ids_from_formatted_body(html) {
+                        if !mentioned_user_ids.contains(&id) {
+                            mentioned_user_ids.push(id);
+                        }
+                    }
+                }
 
                 let event = crate::models::TimelineEvent {
                     event_id: ev.event_id.to_string(),
@@ -2776,7 +3127,11 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     thread_count: None,
                     is_own,
                     mentions_me,
+                    mentioned_user_ids,
                     reactions: Vec::new(),
+                    latest_reply_sender_name: None,
+                    latest_reply_body: None,
+                    latest_reply_ts: None,
                 };
 
                 if let Some(thread_root_id) = thread_root_id {
@@ -2846,7 +3201,11 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                     thread_count: None,
                     is_own: false,
                     mentions_me: false,
+                    mentioned_user_ids: Vec::new(),
                     reactions: Vec::new(),
+                    latest_reply_sender_name: None,
+                    latest_reply_body: None,
+                    latest_reply_ts: None,
                 };
                 tx.send(Event::NewMessage { room_id: room.room_id().to_string(), event })
                     .ok();

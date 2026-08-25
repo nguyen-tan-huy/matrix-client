@@ -115,8 +115,25 @@ button:disabled { color: var(--text-weak); cursor: default; }
   justify-content: space-between;
   align-items: center;
 }
-#room-list-header-actions { display: flex; gap: 4px; }
+#room-list-header-actions { display: flex; gap: 4px; align-items: center; }
 .small-btn { font-size: 11px; padding: 2px 6px; }
+#chats-menu-wrap { position: relative; }
+#chats-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 10;
+  min-width: 140px;
+}
+#chats-menu button { width: 100%; text-align: left; }
 #space-picker {
   display: flex;
   flex-wrap: wrap;
@@ -144,6 +161,12 @@ button:disabled { color: var(--text-weak); cursor: default; }
 #room-list-items {
   overflow-y: auto;
   flex: 1;
+  /* Anchor point for a row fading out after being removed from the list
+   * (see `animateRoomListChanges` in app.js) — it's switched to
+   * `position: absolute` with an explicit top/left computed against this
+   * container, rather than whatever ancestor would otherwise pick up the
+   * containing-block role. */
+  position: relative;
 }
 .room-row {
   padding: 8px;
@@ -166,7 +189,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * box — distinct from `.selected` (the actually-open room), which stays a
  * solid left border so the two don't get visually confused when they
  * land on different rows at once. */
-.room-row.kbd-active { outline: 1px solid var(--accent-strong); outline-offset: -1px; }
+.room-row.kbd-active, .thread-row.kbd-active { outline: 1px solid var(--accent-strong); outline-offset: -1px; }
 .room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-name.unread { font-weight: bold; }
 .room-preview { color: var(--text-weak); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -297,13 +320,6 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .meme-add-form label { display: flex; align-items: center; gap: 4px; color: var(--text-weak); }
 .meme-add-form label input { width: auto; }
 .meme-add-actions { display: flex; gap: 6px; justify-content: flex-end; }
-#summary-box {
-  margin: 6px 12px;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  font-size: 12px;
-}
-#summary-box .summary-title { font-weight: bold; color: var(--text-weak); }
 /* Positioning context for `.jump-latest-btn`, which floats over the
  * message list rather than pushing it around — a plain flex sibling of
  * `#timeline` would either always take up space or require `#timeline`
@@ -344,13 +360,47 @@ button:disabled { color: var(--text-weak); cursor: default; }
   text-align: center;
   margin-top: 40px;
 }
+/* Shared "loading X..." indicator — a small bounce on the dog icon reads
+ * as "something's happening" at a glance, the same job a spinner does,
+ * without pulling in a spinner asset/animation of its own. Built by
+ * `loadingHtml()` in app.js; every plain-text "loading..." placeholder in
+ * the app goes through it instead of writing its own copy of this markup. */
+.loading-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-weak);
+}
+.loading-indicator .loading-icon {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  animation: loading-bounce 1s ease-in-out infinite;
+}
+@keyframes loading-bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
 #load-more-row { text-align: center; color: var(--text-weak); font-size: 12px; padding: 4px; }
 #load-more-row button { font-size: 11px; }
 /* Message content leads, sender is secondary, own messages sit on the
  * right — a chat-bubble layout rather than a flat sender-first list. */
 .msg-row {
   display: flex;
-  margin-bottom: 8px;
+  /* `.reactions`/`.reaction-trigger` deliberately poke ~9px below the
+   * bubble's own bottom edge (see their `bottom: -9px`) to float over the
+   * corner without reserving layout space. `content-visibility: auto`
+   * right below implies paint containment, which clips any descendant
+   * that overflows *this element's own border-box* — margin is outside
+   * that box and does nothing to prevent the clip, only padding
+   * (part of the box) actually gives that overflow somewhere to go
+   * without being cut off right at the row boundary. 10px covers the 9px
+   * of intentional overflow with a little to spare; the visible gap
+   * between messages is `margin-bottom` below, kept separate so grouped
+   * vs. non-grouped spacing can still differ.
+   */
+  padding-bottom: 10px;
+  margin-bottom: 0;
   /* Nothing here virtualizes the timeline — every loaded message stays in
    * the DOM forever, and a room you've paginated back through a lot (or
    * one with a long-running session) can end up with hundreds of rows.
@@ -362,15 +412,33 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * known. */
   content-visibility: auto;
   contain-intrinsic-size: auto 56px;
+  /* Every row shares the same (auto) stacking order otherwise, so
+   * whichever row is being hovered/tapped needs to paint above its
+   * neighbors for its floating reaction badge/actions gutter to ever be
+   * fully clickable rather than partly covered by an adjacent bubble. */
+  position: relative;
+  z-index: 0;
 }
+/* `content-visibility: auto` above always implies paint+layout
+ * containment (even while the row isn't being skipped) — which, per
+ * spec, makes the row a containing block for any `position: fixed`
+ * descendant too, the same way `transform`/`filter` would, silently
+ * clipping it to the row's own (tiny) box instead of letting it escape
+ * to the viewport like `position: fixed` normally does. Nothing inside a
+ * `.msg-row` currently uses `position: fixed` (the "⋯" menu and reaction
+ * picker are both portaled straight to `document.body` instead, see
+ * `openActionsMenu`/`openReactionPicker` in app.js, specifically to sidestep
+ * this) — this override just removes the containment for whichever one
+ * row is hovered/tapped anyway, as cheap insurance against the same trap
+ * for anything added here later. */
+.msg-row:hover, .msg-row.actions-open { z-index: 1; content-visibility: visible; }
+.msg-row:not(.grouped) { margin-bottom: 6px; }
 .msg-row.own { justify-content: flex-end; }
 .msg-row.other { justify-content: flex-start; }
-.msg-row.grouped { margin-bottom: 2px; }
-
 .msg-col {
   display: flex;
   flex-direction: column;
-  position: relative; /* anchors `.actions`, positioned absolutely — see its comment */
+  position: relative;
   /* A percentage max-width on `.bubble` itself wouldn't resolve here —
    * `.msg-col` has no definite width of its own to be a percentage of
    * (it shrinks to fit its content, which is circular). `.msg-row` does
@@ -409,6 +477,26 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .bubble .body code { background: var(--bg); padding: 0 3px; }
 .bubble .body pre { background: var(--bg); padding: 6px; overflow-x: auto; }
 .bubble .body a { color: var(--accent-strong); }
+/* An @mention pill (see `applyMentionPills`) — color/background set
+ * per-element in JS (same per-sender hash as `.sender`'s own color), this
+ * just handles the pill shape and the small avatar-stand-in dot. */
+.mention-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  padding: 0 6px 0 3px;
+  font-weight: 600;
+}
+.mention-pill::before {
+  content: "";
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+  flex-shrink: 0;
+}
 .bubble img { max-width: 280px; max-height: 280px; display: block; cursor: pointer; }
 .image-placeholder {
   width: 200px;
@@ -531,11 +619,16 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 .msg-row:hover .reaction-add { visibility: visible; }
 .reaction-add:hover { border-color: var(--accent); color: var(--accent); }
+/* Position (`fixed` + computed `top`/`left`) is set inline by
+ * `openReactionPicker` in app.js, not here — it's appended to
+ * `document.body`, not the message bubble, specifically so it can't be
+ * clipped by `.msg-row`'s `content-visibility: auto` (paint containment),
+ * which cuts off anything overflowing a row's own box. Positioning it
+ * `absolute` inside the bubble the way `.reactions`/`.reaction-trigger`
+ * do had exactly that problem — the popup escaping upward past the row's
+ * top edge just rendered nothing, even though the trigger button itself
+ * worked fine. */
 .reaction-picker {
-  position: absolute;
-  bottom: 100%;
-  left: 0;
-  margin-bottom: 4px;
   display: flex;
   gap: 2px;
   background: var(--bg);
@@ -545,7 +638,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   z-index: 10;
 }
 /* Floating corner icon for a bubble with no reactions yet — costs no
- * layout space (only ever shown on hover, same idea as `.actions`),
+ * layout space (only ever shown on hover, same idea as `.msg-menu-trigger`),
  * instead of `renderReactions`'s old always-there empty pill row. */
 .reaction-trigger {
   visibility: hidden;
@@ -574,34 +667,52 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 .reaction-picker button:hover { background: var(--bg-alt); }
 
-/* A side gutter, not a row below the bubble — and hidden via `visibility`
- * rather than `display`, so its space stays reserved at all times. Toggling
- * `display` made every hover shift the whole message list vertically
- * (whatever was below jumped up when the actions row collapsed back to
- * nothing); `visibility` just fades the same fixed-size gutter in and out
- * in place. */
-/* Absolutely positioned relative to `.msg-col`, just outside the bubble's
- * own box — so stacking several text labels vertically (needed for them
- * to fit at all in a narrow container like the thread panel) can never
- * inflate a short one-line message's row height, and hovering can never
- * shift anything below it either, no matter how it's toggled. */
-.msg-row .actions {
+/* The "⋯" trigger that opens `openActionsMenu`'s dropdown — sits inside
+ * the bubble's own top-right corner rather than poking outside its box
+ * (unlike `.reaction-trigger` below), since it's just one small button
+ * with nowhere better to go that wouldn't need the same
+ * `content-visibility` containment workaround `openActionsMenu` itself
+ * already sidesteps by portaling the actual dropdown to `document.body`. */
+.msg-menu-trigger {
   visibility: hidden;
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 6px;
   position: absolute;
-  top: 0;
-  bottom: 0;
-  font-size: 11px;
+  top: 3px;
+  right: 4px;
+  font-size: 10px;
+  line-height: 1;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
   color: var(--text-weak);
+  cursor: pointer;
 }
-.msg-row.other .actions { left: 100%; align-items: flex-start; margin-left: 6px; }
-.msg-row.own .actions { right: 100%; align-items: flex-end; margin-right: 6px; }
-.msg-row:hover .actions { visibility: visible; }
-.msg-row .actions a { color: var(--text-weak); cursor: pointer; text-decoration: underline; white-space: nowrap; }
-.msg-row .actions a:hover { color: var(--accent-strong); }
+.msg-row:hover .msg-menu-trigger { visibility: visible; }
+.msg-menu-trigger:hover { border-color: var(--accent); color: var(--accent); }
+
+/* `openActionsMenu`'s dropdown itself — position (`fixed` + `top`/`left`)
+ * set inline in app.js, computed from the trigger's real on-screen rect. */
+.actions-menu {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  z-index: 10;
+  min-width: 110px;
+}
+.actions-menu button {
+  text-align: left;
+  font-size: 12px;
+  padding: 5px 8px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 4px;
+}
+.actions-menu button:hover { background: var(--bg-alt); color: var(--accent-strong); }
 
 #reply-indicator, #edit-indicator {
   padding: 4px 12px;
@@ -695,8 +806,25 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .thread-row .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-0.5cm); }
 .thread-row .unread-dot { color: #7bc99a; }
 .thread-row-body { white-space: pre-wrap; word-wrap: break-word; }
+/* The thread's latest reply, right under its first message — a border-top
+ * (not just spacing) reads as "here's what happened since", distinct
+ * enough from `.thread-row-body` above it not to blur into one paragraph. */
+.thread-row-last {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+  color: var(--text-weak);
+}
 .thread-row-meta { color: var(--text-weak); margin-top: 3px; }
 .thread-room-name { color: var(--text-weak); font-size: 11px; margin: 8px 0 2px; }
+/* Per-row room label in the "all threads" view — threads from different
+ * rooms are interleaved by recency there (see `renderThreadsListRows`),
+ * so each row needs its own room tag instead of one shared group header. */
+.thread-row-room { color: var(--accent); font-size: 10px; margin: 0 0 3px calc(-0.5cm); text-transform: uppercase; letter-spacing: 0.02em; }
+#threads-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
+#threads-filter { flex: 1; margin: 0; }
 
 .dialog-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.5);
@@ -723,6 +851,41 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .dialog-box .checkbox-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
 .dialog-box .checkbox-row input { width: auto; }
 .dialog-box .actions { margin-top: 14px; display: flex; gap: 8px; justify-content: flex-end; }
+.user-search-list {
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  max-height: 260px;
+  overflow-y: auto;
+}
+/* Full-size image viewer (`openLightbox` in app.js). Above the dialog
+ * backdrop (z-index: 30) — opening one from a thread panel or the room
+ * list's image-pack picker should still land on top of it. */
+.lightbox-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 24px;
+  box-sizing: border-box;
+  cursor: zoom-out;
+}
+.lightbox-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.lightbox-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.4);
+}
+.lightbox-close:hover { border-color: #fff; }
 .shortcut-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
 .shortcut-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .shortcut-table .shortcut-keys {
@@ -771,10 +934,18 @@ button:disabled { color: var(--text-weak); cursor: default; }
   #timeline-header-actions { order: 2; }
   #timeline-title { order: 3; flex: 1 1 100%; }
 
-  /* The header's icon buttons ([sec][+][threads][?]) are too many to fit
-   * one row at phone width without shrinking below a comfortable tap
-   * target — let them wrap onto a second line instead. */
-  #room-list-header { flex-wrap: wrap; row-gap: 6px; }
+  /* [sec]/[user msgs]/[?] moved into the "[ ⋯ ]" dropdown (see
+   * `#chats-menu`) specifically so this row stays down to [+][threads][⋯]
+   * — few enough to fit one line at phone width without shrinking below a
+   * comfortable tap target, unlike the original five-button row. */
+
+  /* Workspace filter pills ([ all ]/space names): wrapping to a second
+   * (sometimes third) line ate a full extra row of vertical space just
+   * for filters, most of which are used rarely. A single horizontally
+   * scrollable row keeps it to one line, like a phone's normal tab-strip
+   * pattern — the selected pill (or `[ all ]`) is still visible without
+   * scrolling, and swiping reaches the rest. */
+  #space-picker { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
 
   /* Threads/security panel: same reasoning as the room-list/main-panel
    * split above, but as a full-screen overlay instead of a second
@@ -814,23 +985,20 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * the width available would otherwise need. */
   .msg-col { max-width: 88%; }
 
-  /* Reply/thread/share/edit/delete: desktop floats these in a side gutter
-   * (`position: absolute; left/right: 100%`) that only reveals on hover.
-   * Neither half of that works here — there's no hover on a touchscreen
-   * (see the bubble tap handler in app.js that adds `.actions-open`
-   * instead), and a gutter positioned *outside* a column that's already
-   * up to 62% wide runs straight off the edge of a phone-width screen
-   * regardless. This drops it back into normal flow, stacked under the
-   * bubble, shown only once tapped open. */
-  .msg-row .actions {
-    position: static;
-    visibility: visible;
-    display: none;
-    flex-direction: row;
-    flex-wrap: wrap;
-    gap: 10px 14px;
-    margin-top: 4px;
-    font-size: 13px;
+  /* The "⋯" menu trigger and `.reaction-add`/`.reaction-trigger` are all
+   * hover-only on desktop, so none of them was ever reachable on a
+   * touchscreen at all — tied to the same tap-to-reveal `.actions-open`
+   * state instead (see the bubble tap handler in app.js that adds it).
+   * All three stay absolutely positioned on the bubble's own corner, so
+   * no layout change needed here, only visibility. */
+  .msg-row .msg-menu-trigger,
+  .msg-row .reaction-add,
+  .msg-row .reaction-trigger {
+    visibility: hidden;
   }
-  .msg-row.actions-open .actions { display: flex; }
+  .msg-row.actions-open .msg-menu-trigger,
+  .msg-row.actions-open .reaction-add,
+  .msg-row.actions-open .reaction-trigger {
+    visibility: visible;
+  }
 }

@@ -9,6 +9,17 @@ function send(type, data) {
   });
 }
 
+// key ("room:"+room_id / "invite:"+room_id / "empty-placeholder") -> the
+// live DOM node `renderRooms()` last rendered for it. Kept outside `state`
+// (not serializable/relevant app data, just a render cache) so
+// `renderRooms()` can reuse and update existing rows in place across
+// re-renders instead of wiping and rebuilding the whole list every time —
+// that full rebuild was the "nhảy nhảy" (jumpy) flicker on every badge
+// update, since content-visibility:auto rows getting destroyed/recreated
+// forces a reflow of the whole visible list even when a single unread
+// count changed and nothing actually needs to move.
+const roomRowEls = new Map();
+
 const state = {
   screen: "login",
   loggingIn: false,
@@ -18,6 +29,7 @@ const state = {
   spaceChildren: {}, // space_room_id -> [room_id]
   roomFilter: "",
   unreadOnly: false,
+  reloadingRooms: false,
   // Index into the currently-visible (filtered) room list, i.e. the row
   // arrow-key navigation currently has "selected" — separate from
   // `selectedRoom` since a keyboard highlight moving through search
@@ -50,9 +62,18 @@ const state = {
   imageUnviewable: {},
   imagePacks: {}, // room_id -> [{shortcode, url, pack_name}] — custom emoji/meme, see Command::ListImagePacks
   roomMembers: {}, // room_id -> [[user_id, display_name]]
+  // Every joined member across every joined room, deduped by user id — for
+  // the "messages from a user" picker. `null` until `Command::ListAllUsers`
+  // has answered once (fetched lazily, the first time that dialog opens,
+  // then cached for the rest of the session).
+  allUsers: null,
+  allUsersLoading: false,
   notificationModes: {}, // room_id -> mode
-  summaries: {}, // room_id -> text
-  summarizing: false,
+  // `{ roomId, threadRootId }` for whichever `Command::Summarize` the
+  // currently-open summary dialog (if any) is waiting on — `Event::Summary`
+  // only updates that dialog's contents when both match, so a stray
+  // answer for a request the dialog's since moved past can't clobber it.
+  summaryRequest: null,
 
   pendingReply: null, // { roomId, threadId, eventId, preview }
   pendingEdit: null, // { roomId, threadId, eventId }
@@ -71,13 +92,50 @@ const state = {
   unreadThreads: new Set(), // "room_id|thread_root_id"
   threadCompose: { sending: false },
   threadPaginationReachedStart: new Set(),
+  // Keyboard roving-highlight index into the threads-list panel's
+  // currently rendered rows (`state.visibleThreadRows`) — same idea as
+  // `roomListActiveIndex`/`visibleRoomIds` for the room list. -1 = none
+  // highlighted.
+  threadsListActiveIndex: -1,
+  // `{roomId, eventId}` pairs in the order `renderSidePanel()`'s
+  // "threads-list" branch actually rendered them — what Up/Down/Enter
+  // navigate over, kept in sync with the DOM the same way
+  // `visibleRoomIds` is for the room list.
+  visibleThreadRows: [],
+  // Search text for the threads-list panel's own filter box — matched
+  // (diacritic/case-insensitive, same as the room filter) against the
+  // room name, the thread's first message, and its latest reply.
+  // Cleared whenever the panel is (re)opened, not kept across sessions.
+  threadsListFilter: "",
 
   verificationEmojis: null,
   recoveryStatus: null,
   recoveryKeyInput: "",
+  // Whether an LVX API key is currently set (security panel's own field —
+  // never the actual key value, see `Event::LvxApiKeyStatus`). `null`
+  // until the panel's asked and gotten an answer.
+  lvxApiKeyConfigured: null,
   // Set right before switching rooms to follow a matrix.to link — once
   // that room's `Timeline` event lands, scroll to this event and clear it.
   pendingScrollTarget: null, // { roomId, eventId }
+  // Set by `findAndScrollToMessage` while it's auto-paginating a room
+  // backwards looking for a matrix.to link's target message that wasn't
+  // in whatever was already loaded — checked again each `TimelinePrepend`
+  // for that room until the message turns up or history runs out.
+  pendingScrollSearch: null, // { roomId, eventId }
+  // Set by a matrix.to link carrying our `?thread=` extension (see
+  // `buildMatrixToLink`) while its target room's main timeline is still
+  // being paginated back looking for the *thread's root* message — the
+  // root is a normal timeline event, and its data (needed to even open
+  // the thread panel — see `openThread`) has to be found there before
+  // anything thread-specific can happen. Resumed from `TimelinePrepend`
+  // the same way `pendingScrollSearch` is.
+  pendingThreadLink: null, // { roomId, threadRootId, eventId }
+  // Set once the thread panel from a `?thread=` link is open and it's
+  // waiting for its (already-in-progress — see `ThreadEvents`) full
+  // auto-load of the thread to bring in the specific reply being linked
+  // to. Resumed from `ThreadEvents`/`ThreadEventsPrepend`.
+  pendingThreadScrollTarget: null, // { roomId, threadRootId, eventId }
 };
 
 // ---- DOM refs ----
@@ -96,8 +154,12 @@ const el = {
   roomListItems: document.getElementById("room-list-items"),
   btnSecurity: document.getElementById("btn-security"),
   btnCreateRoom: document.getElementById("btn-create-room"),
+  btnReloadRooms: document.getElementById("btn-reload-rooms"),
   btnGlobalThreads: document.getElementById("btn-global-threads"),
+  btnUserSearch: document.getElementById("btn-user-search"),
   btnShortcuts: document.getElementById("btn-shortcuts"),
+  btnChatsMenu: document.getElementById("btn-chats-menu"),
+  chatsMenu: document.getElementById("chats-menu"),
   btnBackToRooms: document.getElementById("btn-back-to-rooms"),
   timelineTitle: document.getElementById("timeline-title"),
   timelineHeaderActions: document.getElementById("timeline-header-actions"),
@@ -109,7 +171,6 @@ const el = {
   btnLeaveRoom: document.getElementById("btn-leave-room"),
   notificationMode: document.getElementById("notification-mode"),
   btnSummarize: document.getElementById("btn-summarize"),
-  summaryBox: document.getElementById("summary-box"),
   timeline: document.getElementById("timeline"),
   btnJumpLatest: document.getElementById("btn-jump-latest"),
   replyIndicator: document.getElementById("reply-indicator"),
@@ -126,6 +187,7 @@ const el = {
   fileInput: document.getElementById("file-input"),
   importKeysFileInput: document.getElementById("import-keys-file-input"),
   sidePanel: document.getElementById("side-panel"),
+  mainPanel: document.getElementById("main-panel"),
 };
 
 // =========================================================================
@@ -171,22 +233,27 @@ function enterChat() {
   // seconds (longer on a flaky connection, e.g. the retry-heavy path
   // right after an Android OAuth login) — with nothing to tell the user
   // whether that's still in progress or the app is just stuck.
-  // `renderRooms()` overwrites this `innerHTML` outright the moment real
-  // data shows up, so nothing further needs to clear it back out.
-  el.roomListItems.innerHTML = `<div style="padding:12px;color:var(--text-weak);font-size:12px;text-align:center;">loading rooms...</div>`;
+  // Nothing further needs to clear this back out — the first `Rooms`
+  // event's `renderRooms()` call replaces these children with real rows
+  // via `appendChild` regardless of what was here before.
+  el.roomListItems.innerHTML = `<div style="padding:12px;font-size:12px;text-align:center;">${loadingHtml("loading rooms...")}</div>`;
 }
 
 // =========================================================================
 // Room list / spaces / create room
 // =========================================================================
 
-// Debounced — `renderRooms()` rebuilds every visible row from scratch, and
-// on an account with thousands of rooms that's real work (not just paint;
-// see `.room-row`'s `content-visibility` for the paint side of this).
-// Running it on every single keystroke made fast typing itself feel
-// laggy, one rebuild behind each character. A short debounce lets a burst
-// of keystrokes settle before paying for the rebuild once.
+// Debounced — `renderRooms()` re-walks every room in `state.rooms` to
+// decide what's visible under the new filter, and on an account with
+// thousands of rooms that's real work even though existing rows are
+// reused rather than rebuilt (see `renderRoomRow`). Running it on every
+// single keystroke made fast typing itself feel laggy, one pass behind
+// each character. A short debounce lets a burst of keystrokes settle
+// before paying for that pass once.
 let roomFilterDebounceTimer = null;
+// Same debounce idea for the threads-list panel's own search box — see
+// `renderSidePanel`'s "threads-list" branch.
+let threadsFilterDebounceTimer = null;
 el.roomFilter.addEventListener("input", () => {
   state.roomFilter = el.roomFilter.value;
   clearTimeout(roomFilterDebounceTimer);
@@ -226,6 +293,14 @@ el.roomFilter.addEventListener("keydown", (e) => {
       el.roomFilter.blur();
     }
   }
+});
+
+el.btnReloadRooms.addEventListener("click", () => {
+  if (state.reloadingRooms) return;
+  state.reloadingRooms = true;
+  el.btnReloadRooms.disabled = true;
+  el.btnReloadRooms.textContent = "[ reloading… ]";
+  send("RefreshRooms");
 });
 
 el.btnUnreadOnly.addEventListener("click", () => {
@@ -307,23 +382,119 @@ function selectSpace(spaceId) {
   renderRooms();
 }
 
+/** Builds (once) or updates (every render) the row for one invite. The
+ * node is reused across renders — see `roomRowEls` — so listeners are
+ * attached only when it's first created. */
+function renderInviteRow(room) {
+  const key = "invite:" + room.room_id;
+  let row = roomRowEls.get(key);
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "invite-row";
+    row.innerHTML = `<div><b>invite:</b> <span data-name></span></div>
+      <div class="actions">
+        <button data-accept>accept</button>
+        <button data-decline>decline</button>
+      </div>`;
+    row.querySelector("[data-accept]").addEventListener("click", () =>
+      send("AcceptInvite", { room_id: room.room_id }),
+    );
+    row.querySelector("[data-decline]").addEventListener("click", () =>
+      send("DeclineInvite", { room_id: room.room_id }),
+    );
+    row.dataset.rowKey = key;
+    roomRowEls.set(key, row);
+  }
+  row.querySelector("[data-name]").textContent = room.name;
+  return { key, row };
+}
+
+/** Same idea for a regular room row — created once, then just has its
+ * text/classes patched on every subsequent render instead of being torn
+ * down and rebuilt. `rowIndex` (this room's position in the currently
+ * *visible* filtered list, used by arrow-key navigation and the hover
+ * highlight) does change across renders even when the room itself
+ * doesn't move, so it's read from a data attribute at event time rather
+ * than captured in the listener closure. */
+function renderRoomRow(room, rowIndex) {
+  const key = "room:" + room.room_id;
+  let row = roomRowEls.get(key);
+  let nameEl, badgeEl;
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "room-row";
+    nameEl = document.createElement("div");
+    nameEl.className = "room-name";
+    row.appendChild(nameEl);
+    row.addEventListener("click", () => selectRoom(row.dataset.roomId));
+    row.addEventListener("mouseenter", () => {
+      state.roomListActiveIndex = Number(row.dataset.rowIndex);
+      el.roomListItems.querySelector(".room-row.kbd-active")?.classList.remove("kbd-active");
+      row.classList.add("kbd-active");
+    });
+    roomRowEls.set(key, row);
+  } else {
+    nameEl = row.querySelector(".room-name");
+    badgeEl = row.querySelector(".room-badge");
+  }
+
+  row.dataset.roomId = room.room_id;
+  row.dataset.rowKey = key;
+  row.dataset.rowIndex = String(rowIndex);
+  row.className =
+    "room-row" +
+    (room.room_id === state.selectedRoom ? " selected" : "") +
+    (rowIndex === state.roomListActiveIndex ? " kbd-active" : "");
+
+  const name = (room.is_encrypted ? "[e] " : "") + room.name;
+  if (nameEl.textContent !== name) nameEl.textContent = name;
+  nameEl.className = "room-name" + (room.unread_count > 0 ? " unread" : "");
+
+  if (room.unread_count > 0) {
+    const badgeText = room.unread_count > 99 ? "99+" : String(room.unread_count);
+    if (!badgeEl) {
+      badgeEl = document.createElement("span");
+      badgeEl.className = "room-badge";
+      row.appendChild(badgeEl);
+    }
+    if (badgeEl.textContent !== badgeText) badgeEl.textContent = badgeText;
+  } else if (badgeEl) {
+    badgeEl.remove();
+  }
+
+  return { key, row };
+}
+
+/** Renders the room list by reusing/patching existing row elements
+ * (`roomRowEls`) rather than wiping and rebuilding the whole list on
+ * every call — that rebuild used to run on every single unread-count
+ * change (a message arriving, `[ mark read ]`, the reload button, ...)
+ * and was the source of the list visibly jumping/flickering each time,
+ * since content-visibility:auto rows getting destroyed and recreated
+ * forces the browser to redo layout for the whole visible viewport even
+ * when nothing but one badge changed. Existing rows just get their
+ * text/classes patched in place; only actual additions/removals/reorders
+ * touch the DOM tree, and those are animated (`animateRoomListChanges`)
+ * instead of happening instantly. */
 function renderRooms() {
   renderSpacePicker();
-  el.roomListItems.innerHTML = "";
   const filter = normalizeForSearch(state.roomFilter.trim());
   const spaceFilter = state.selectedSpace ? state.spaceChildren[state.selectedSpace] : null;
   state.visibleRoomIds = [];
 
+  const prevRects = new Map();
+  for (const [key, node] of roomRowEls) {
+    if (node.isConnected) prevRects.set(key, node.getBoundingClientRect());
+  }
+
+  const keepKeys = new Set();
+  const orderedRows = [];
+
   for (const room of state.rooms) {
     if (room.is_invite) {
-      const row = document.createElement("div");
-      row.className = "invite-row";
-      row.innerHTML = `<div><b>invite:</b> ${escapeHtml(room.name)}</div>
-        <div class="actions">
-          <button data-accept="${room.room_id}">accept</button>
-          <button data-decline="${room.room_id}">decline</button>
-        </div>`;
-      el.roomListItems.appendChild(row);
+      const { key, row } = renderInviteRow(room);
+      keepKeys.add(key);
+      orderedRows.push(row);
       continue;
     }
     if (room.is_space) continue;
@@ -333,47 +504,113 @@ function renderRooms() {
 
     const rowIndex = state.visibleRoomIds.length;
     state.visibleRoomIds.push(room.room_id);
-
-    const row = document.createElement("div");
-    row.className =
-      "room-row" +
-      (room.room_id === state.selectedRoom ? " selected" : "") +
-      (rowIndex === state.roomListActiveIndex ? " kbd-active" : "");
-
-    const nameEl = document.createElement("div");
-    nameEl.className = "room-name" + (room.unread_count > 0 ? " unread" : "");
-    nameEl.textContent = (room.is_encrypted ? "[e] " : "") + room.name;
-
-    row.appendChild(nameEl);
-    if (room.unread_count > 0) {
-      const badge = document.createElement("span");
-      badge.className = "room-badge";
-      badge.textContent = room.unread_count > 99 ? "99+" : String(room.unread_count);
-      row.appendChild(badge);
-    }
-    row.addEventListener("click", () => selectRoom(room.room_id));
-    row.addEventListener("mouseenter", () => {
-      state.roomListActiveIndex = rowIndex;
-      el.roomListItems.querySelector(".room-row.kbd-active")?.classList.remove("kbd-active");
-      row.classList.add("kbd-active");
-    });
-    el.roomListItems.appendChild(row);
+    const { key, row } = renderRoomRow(room, rowIndex);
+    keepKeys.add(key);
+    orderedRows.push(row);
   }
 
   if (state.roomListActiveIndex >= state.visibleRoomIds.length) {
     state.roomListActiveIndex = state.visibleRoomIds.length - 1;
   }
 
-  if (state.unreadOnly && el.roomListItems.children.length === 0) {
-    el.roomListItems.innerHTML = `<div style="padding:12px;color:var(--text-weak);font-size:12px;text-align:center;">no unread rooms</div>`;
+  const showEmptyPlaceholder = state.unreadOnly && orderedRows.length === 0;
+  if (showEmptyPlaceholder) {
+    const key = "empty-placeholder";
+    let row = roomRowEls.get(key);
+    if (!row) {
+      row = document.createElement("div");
+      row.style.cssText = "padding:12px;color:var(--text-weak);font-size:12px;text-align:center;";
+      row.textContent = "no unread rooms";
+      row.dataset.rowKey = key;
+      roomRowEls.set(key, row);
+    }
+    keepKeys.add(key);
+    orderedRows.push(row);
   }
 
-  el.roomListItems.querySelectorAll("[data-accept]").forEach((btn) => {
-    btn.addEventListener("click", () => send("AcceptInvite", { room_id: btn.dataset.accept }));
-  });
-  el.roomListItems.querySelectorAll("[data-decline]").forEach((btn) => {
-    btn.addEventListener("click", () => send("DeclineInvite", { room_id: btn.dataset.decline }));
-  });
+  // Anything no longer wanted (filtered out, room left, invite resolved)
+  // fades out instead of just vanishing.
+  const exiting = [];
+  for (const [key, node] of roomRowEls) {
+    if (keepKeys.has(key)) continue;
+    roomRowEls.delete(key);
+    if (node.isConnected) exiting.push(node);
+  }
+
+  // `appendChild` on a node already in the DOM *moves* it rather than
+  // cloning it, so replaying the full desired order here is enough to
+  // both reorder existing rows and insert new ones — no manual
+  // insertBefore bookkeeping needed.
+  for (const row of orderedRows) el.roomListItems.appendChild(row);
+
+  animateRoomListChanges(prevRects, orderedRows, exiting);
+}
+
+/** FLIP-animates whatever `renderRooms()` just changed: rows that moved
+ * slide to their new position instead of jumping there, newly-added rows
+ * fade/slide in, and removed rows fade out before actually leaving the
+ * DOM. All transform/opacity — never touches layout-affecting properties
+ * — so it's cheap even with a long list. */
+function animateRoomListChanges(prevRects, orderedRows, exiting) {
+  // Pull exiting rows out of flow *first* — otherwise they'd still be
+  // occupying space when the "next" rects below are measured, throwing
+  // off every delta computed for the rows around them. Pin them to their
+  // current spot with explicit top/left/width (relative to the
+  // scrollable container, so its `scrollTop` has to be folded in) since
+  // switching to `position: absolute` alone would let them shrink to
+  // content width and only *happens* to keep their vertical spot via the
+  // browser's static-position fallback — not guaranteed once they no
+  // longer have layout siblings pushing them there.
+  const containerRect = el.roomListItems.getBoundingClientRect();
+  for (const row of exiting) {
+    const rect = row.getBoundingClientRect();
+    row.style.transition = "none";
+    row.style.position = "absolute";
+    row.style.top = `${rect.top - containerRect.top + el.roomListItems.scrollTop}px`;
+    row.style.left = "0";
+    row.style.width = `${rect.width}px`;
+    row.style.pointerEvents = "none";
+  }
+  // Forces that reflow to actually happen before the rects below read
+  // off it, rather than getting coalesced with the batch of style writes
+  // that follows.
+  void el.roomListItems.offsetHeight;
+
+  for (const row of orderedRows) {
+    const prev = prevRects.get(roomKeyOf(row));
+    row.style.transition = "none";
+    if (prev) {
+      const next = row.getBoundingClientRect();
+      const dy = prev.top - next.top;
+      if (Math.abs(dy) > 0.5) {
+        row.style.transform = `translateY(${dy}px)`;
+      }
+    } else {
+      // Genuinely new row — slide/fade in from just above its final spot.
+      row.style.opacity = "0";
+      row.style.transform = "translateY(-6px)";
+    }
+  }
+
+  // Forces the browser to apply the "from" styles above before the "to"
+  // styles below get a transition to animate across — without this the
+  // two would coalesce into one paint and nothing would visibly move.
+  void el.roomListItems.offsetHeight;
+
+  for (const row of orderedRows) {
+    row.style.transition = "transform 180ms ease, opacity 180ms ease";
+    row.style.transform = "";
+    row.style.opacity = "";
+  }
+  for (const row of exiting) {
+    row.style.transition = "opacity 150ms ease";
+    row.style.opacity = "0";
+    setTimeout(() => row.remove(), 160);
+  }
+}
+
+function roomKeyOf(row) {
+  return row.dataset.rowKey;
 }
 
 el.btnCreateRoom.addEventListener("click", () => {
@@ -416,6 +653,39 @@ function closeDialog() {
   document.getElementById("active-dialog")?.remove();
 }
 
+/** Full-size image viewer — a message bubble's `<img>` is deliberately
+ * capped small (`.bubble img { max-width: 280px; ... }`, see its CSS) so
+ * a photo doesn't dominate the timeline; this is the "actually look at
+ * it" affordance that cap implies but never had a way to act on before.
+ * Tapping/clicking anywhere on the overlay closes it — same as
+ * `showDialog`'s backdrop, just without needing to land exactly on a
+ * particular element first. */
+function openLightbox(src, alt) {
+  closeLightbox();
+  const overlay = document.createElement("div");
+  overlay.className = "lightbox-backdrop";
+  overlay.id = "active-lightbox";
+  const img = document.createElement("img");
+  img.className = "lightbox-img";
+  img.src = src;
+  img.alt = alt || "image";
+  overlay.appendChild(img);
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "lightbox-close small-btn";
+  closeBtn.textContent = "[ x ]";
+  overlay.appendChild(closeBtn);
+  overlay.addEventListener("click", closeLightbox);
+  document.addEventListener("keydown", lightboxKeyHandler);
+  document.body.appendChild(overlay);
+}
+function closeLightbox() {
+  document.getElementById("active-lightbox")?.remove();
+  document.removeEventListener("keydown", lightboxKeyHandler);
+}
+function lightboxKeyHandler(e) {
+  if (e.key === "Escape") closeLightbox();
+}
+
 // =========================================================================
 // Room selection / header actions
 // =========================================================================
@@ -443,12 +713,16 @@ function selectRoom(roomId) {
   renderRooms();
   renderSidePanel();
   if (!state.timelineLoaded.has(roomId)) {
-    el.timeline.innerHTML = `<div id="timeline-placeholder">loading messages...</div>`;
+    el.timeline.innerHTML = `<div id="timeline-placeholder">${loadingHtml("loading messages...")}</div>`;
     send("LoadTimeline", { room_id: roomId });
   } else {
     renderTimeline();
   }
-  send("MarkRoomRead", { room_id: roomId });
+  // Deliberately not auto-marking read just for opening the room — read
+  // state only ever changes via the explicit "[ mark read ]" button (see
+  // `el.btnMarkRead`'s handler), so the unread badge stays put until the
+  // user actually says they're done with it, rather than clearing itself
+  // the instant a room is clicked open.
   if (!state.roomMembers[roomId]) send("ListMembers", { room_id: roomId });
   if (!state.imagePacks[roomId]) send("ListImagePacks", { room_id: roomId });
   updateNotificationModeUi();
@@ -459,6 +733,9 @@ function selectRoom(roomId) {
 function closeRoomMenu() {
   el.roomMenu.style.display = "none";
 }
+function closeChatsMenu() {
+  el.chatsMenu.style.display = "none";
+}
 el.btnBackToRooms.addEventListener("click", () => {
   el.chatScreen.classList.remove("room-open");
 });
@@ -466,9 +743,16 @@ el.btnRoomMenu.addEventListener("click", (e) => {
   e.stopPropagation();
   el.roomMenu.style.display = el.roomMenu.style.display === "none" ? "flex" : "none";
 });
+el.btnChatsMenu.addEventListener("click", (e) => {
+  e.stopPropagation();
+  el.chatsMenu.style.display = el.chatsMenu.style.display === "none" ? "flex" : "none";
+});
 document.addEventListener("click", (e) => {
   if (el.roomMenu.style.display !== "none" && !el.roomMenu.contains(e.target) && e.target !== el.btnRoomMenu) {
     closeRoomMenu();
+  }
+  if (el.chatsMenu.style.display !== "none" && !el.chatsMenu.contains(e.target) && e.target !== el.btnChatsMenu) {
+    closeChatsMenu();
   }
 });
 
@@ -524,21 +808,36 @@ function updateNotificationModeUi() {
 
 el.btnSummarize.addEventListener("click", () => {
   closeRoomMenu();
-  if (!state.selectedRoom || state.summarizing) return;
-  state.summarizing = true;
-  el.btnSummarize.textContent = "summarizing...";
-  el.btnSummarize.disabled = true;
-  send("Summarize", { room_id: state.selectedRoom });
+  if (!state.selectedRoom) return;
+  openSummaryDialog(state.selectedRoom, null);
 });
 
-function renderSummary() {
-  const text = state.summaries[state.selectedRoom];
-  if (text) {
-    el.summaryBox.style.display = "block";
-    el.summaryBox.innerHTML = `<div class="summary-title">SUMMARY</div><div>${escapeHtml(text)}</div>`;
-  } else {
-    el.summaryBox.style.display = "none";
-  }
+/** Opens the "summarizing..." popup and kicks off `Command::Summarize`
+ * for the main room timeline (`threadRootId: null`) or one open thread
+ * (`threadRootId` = its root event id) — shared by the room menu's
+ * `[ summarize ]` button and the thread panel's own. */
+function openSummaryDialog(roomId, threadRootId) {
+  state.summaryRequest = { roomId, threadRootId };
+  // Says which one this is — room or thread — and which room, so the
+  // popup itself makes clear what's being summarized instead of a bare
+  // "summary" that reads identically either way (easy to lose track of
+  // after opening one, then the other, back to back).
+  const roomName = state.rooms.find((r) => r.room_id === roomId)?.name || roomId;
+  const scopeLabel = threadRootId ? `thread in ${roomName}` : roomName;
+  showDialog(`
+    <h3>summary — ${escapeHtml(scopeLabel)}</h3>
+    <div id="summary-dialog-body" style="max-height:65vh;overflow-y:auto;line-height:1.5;">${loadingHtml("summarizing...")}</div>
+    <div class="actions"><button id="dlg-cancel">close</button></div>
+  `);
+  // `.dialog-box`'s own CSS caps it at 320px — comfortable for the short
+  // forms every other dialog in this app uses, but far too narrow for a
+  // multi-paragraph summary (a wall of single-word-wide lines). Widened
+  // just for this one, `max-width: 100%` from that same CSS still keeps
+  // it from overflowing a narrower window.
+  const box = document.querySelector("#active-dialog .dialog-box");
+  if (box) box.style.width = "640px";
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  send("Summarize", { room_id: roomId, thread_root_id: threadRootId });
 }
 
 // =========================================================================
@@ -553,7 +852,7 @@ function renderTimeline() {
     const row = document.createElement("div");
     row.id = "load-more-row";
     if (state.paginationInFlight.has(state.selectedRoom)) {
-      row.textContent = "loading older messages...";
+      row.innerHTML = loadingHtml("loading older messages...");
     } else {
       const btn = document.createElement("button");
       btn.textContent = "load more messages";
@@ -644,7 +943,7 @@ function paginateBack(roomId) {
   // is exactly wrong here: this only ever fires because the user just
   // scrolled *up* near the top to trigger it.
   const row = document.getElementById("load-more-row");
-  if (row) row.textContent = "loading older messages...";
+  if (row) row.innerHTML = loadingHtml("loading older messages...");
   send("PaginateBack", { room_id: roomId });
 }
 
@@ -720,7 +1019,37 @@ function openReactionPicker(anchorEl, toggle) {
     });
     picker.appendChild(opt);
   }
-  anchorEl.appendChild(picker);
+  // Appended to <body> (like every dialog/lightbox in this app), not
+  // `anchorEl` — `.msg-row` has `content-visibility: auto` (paint
+  // containment), which clips any descendant that overflows a row's own
+  // box. The popup opening *above* a short bubble routinely did exactly
+  // that (escaping past the row's top edge into the previous row's
+  // territory), rendering completely invisible even though the trigger
+  // button that opened it worked fine — same underlying issue
+  // `.reactions`/`.reaction-trigger` had before their own fix, just on
+  // the other edge. `position: fixed` + coordinates computed from the
+  // anchor's real on-screen position sidesteps the whole row hierarchy
+  // (and its containment) entirely, so this can't happen again regardless
+  // of future spacing/layout changes there.
+  // `position: fixed` set *before* measuring `pickerRect` — while still
+  // `position: static` (the default right after `appendChild`), a block
+  // box with no explicit width stretches to its containing block's full
+  // width (`<body>`, i.e. nearly the whole window), so measuring first
+  // reported that same huge width back. `left`'s clamp below then read
+  // "not enough room to the right of a window-wide box" and pinned the
+  // popup to the left edge no matter where the anchor actually was.
+  picker.style.position = "fixed";
+  document.body.appendChild(picker);
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+  let top = anchorRect.top - pickerRect.height - 4;
+  if (top < 4) top = anchorRect.bottom + 4; // not enough room above — open below instead
+  let left = anchorRect.left;
+  left = Math.min(left, window.innerWidth - pickerRect.width - 4);
+  left = Math.max(4, left);
+  picker.style.top = `${top}px`;
+  picker.style.left = `${left}px`;
+
   setTimeout(() => {
     document.addEventListener("click", () => picker.remove(), { once: true });
   }, 0);
@@ -842,6 +1171,7 @@ function renderMessage(event, ctx, opts = {}) {
       const img = document.createElement("img");
       img.alt = event.body || "image";
       img.src = cached;
+      img.addEventListener("click", () => openLightbox(cached, event.body));
       wrap.appendChild(img);
       wrap.appendChild(makeDownloadButton(event));
       bubble.appendChild(wrap);
@@ -855,13 +1185,17 @@ function renderMessage(event, ctx, opts = {}) {
       const failed = (imageFetchAttempts[event.media_url] || 0) > 0;
       const placeholder = document.createElement("div");
       placeholder.className = "image-placeholder" + (failed ? " failed" : "");
-      placeholder.textContent = failed ? "⟳ image failed to load — click to retry" : "loading image...";
+      if (failed) {
+        placeholder.textContent = "⟳ image failed to load — click to retry";
+      } else {
+        placeholder.innerHTML = loadingHtml("loading image...");
+      }
       if (failed) {
         placeholder.addEventListener("click", () => {
           delete imageFetchAttempts[event.media_url];
           state.imageRequested.delete(event.media_url);
           requestImage(event.media_url);
-          placeholder.textContent = "loading image...";
+          placeholder.innerHTML = loadingHtml("loading image...");
           placeholder.classList.remove("failed");
         });
       }
@@ -915,6 +1249,7 @@ function renderMessage(event, ctx, opts = {}) {
     const body = document.createElement("div");
     body.className = "body" + (event.msg_type === "notice" ? " notice" : "");
     body.innerHTML = renderMarkdown(event.body || "");
+    applyMentionPills(body, event.mentioned_user_ids, ctx.roomId);
     bubble.appendChild(body);
   }
 
@@ -973,56 +1308,100 @@ function renderMessage(event, ctx, opts = {}) {
 
   col.appendChild(bubble);
 
-  const actions = document.createElement("div");
-  actions.className = "actions";
-
-  // Short text labels, not full "[ reply in thread ]"-style phrases — the
-  // side gutter stacks them vertically (see CSS), so each just needs to
-  // fit on its own line rather than the whole row fitting side by side.
-  if (!ctx.threadId && !event.thread_count) {
-    const threadLabel = document.createElement("a");
-    threadLabel.textContent = "[ thread ]";
-    threadLabel.addEventListener("click", () => openThread(ctx.roomId, event));
-    actions.appendChild(threadLabel);
-  }
-
-  const replyLink = document.createElement("a");
-  replyLink.textContent = "[ reply ]";
-  replyLink.addEventListener("click", () => startReply(ctx.roomId, ctx.threadId, event));
-  actions.appendChild(replyLink);
-
-  const shareLink = document.createElement("a");
-  shareLink.textContent = "[ share ]";
-  shareLink.addEventListener("click", () => shareMessage(ctx.roomId, event.event_id));
-  actions.appendChild(shareLink);
-
-  if (event.is_own && event.msg_type !== "image" && event.msg_type !== "deleted") {
-    const editLink = document.createElement("a");
-    editLink.textContent = "[ edit ]";
-    editLink.addEventListener("click", () => startEdit(ctx.roomId, ctx.threadId, event));
-    actions.appendChild(editLink);
-  }
-  if (event.is_own) {
-    const delLink = document.createElement("a");
-    delLink.textContent = "[ delete ]";
-    delLink.addEventListener("click", () => {
-      send("DeleteMessage", { room_id: ctx.roomId, event_id: event.event_id });
+  // A single "⋯" trigger opening a dropdown menu, not a whole row of
+  // always-visible `[ reply ] [ share ] [ react ] ...` text links —
+  // that many labels at once (up to 7) was cramped and easy to
+  // mis-click, and the side gutter they lived in kept needing more and
+  // more clamping logic (see git history) to avoid overflowing a narrow
+  // column. One small button anchored to the bubble's own corner sidesteps
+  // that whole class of problem, and `openActionsMenu` (portaled to
+  // `document.body`, same as `openReactionPicker`) positions its dropdown
+  // from the trigger's actual on-screen rect, so it's never at the mercy
+  // of `.msg-row`'s `content-visibility` containment either.
+  const menuTrigger = document.createElement("button");
+  menuTrigger.className = "msg-menu-trigger";
+  menuTrigger.title = "more actions";
+  menuTrigger.textContent = "⋯";
+  menuTrigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const items = [];
+    if (!ctx.threadId && !event.thread_count) {
+      items.push({ label: "thread", onClick: () => openThread(ctx.roomId, event) });
+    }
+    items.push({ label: "reply", onClick: () => startReply(ctx.roomId, ctx.threadId, event) });
+    items.push({ label: "share", onClick: () => shareMessage(ctx.roomId, event.event_id, ctx.threadId) });
+    items.push({
+      label: "react",
+      onClick: () =>
+        openReactionPicker(bubble, (emoji) => {
+          send("ToggleReaction", { room_id: ctx.roomId, event_id: event.event_id, emoji });
+        }),
     });
-    actions.appendChild(delLink);
-  }
-  // Actions sit in the gutter beside the bubble — to its left for your
-  // own (right-aligned) messages, to its right for everyone else's — not
-  // stacked below it. Below-the-bubble actions made every hover shift the
-  // whole message list vertically (annoying while scrolling); a side
-  // gutter never shifts anything, it just fades in in place. It's
-  // absolutely positioned (see CSS) rather than a normal flex sibling so
-  // that stacking several text labels vertically — needed for them to fit
-  // at all in a narrow container like the thread panel — can't inflate a
-  // short one-line message's row height either.
-  col.appendChild(actions);
+    items.push({
+      label: "from user",
+      title: `see every message from ${event.sender_name}, across all rooms`,
+      onClick: () => openUserSearch(event.sender),
+    });
+    if (event.is_own && event.msg_type !== "image" && event.msg_type !== "deleted") {
+      items.push({ label: "edit", onClick: () => startEdit(ctx.roomId, ctx.threadId, event) });
+    }
+    if (event.is_own) {
+      items.push({
+        label: "delete",
+        onClick: () => send("DeleteMessage", { room_id: ctx.roomId, event_id: event.event_id }),
+      });
+    }
+    openActionsMenu(menuTrigger, items);
+  });
+  bubble.appendChild(menuTrigger);
+
   row.appendChild(col);
 
   return row;
+}
+
+/** Opens a small dropdown menu anchored to `anchorEl` — `items` is
+ * `[{label, onClick, title?}]`. Shared by every "⋯" trigger (currently
+ * just `renderMessage`'s). Appended to `document.body` and positioned
+ * `fixed` from `anchorEl`'s real on-screen rect, same approach as
+ * `openReactionPicker` — see its own comment for why that matters (a
+ * `.msg-row`-nested popup can get silently clipped by its `content-visibility`
+ * containment). */
+function openActionsMenu(anchorEl, items) {
+  document.querySelectorAll(".actions-menu").forEach((m) => m.remove());
+  const menu = document.createElement("div");
+  menu.className = "actions-menu";
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.textContent = item.label;
+    if (item.title) btn.title = item.title;
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      menu.remove();
+      item.onClick();
+    });
+    menu.appendChild(btn);
+  }
+
+  menu.style.position = "fixed";
+  document.body.appendChild(menu);
+  const anchorRect = anchorEl.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const margin = 4;
+
+  let top = anchorRect.bottom + 4;
+  if (top + menuRect.height > window.innerHeight - margin) {
+    top = anchorRect.top - menuRect.height - 4;
+  }
+  top = Math.max(margin, top);
+  let left = anchorRect.right - menuRect.width;
+  left = Math.max(margin, Math.min(left, window.innerWidth - menuRect.width - margin));
+  menu.style.top = `${top}px`;
+  menu.style.left = `${left}px`;
+
+  setTimeout(() => {
+    document.addEventListener("click", () => menu.remove(), { once: true });
+  }, 0);
 }
 
 function findReplyPreview(roomId, eventId) {
@@ -1152,6 +1531,88 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+/** Turns a plain-text `@DisplayName` occurrence for someone actually named
+ * in `mentionedUserIds` (the message's real `m.mentions`, or a matrix.to
+ * pill in its formatted body — see `mentioned_user_ids` on the backend)
+ * into a colored pill, matching how Element renders a mention — instead
+ * of the plain "@Name" text `renderMarkdown` alone leaves behind.
+ * Deliberately gated on that real signal rather than just "any `@` some
+ * member's current name happens to follow": retyping the exact same
+ * "@Name" a second time without picking it from the autocomplete again
+ * sends with no mention metadata at all — and Element itself then shows
+ * plain text for it too, confirmed against the real app — so pill-ifying
+ * it here anyway would be *less* faithful to Element, not more, even
+ * though it can look like "the same tag" was typed twice.
+ *
+ * Deliberately DOM-based (walks `containerEl`'s text nodes and splices in
+ * `<span>` elements) rather than string/HTML-based: the message's
+ * `formatted_body` HTML is attacker-controlled (any other user in the
+ * room can send it) and isn't sanitized anywhere in this app, so building
+ * pills by re-parsing *that* and dropping it into `innerHTML` would be a
+ * straightforward stored-XSS hole. This only ever touches text nodes
+ * already produced by `renderMarkdown`'s own escaping, and only inserts
+ * elements built with `textContent`/`createElement` — nothing here can
+ * execute attacker HTML. */
+function applyMentionPills(containerEl, mentionedUserIds, roomId) {
+  if (!mentionedUserIds || mentionedUserIds.length === 0) return;
+  const roomMembers = state.roomMembers[roomId] || [];
+  // Longest name first, same reasoning as `buildMentionHtml`'s own
+  // `candidates` sort — a shorter mentioned name that happens to be a
+  // prefix of a longer one shouldn't shadow it.
+  const targets = mentionedUserIds
+    .map((uid) => roomMembers.find(([id]) => id === uid))
+    .filter(Boolean)
+    .map(([userId, name]) => ({ userId, name }))
+    .sort((a, b) => b.name.length - a.name.length);
+  if (targets.length === 0) return;
+
+  const walker = document.createTreeWalker(containerEl, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  let node;
+  while ((node = walker.nextNode())) textNodes.push(node);
+
+  for (const textNode of textNodes) {
+    const text = textNode.nodeValue;
+    if (!text.includes("@")) continue;
+    const parent = textNode.parentNode;
+    if (!parent) continue;
+
+    const frag = document.createDocumentFragment();
+    let rest = text;
+    let changed = false;
+    while (rest.length > 0) {
+      let best = null;
+      for (const t of targets) {
+        const needle = "@" + t.name;
+        const idx = rest.indexOf(needle);
+        if (idx !== -1 && (!best || idx < best.idx)) best = { idx, needle, t };
+      }
+      if (!best) {
+        frag.appendChild(document.createTextNode(rest));
+        break;
+      }
+      changed = true;
+      if (best.idx > 0) frag.appendChild(document.createTextNode(rest.slice(0, best.idx)));
+      const pill = document.createElement("span");
+      pill.className = "mention-pill";
+      pill.style.color = senderColor(best.t.userId);
+      pill.style.background = senderColor(best.t.userId) + "26"; // ~15% opacity
+      pill.textContent = "@" + best.t.name;
+      pill.title = best.t.userId;
+      frag.appendChild(pill);
+      rest = rest.slice(best.idx + best.needle.length);
+    }
+    if (changed) parent.replaceChild(frag, textNode);
+  }
+}
+
+/** Every "loading X..." placeholder in the app renders through this, so
+ * they all get the same bouncing-dog indicator instead of each writing
+ * its own plain-text copy. */
+function loadingHtml(text) {
+  return `<span class="loading-indicator"><img class="loading-icon" src="assets/loading-dog.png" alt="" /> ${escapeHtml(text)}</span>`;
+}
+
 // =========================================================================
 // Reply / edit
 // =========================================================================
@@ -1244,7 +1705,23 @@ function activeMentionQuery(text, cursorPos) {
  * bound once). `getRoomId`/`mentionsList` are functions/arrays so each
  * caller supplies its own room and mention-tracking state. */
 function wireMentionAutocomplete(inputEl, suggestionsEl, getRoomId, mentionsList) {
+  // Which suggestion row Up/Down has highlighted — same roving-highlight
+  // idea as the room list's `roomListActiveIndex`. Reset on every fresh
+  // filter (a keystroke, or the box losing focus) since the result set
+  // underneath it just changed.
+  let activeIndex = -1;
+
+  const selectMention = (userId, name, at) => {
+    const before = inputEl.value.slice(0, at);
+    const after = inputEl.value.slice(inputEl.selectionStart);
+    inputEl.value = `${before}@${name} ${after}`;
+    mentionsList.push({ userId, displayName: name });
+    suggestionsEl.style.display = "none";
+    inputEl.focus();
+  };
+
   inputEl.addEventListener("input", () => {
+    activeIndex = -1;
     const m = activeMentionQuery(inputEl.value, inputEl.selectionStart);
     const roomId = getRoomId();
     if (!m || !roomId) {
@@ -1252,8 +1729,15 @@ function wireMentionAutocomplete(inputEl, suggestionsEl, getRoomId, mentionsList
       return;
     }
     const members = state.roomMembers[roomId] || [];
+    // Diacritic-insensitive, same as the room list's own filter
+    // (`normalizeForSearch`) — without this, typing an unaccented "@duy"
+    // (the everyday way most Vietnamese keyboards/typists enter text)
+    // never matched a name like "Đinh Hà Duy" at all, since a plain
+    // `.toLowerCase()` still leaves "à"/"ă"/... as different characters
+    // from their unaccented base letter.
+    const query = normalizeForSearch(m.query);
     const matches = members
-      .filter(([, name]) => name.toLowerCase().includes(m.query.toLowerCase()))
+      .filter(([, name]) => normalizeForSearch(name).includes(query))
       .slice(0, 6);
     if (matches.length === 0) {
       suggestionsEl.style.display = "none";
@@ -1265,15 +1749,43 @@ function wireMentionAutocomplete(inputEl, suggestionsEl, getRoomId, mentionsList
       const item = document.createElement("div");
       item.className = "mention-item";
       item.textContent = name;
-      item.addEventListener("click", () => {
-        const before = inputEl.value.slice(0, m.at);
-        const after = inputEl.value.slice(inputEl.selectionStart);
-        inputEl.value = `${before}@${name} ${after}`;
-        mentionsList.push({ userId, displayName: name });
-        suggestionsEl.style.display = "none";
-        inputEl.focus();
-      });
+      item.addEventListener("click", () => selectMention(userId, name, m.at));
       suggestionsEl.appendChild(item);
+    }
+  });
+
+  // Arrow keys move the highlight, Enter/Tab picks the highlighted (or
+  // first, if none highlighted yet) suggestion, Escape dismisses — mouse
+  // click was previously the *only* way to actually pick a suggestion;
+  // Enter just fell through to the textarea's own handler and inserted a
+  // newline instead. Registered before `wireComposeEditor`'s own keydown
+  // listener on the same element (see call order below/at the thread
+  // panel), so `stopImmediatePropagation()` here reliably pre-empts it.
+  inputEl.addEventListener("keydown", (e) => {
+    if (suggestionsEl.style.display === "none") return;
+    const items = suggestionsEl.querySelectorAll(".mention-item");
+    if (items.length === 0) return;
+
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const delta = e.key === "ArrowDown" ? 1 : -1;
+      activeIndex = (activeIndex + delta + items.length) % items.length;
+      items.forEach((it, i) => it.classList.toggle("active", i === activeIndex));
+      items[activeIndex].scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const m = activeMentionQuery(inputEl.value, inputEl.selectionStart);
+      if (!m) return;
+      const idx = activeIndex === -1 ? 0 : activeIndex;
+      const roomId = getRoomId();
+      const members = state.roomMembers[roomId] || [];
+      const query = normalizeForSearch(m.query);
+      const matches = members.filter(([, name]) => normalizeForSearch(name).includes(query)).slice(0, 6);
+      const picked = matches[idx];
+      if (picked) selectMention(picked[0], picked[1], m.at);
+    } else if (e.key === "Escape") {
+      suggestionsEl.style.display = "none";
     }
   });
 }
@@ -1463,7 +1975,14 @@ function wireComposeEditor(textarea, { onSend, isSuggestionsOpen }) {
       return;
     }
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
-      const action = { b: "bold", i: "italic", e: "code", k: "link" }[e.key.toLowerCase()];
+      // No "k" here (unlike bold/italic/code) — Ctrl+K is the app-wide
+      // "focus room search" shortcut (see the `document`-level handler
+      // below), and that binding should win even while the compose box
+      // has focus. Capturing it here for "insert link" instead just ate
+      // the global shortcut every time you were typing a message, which
+      // is most of the time. The link toolbar button still works exactly
+      // the same either way, just without its own keyboard shortcut now.
+      const action = { b: "bold", i: "italic", e: "code" }[e.key.toLowerCase()];
       if (action) {
         e.preventDefault();
         e.stopPropagation();
@@ -1508,7 +2027,17 @@ function sendCurrentMessage() {
       html_body: html,
     });
     cancelEdit();
-    state.composeMentions = [];
+    // In-place clear, not `state.composeMentions = []` — the main
+    // compose box's `wireMentionAutocomplete` is only ever wired up once
+    // at page load (unlike the thread panel's, rewired on every
+    // re-render), so its closure holds onto this exact array object for
+    // the whole session. Reassigning the property to a brand-new array
+    // here would leave that closure still pushing into the old, now
+    // disconnected one — every mention picked after your *first* sent
+    // message would silently stop actually attaching (the send path
+    // would always see the fresh, still-empty array instead), even
+    // though the "@Name" text still looked right in the box.
+    state.composeMentions.length = 0;
     el.composeInput.focus();
     return;
   }
@@ -1525,7 +2054,10 @@ function sendCurrentMessage() {
     reply_to_event_id: replyTo,
   });
   cancelReply();
-  state.composeMentions = [];
+  // In-place clear — see the `EditMessage` branch above for why
+  // reassigning to a new array here would break every mention picked
+  // after this one for the rest of the session.
+  state.composeMentions.length = 0;
   // Enter already loses focus (that's what triggers `lost_focus`-style
   // send elsewhere), so put it back — otherwise every message needs a
   // re-click on the input before the next one can be typed.
@@ -1743,18 +2275,26 @@ document.addEventListener("keydown", async (e) => {
 // mouse, and a cheat sheet to find out these exist at all.
 const SHORTCUTS = [
   ["Ctrl+K or /", "focus room search"],
+  ["Ctrl+M", "focus the main message box"],
+  ["Ctrl+N", "focus the thread's message box"],
+  ["Ctrl+Shift+M", "focus the main timeline"],
+  ["Ctrl+Shift+N", "focus the thread panel"],
+  ["Ctrl+T", "open this room's threads list"],
+  ["Ctrl+Shift+T", "focus the threads-list search box"],
   ["↑ / ↓ (in search)", "move through search results"],
   ["Enter (in search)", "open the highlighted room"],
   ["Esc (in search)", "clear search, then unfocus"],
+  ["↑ / ↓ (threads list)", "move through the threads list"],
+  ["Enter (threads list)", "open the highlighted thread"],
   ["← / → (in tags)", "switch space/tag"],
   ["Alt+↑ / Alt+↓", "previous / next room in the list"],
   ["Ctrl+Shift+U", "toggle unread-only filter"],
+  ["Ctrl+Shift+R", "mark current room as read"],
   ["Esc", "close dialog / menu"],
   ["?", "show this list"],
   ["Shift+Enter (compose)", "new line instead of sending"],
   ["Ctrl+B / Ctrl+I", "bold / italic selection"],
   ["Ctrl+E / Ctrl+Shift+E", "inline code / code block"],
-  ["Ctrl+K (compose)", "insert link"],
 ];
 
 function showShortcutsHelp() {
@@ -1768,7 +2308,10 @@ function showShortcutsHelp() {
   `);
   document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
 }
-el.btnShortcuts.addEventListener("click", showShortcutsHelp);
+el.btnShortcuts.addEventListener("click", () => {
+  closeChatsMenu();
+  showShortcutsHelp();
+});
 
 /** True while the user is typing somewhere else — global shortcuts (`/`,
  * `?`, ...) that reuse plain, easy-to-hit keys must not fire while that's
@@ -1792,6 +2335,62 @@ document.addEventListener("keydown", (e) => {
     el.roomFilter.focus();
     return;
   }
+  // Not gated by `!typing` — like Ctrl+K above, the Ctrl modifier already
+  // makes these safe to fire no matter what currently has focus (unlike
+  // the bare `/`/`?`/single-letter shortcuts, which would otherwise
+  // hijack a character someone's typing into a message).
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "m") {
+    e.preventDefault();
+    if (state.selectedRoom) el.composeInput.focus();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "n") {
+    e.preventDefault();
+    if (state.rightPanel?.kind === "thread") {
+      document.getElementById("thread-compose-input")?.focus();
+    }
+    return;
+  }
+  // Shift variants of the two above — focus the *message list* itself
+  // (main timeline / thread panel) rather than its compose box, e.g. to
+  // scroll it with Page Up/Down or just move focus off the compose input
+  // without sending anything. `tabindex="-1"` on both targets (see
+  // index.html) is what makes a plain, non-interactive `<div>` a valid
+  // `.focus()` target at all.
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "m") {
+    e.preventDefault();
+    if (state.selectedRoom) el.timeline.focus();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "n") {
+    e.preventDefault();
+    if (state.rightPanel?.kind === "thread") {
+      // `#side-panel-body`, not `#thread-messages` — the latter doesn't
+      // scroll itself (see `appendThreadMessage`'s comment on why: its
+      // *parent* does), so focusing it wouldn't let Page Up/Down actually
+      // scroll anything.
+      document.getElementById("side-panel-body")?.focus();
+    }
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "t") {
+    e.preventDefault();
+    openRoomThreadsList();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "t") {
+    e.preventDefault();
+    // Opens the current room's thread list if nothing's open yet (same as
+    // plain Ctrl+T) — but leaves it alone if some threads-list panel
+    // (this room's, or "all threads") is already open, so this can't
+    // clobber a broader search someone's mid-typing into with a
+    // room-scoped one.
+    if (state.rightPanel?.kind !== "threads-list") openRoomThreadsList();
+    const filterInput = document.getElementById("threads-filter");
+    filterInput?.focus();
+    filterInput?.select();
+    return;
+  }
   if (e.key === "?" && !typing) {
     e.preventDefault();
     showShortcutsHelp();
@@ -1802,6 +2401,11 @@ document.addEventListener("keydown", (e) => {
     el.btnUnreadOnly.click();
     return;
   }
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "r") {
+    e.preventDefault();
+    el.btnMarkRead.click();
+    return;
+  }
   if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
     e.preventDefault();
     if (state.visibleRoomIds.length === 0) return;
@@ -1810,6 +2414,25 @@ document.addEventListener("keydown", (e) => {
     const base = currentIndex === -1 ? (delta === 1 ? -1 : 0) : currentIndex;
     const nextIndex = (base + delta + state.visibleRoomIds.length) % state.visibleRoomIds.length;
     selectRoom(state.visibleRoomIds[nextIndex]);
+    return;
+  }
+  // Plain (no modifier) Up/Down/Enter navigate the threads-list side
+  // panel's rows, same roving-highlight shape as the room filter box's
+  // own Up/Down/Enter handling — gated on that panel actually being open
+  // and not typing anywhere, so this can't hijack arrow keys/Enter
+  // anywhere else (a compose box, a dialog, ...). The panel's own search
+  // box (`#threads-filter`) handles the same keys itself, unaffected by
+  // this `!typing` gate — see its own `keydown` listener in
+  // `renderSidePanel`.
+  if (
+    !typing &&
+    !e.ctrlKey &&
+    !e.metaKey &&
+    !e.altKey &&
+    state.rightPanel?.kind === "threads-list" &&
+    (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Enter")
+  ) {
+    if (navigateThreadsList(e.key)) e.preventDefault();
     return;
   }
   if (e.key === "Escape") {
@@ -1933,18 +2556,158 @@ function openThread(roomId, root) {
   if (!state.roomMembers[roomId]) send("ListMembers", { room_id: roomId });
 }
 
+// =========================================================================
+// Search a user's messages across all rooms
+// =========================================================================
+
+/** Opens the side panel and kicks off `Command::SearchUserMessages` for
+ * `userId` (`@name:server`) — "show me everything this person has said,
+ * across every room". `fromTs`/`toTs` are optional millisecond bounds
+ * (inclusive) narrowing the search to a date range — `null` on either
+ * side means open-ended. Always re-runs the search, even if the panel is
+ * already open for the same user, since a different date range needs a
+ * fresh fetch anyway. */
+function openUserSearch(userId, fromTs = null, toTs = null) {
+  state.rightPanel = { kind: "user-search", userId, loading: true, results: [], truncated: false };
+  renderSidePanel();
+  send("SearchUserMessages", { user_id: userId, from_ts: fromTs, to_ts: toTs });
+}
+
+/** Reads the dialog's optional from/to `<input type=date>` values as
+ * millisecond bounds — start-of-day for "from", end-of-day for "to" so the
+ * "to" date itself is included. `NaN`/empty inputs become `null` (no
+ * bound on that side). */
+function readUserSearchDateRange() {
+  const fromStr = document.getElementById("dlg-user-search-from")?.value;
+  const toStr = document.getElementById("dlg-user-search-to")?.value;
+  const fromTs = fromStr ? new Date(fromStr + "T00:00:00").getTime() : null;
+  const toTs = toStr ? new Date(toStr + "T23:59:59.999").getTime() : null;
+  return { fromTs: Number.isFinite(fromTs) ? fromTs : null, toTs: Number.isFinite(toTs) ? toTs : null };
+}
+
+/** Renders/filters the picker list inside the "messages from a user"
+ * dialog — `state.allUsers` (`[user_id, display_name]` pairs, deduped
+ * across every joined room) once `Event::AllUsers` has answered, or a
+ * loading placeholder before that. Matching by id too (not just display
+ * name), Vietnamese-diacritic-insensitive like the room filter, since not
+ * every account has a friendly display name set. */
+function renderUserSearchDialogList() {
+  const listEl = document.getElementById("dlg-user-search-list");
+  if (!listEl) return;
+  if (state.allUsers === null) {
+    listEl.innerHTML = `<div style="padding:8px;font-size:12px;">${loadingHtml("loading members...")}</div>`;
+    return;
+  }
+  const query = normalizeForSearch(document.getElementById("dlg-user-search-filter").value.trim());
+  const matches = state.allUsers.filter(
+    ([userId, name]) => !query || normalizeForSearch(name).includes(query) || normalizeForSearch(userId).includes(query),
+  );
+  listEl.innerHTML = "";
+  if (matches.length === 0) {
+    listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--text-weak)">no matching member — you can still type a full @user:server id and press enter</div>`;
+    return;
+  }
+  for (const [userId, name] of matches.slice(0, 200)) {
+    const item = document.createElement("div");
+    item.className = "mention-item";
+    item.textContent = userId === name ? name : `${name}  (${userId})`;
+    item.addEventListener("click", () => {
+      const { fromTs, toTs } = readUserSearchDateRange();
+      closeDialog();
+      openUserSearch(userId, fromTs, toTs);
+    });
+    listEl.appendChild(item);
+  }
+}
+
+el.btnUserSearch.addEventListener("click", () => {
+  closeChatsMenu();
+  showDialog(`
+    <h3>messages from a user</h3>
+    <label>pick a member, or type an id and press enter</label>
+    <input type="text" id="dlg-user-search-filter" placeholder="filter by name or @user:server" autocomplete="off" />
+    <div id="dlg-user-search-list" class="user-search-list"></div>
+    <label>from date (optional)</label>
+    <input type="date" id="dlg-user-search-from" />
+    <label>to date (optional)</label>
+    <input type="date" id="dlg-user-search-to" />
+    <div class="actions">
+      <button id="dlg-cancel">cancel</button>
+    </div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  const filterInput = document.getElementById("dlg-user-search-filter");
+  filterInput.addEventListener("input", renderUserSearchDialogList);
+  filterInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const typed = filterInput.value.trim();
+      if (typed.startsWith("@") && typed.includes(":")) {
+        const { fromTs, toTs } = readUserSearchDateRange();
+        closeDialog();
+        openUserSearch(typed, fromTs, toTs);
+      }
+    }
+  });
+  if (state.allUsers === null && !state.allUsersLoading) {
+    state.allUsersLoading = true;
+    send("ListAllUsers");
+  }
+  renderUserSearchDialogList();
+  filterInput.focus();
+});
+
 el.btnMarkRead.addEventListener("click", () => {
   if (!state.selectedRoom) return;
   send("MarkRoomRead", { room_id: state.selectedRoom });
   showToast("marked as read");
 });
 
-el.btnRoomThreads.addEventListener("click", () => {
+el.btnRoomThreads.addEventListener("click", openRoomThreadsList);
+
+/** Opens the current room's thread-list panel — shared by the
+ * `[ threads ]` button and the `Ctrl+T` shortcut. */
+/** Moves/activates the threads-list panel's roving highlight — shared by
+ * the global keydown handler (fires when nothing in particular has focus)
+ * and `#threads-filter`'s own listener (fires while the search box has
+ * focus, bypassing the global handler's `!typing` gate the same way
+ * `el.roomFilter`'s keydown listener does for the room list). Returns
+ * whether it actually handled `key`, so callers know whether to
+ * `preventDefault()`. */
+function navigateThreadsList(key) {
+  const rows = state.visibleThreadRows;
+  if (rows.length === 0) return false;
+  if (key === "Enter") {
+    const picked = rows[state.threadsListActiveIndex];
+    if (!picked) return false;
+    const root = state.threadsByRoom[picked.roomId]?.find((t) => t.event_id === picked.eventId);
+    if (root) openThread(picked.roomId, root);
+    return true;
+  }
+  if (key !== "ArrowUp" && key !== "ArrowDown") return false;
+  const delta = key === "ArrowDown" ? 1 : -1;
+  const base = state.threadsListActiveIndex === -1 ? (delta === 1 ? -1 : 0) : state.threadsListActiveIndex;
+  state.threadsListActiveIndex = (base + delta + rows.length) % rows.length;
+  // Not `renderSidePanel()` — that would rebuild `#threads-filter` too
+  // (see `renderThreadsListRows`'s doc comment), which only matters here
+  // because this is reachable from that very input's own `keydown`
+  // listener: an arrow key while it's focused would otherwise cost it its
+  // own focus on every press.
+  renderThreadsListRows();
+  document
+    .getElementById("side-panel-body")
+    ?.querySelector(".thread-row.kbd-active")
+    ?.scrollIntoView({ block: "nearest" });
+  return true;
+}
+
+function openRoomThreadsList() {
   if (!state.selectedRoom) return;
   send("ListThreads", { room_id: state.selectedRoom });
   state.rightPanel = { kind: "threads-list", scope: state.selectedRoom };
+  state.threadsListActiveIndex = -1;
+  state.threadsListFilter = "";
   renderSidePanel();
-});
+}
 
 el.btnGlobalThreads.addEventListener("click", () => {
   // This view only ever shows *unread* threads (see `unreadOnly` in
@@ -1960,6 +2723,8 @@ el.btnGlobalThreads.addEventListener("click", () => {
     send("ListThreads", { room_id: roomId });
   }
   state.rightPanel = { kind: "threads-list", scope: null };
+  state.threadsListActiveIndex = -1;
+  state.threadsListFilter = "";
   renderSidePanel();
 });
 
@@ -2046,6 +2811,177 @@ function rerenderThreadMessageInPlace(eventId) {
   row.replaceWith(renderMessage(rp.events[idx], threadCtx, { grouped }));
 }
 
+/** Renders the threads-list side panel's static shell (header + search
+ * box + an empty `#side-panel-body`) — but only when it isn't already
+ * showing the right one; a live search-box keystroke, a background
+ * thread-data update, and arrow-key navigation all end up calling this
+ * (via `renderSidePanel()`) far more often than the shell itself ever
+ * actually needs to change. Skipping the rebuild in the common case is
+ * what keeps `#threads-filter` from being destroyed and recreated
+ * constantly — see `renderThreadsListRows`'s doc comment for why that
+ * matters. Always hands off to `renderThreadsListRows()` for the actual
+ * row content, whether or not the shell needed rebuilding. */
+function renderThreadsListPanel() {
+  const rp = state.rightPanel; // caller already checked kind === "threads-list"
+  const shellReady =
+    el.sidePanel.dataset.threadsListScope === String(rp.scope) &&
+    document.getElementById("threads-filter");
+  if (!shellReady) {
+    el.sidePanel.dataset.threadsListScope = String(rp.scope);
+    el.sidePanel.innerHTML = `<div id="side-panel-header"><span>${rp.scope === null ? "all threads" : "threads"}</span><button id="side-panel-close" class="small-btn">[x]</button></div>
+      <div id="threads-filter-row"><input id="threads-filter" placeholder="search threads..." value="${escapeHtml(state.threadsListFilter)}" /></div>
+      <div id="side-panel-body"></div>`;
+    document.getElementById("side-panel-close").addEventListener("click", () => {
+      state.rightPanel = null;
+      renderSidePanel();
+    });
+    const filterInput = document.getElementById("threads-filter");
+    filterInput.addEventListener("input", () => {
+      state.threadsListFilter = filterInput.value;
+      clearTimeout(threadsFilterDebounceTimer);
+      threadsFilterDebounceTimer = setTimeout(() => {
+        state.threadsListActiveIndex = -1;
+        renderThreadsListRows();
+      }, 120);
+    });
+    filterInput.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Enter") {
+        if (navigateThreadsList(e.key)) e.preventDefault();
+      } else if (e.key === "Escape") {
+        if (filterInput.value) {
+          filterInput.value = "";
+          state.threadsListFilter = "";
+          state.threadsListActiveIndex = -1;
+          renderThreadsListRows();
+        } else {
+          filterInput.blur();
+        }
+      }
+    });
+  }
+  renderThreadsListRows();
+}
+
+/** Rebuilds just `#side-panel-body`'s contents (the matching-thread rows,
+ * "no results" placeholder, and "load more" row) for the threads-list
+ * panel — never touches `#threads-filter` or anything else in the shell.
+ * This used to all happen inside one full-panel rebuild that also
+ * recreated the search box every time, which meant every keystroke typed
+ * into it (the filter re-runs this on a 120ms debounce) tore out and
+ * replaced the very input being typed into — knocking focus out of it
+ * every time and, worse for anyone typing Vietnamese through an IME,
+ * breaking whatever composition was in progress. Splitting the row
+ * content out from the shell (see `renderThreadsListPanel`) fixes that
+ * at the root instead of trying to save/restore focus around a rebuild
+ * that didn't need to touch the input at all. */
+function renderThreadsListRows() {
+  const rp = state.rightPanel;
+  if (!rp || rp.kind !== "threads-list") return;
+  const bodyEl = document.getElementById("side-panel-body");
+  if (!bodyEl) return;
+
+  const unreadOnly = rp.scope === null;
+  const query = normalizeForSearch(state.threadsListFilter.trim());
+  /** A thread matches if the room it's in, its first message, or its
+   * latest reply mention the search text — covers "I remember someone
+   * said X" without needing to know which of those two messages it was
+   * in, or opening the thread to check. */
+  const threadMatches = (roomName, t) =>
+    !query ||
+    [roomName, t.sender_name, t.body, t.latest_reply_sender_name, t.latest_reply_body]
+      .filter(Boolean)
+      .some((s) => normalizeForSearch(s).includes(query));
+
+  let rooms = Object.entries(state.threadsByRoom)
+    .filter(([roomId]) => rp.scope === null || roomId === rp.scope)
+    .map(([roomId, threads]) => {
+      const roomName = state.rooms.find((r) => r.room_id === roomId)?.name || roomId;
+      const filtered = threads.filter(
+        (t) =>
+          (!unreadOnly || state.unreadThreads.has(`${roomId}|${t.event_id}`)) &&
+          threadMatches(roomName, t),
+      );
+      return { roomId, roomName, threads: filtered };
+    })
+    .filter((r) => r.threads.length > 0);
+
+  // Flattened across rooms and sorted by whichever's most recently
+  // active — a thread's latest reply if it has one, its own send time
+  // otherwise — rather than grouped under alphabetical room-name
+  // headers. The room-per-row label below (`rp.scope === null` only —
+  // implied otherwise) is what keeps that legible once threads from
+  // different rooms interleave.
+  const allThreads = rooms.flatMap((r) =>
+    r.threads.map((t) => ({ roomId: r.roomId, roomName: r.roomName, t })),
+  );
+  allThreads.sort((a, b) => (b.t.latest_reply_ts ?? b.t.timestamp) - (a.t.latest_reply_ts ?? a.t.timestamp));
+
+  let html = "";
+  if (allThreads.length === 0) {
+    html += `<div style="color:var(--text-weak)">${
+      query
+        ? "no threads match your search"
+        : unreadOnly
+          ? "no unread threads"
+          : "no threads yet"
+    }</div>`;
+  }
+  state.visibleThreadRows = [];
+  for (const { roomId, roomName, t } of allThreads) {
+    const rowIndex = state.visibleThreadRows.length;
+    state.visibleThreadRows.push({ roomId, eventId: t.event_id });
+    const unread = state.unreadThreads.has(`${roomId}|${t.event_id}`);
+    // "First message" is the thread root itself (`t`); "last message"
+    // is its bundled latest-reply preview (see `latest_reply_*` on
+    // `TimelineEvent` — comes straight off the root event's own
+    // server-side aggregation, no per-thread fetch needed just to
+    // list them). Absent for a thread with 0 replies.
+    const lastMsgHtml = t.latest_reply_body
+      ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${escapeHtml(truncate(t.latest_reply_body, 80))}</div>`
+      : "";
+    const roomTagHtml = rp.scope === null ? `<div class="thread-row-room">${escapeHtml(roomName)}</div>` : "";
+    html += `<div class="thread-row${rowIndex === state.threadsListActiveIndex ? " kbd-active" : ""}" data-room="${roomId}" data-event="${t.event_id}">
+      ${roomTagHtml}
+      <div class="sender" style="color:${senderColor(t.sender)}">${unread ? '<span class="unread-dot">●</span> ' : ""}${escapeHtml(t.sender_name)}</div>
+      <div class="thread-row-body">${escapeHtml(truncate(t.body || "", 80))}</div>
+      ${lastMsgHtml}
+      <div class="thread-row-meta">${t.thread_count || 0} replies →</div>
+    </div>`;
+  }
+  if (state.threadsListActiveIndex >= state.visibleThreadRows.length) {
+    state.threadsListActiveIndex = state.visibleThreadRows.length - 1;
+  }
+  // Pagination only makes sense for one room's own (unfiltered) thread
+  // list — the all-rooms view is already narrowed to unread threads only,
+  // which `state.unreadThreads` tracks live rather than needing a deeper
+  // fetch. `rooms.length === 1` here whenever `rp.scope` is a room id,
+  // since the filter above already narrowed to just that room. Hidden
+  // while a search is active — "load more" fetches more threads from the
+  // server, which has nothing to do with what's already loaded just not
+  // matching the current search text.
+  const scopedRoom = rp.scope !== null && !query ? rooms[0] : null;
+  if (scopedRoom && !state.threadsListReachedEnd.has(rp.scope)) {
+    const loading = state.threadsListPaginationInFlight.has(rp.scope);
+    html += `<div id="threads-load-more-row" style="text-align:center;font-size:12px;padding:4px;">${
+      loading ? loadingHtml("loading more threads...") : '<button id="threads-load-more-btn" class="small-btn">load more threads</button>'
+    }</div>`;
+  }
+  bodyEl.innerHTML = html;
+  bodyEl.querySelectorAll(".thread-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const roomId = row.dataset.room;
+      const eventId = row.dataset.event;
+      const root = state.threadsByRoom[roomId]?.find((t) => t.event_id === eventId);
+      if (root) openThread(roomId, root);
+    });
+  });
+  document.getElementById("threads-load-more-btn")?.addEventListener("click", () => {
+    state.threadsListPaginationInFlight.add(rp.scope);
+    send("LoadMoreThreads", { room_id: rp.scope });
+    renderThreadsListRows();
+  });
+}
+
 function renderSidePanel() {
   const rp = state.rightPanel;
   const resizerRight = document.getElementById("resizer-right");
@@ -2055,69 +2991,34 @@ function renderSidePanel() {
     resizerRight.style.display = "none";
     return;
   }
+  // Below `720px`/`500px` (see that media query in style.css) `#side-panel`
+  // becomes a full-screen overlay (`width: 100%`) instead of a second
+  // pane next to the timeline — setting an inline pixel width here would
+  // outrank that unconditionally (inline styles beat any stylesheet rule
+  // regardless of media query) and break it, so this only ever applies to
+  // the side-by-side desktop layout.
+  const isNarrowLayout = window.matchMedia("(max-width: 720px), (max-height: 500px)").matches;
+  if (!isNarrowLayout && el.sidePanel.style.display !== "flex") {
+    // Default to splitting the space evenly with the timeline instead of
+    // a fixed width — measured right before `#side-panel` starts taking
+    // up any room, so `#main-panel` (`flex: 1`) still reflects the full
+    // width available to both of them at this instant. Only on the
+    // closed→open transition (this check), not on every subsequent
+    // re-render while it's already showing, so it doesn't fight a resize
+    // the user just did by hand.
+    const availableWidth = el.mainPanel.getBoundingClientRect().width;
+    // `resizerRight` is still `display: none` at this point (set below),
+    // so it has no measurable width of its own yet — `.resizer`'s CSS
+    // width is a fixed 4px regardless, so just use that directly.
+    const resizerWidth = 4;
+    const min = parseInt(getComputedStyle(el.sidePanel).minWidth, 10) || 220;
+    el.sidePanel.style.width = Math.max(min, (availableWidth - resizerWidth) / 2) + "px";
+  }
   el.sidePanel.style.display = "flex";
   resizerRight.style.display = "block";
 
   if (rp.kind === "threads-list") {
-    const unreadOnly = rp.scope === null;
-    let rooms = Object.entries(state.threadsByRoom)
-      .filter(([roomId]) => rp.scope === null || roomId === rp.scope)
-      .map(([roomId, threads]) => {
-        const filtered = unreadOnly
-          ? threads.filter((t) => state.unreadThreads.has(`${roomId}|${t.event_id}`))
-          : threads;
-        const roomName = state.rooms.find((r) => r.room_id === roomId)?.name || roomId;
-        return { roomId, roomName, threads: filtered };
-      })
-      .filter((r) => r.threads.length > 0);
-    rooms.sort((a, b) => a.roomName.localeCompare(b.roomName));
-
-    let html = `<div id="side-panel-header"><span>${rp.scope === null ? "all threads" : "threads"}</span><button id="side-panel-close" class="small-btn">[x]</button></div><div id="side-panel-body">`;
-    if (rooms.length === 0) {
-      html += `<div style="color:var(--text-weak)">${unreadOnly ? "no unread threads" : "no threads yet"}</div>`;
-    }
-    for (const r of rooms) {
-      if (rp.scope === null) html += `<div class="thread-room-name">${escapeHtml(r.roomName)}</div>`;
-      for (const t of r.threads) {
-        const unread = state.unreadThreads.has(`${r.roomId}|${t.event_id}`);
-        html += `<div class="thread-row" data-room="${r.roomId}" data-event="${t.event_id}">
-          <div class="sender" style="color:${senderColor(t.sender)}">${unread ? '<span class="unread-dot">●</span> ' : ""}${escapeHtml(t.sender_name)}</div>
-          <div class="thread-row-body">${escapeHtml(truncate(t.body || "", 80))}</div>
-          <div class="thread-row-meta">${t.thread_count || 0} replies →</div>
-        </div>`;
-      }
-    }
-    // Pagination only makes sense for one room's own (unfiltered) thread
-    // list — the all-rooms view is already narrowed to unread threads
-    // only, which `state.unreadThreads` tracks live rather than needing a
-    // deeper fetch. `rooms.length === 1` here whenever `rp.scope` is a
-    // room id, since the filter above already narrowed to just that room.
-    const scopedRoom = rp.scope !== null ? rooms[0] : null;
-    if (scopedRoom && !state.threadsListReachedEnd.has(rp.scope)) {
-      const loading = state.threadsListPaginationInFlight.has(rp.scope);
-      html += `<div id="threads-load-more-row" style="text-align:center;color:var(--text-weak);font-size:12px;padding:4px;">${
-        loading ? "loading more threads..." : '<button id="threads-load-more-btn" class="small-btn">load more threads</button>'
-      }</div>`;
-    }
-    html += "</div>";
-    el.sidePanel.innerHTML = html;
-    document.getElementById("side-panel-close").addEventListener("click", () => {
-      state.rightPanel = null;
-      renderSidePanel();
-    });
-    el.sidePanel.querySelectorAll(".thread-row").forEach((row) => {
-      row.addEventListener("click", () => {
-        const roomId = row.dataset.room;
-        const eventId = row.dataset.event;
-        const root = state.threadsByRoom[roomId]?.find((t) => t.event_id === eventId);
-        if (root) openThread(roomId, root);
-      });
-    });
-    document.getElementById("threads-load-more-btn")?.addEventListener("click", () => {
-      state.threadsListPaginationInFlight.add(rp.scope);
-      send("LoadMoreThreads", { room_id: rp.scope });
-      renderSidePanel();
-    });
+    renderThreadsListPanel();
     return;
   }
 
@@ -2131,8 +3032,8 @@ function renderSidePanel() {
     const hadFocus = document.activeElement?.id === "thread-compose-input";
     const priorSelectionStart = hadFocus ? document.activeElement.selectionStart : null;
 
-    let html = `<div id="side-panel-header"><span>thread</span><button id="side-panel-close" class="small-btn">[x]</button></div>
-      <div id="side-panel-body"><div id="thread-messages"></div></div>
+    let html = `<div id="side-panel-header"><span>thread</span><div style="display:flex;gap:6px;"><button id="thread-btn-summarize" class="small-btn">[ summarize ]</button><button id="side-panel-close" class="small-btn">[x]</button></div></div>
+      <div id="side-panel-body" tabindex="-1"><div id="thread-messages"></div></div>
       <div id="thread-reply-indicator" style="display:none;"></div>
       <div id="thread-mention-suggestions" style="display:none;"></div>
       <div id="thread-pending-image-preview" style="display:none;padding:6px 12px;"></div>
@@ -2148,7 +3049,7 @@ function renderSidePanel() {
             <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
             <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
             <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
-            <button type="button" class="md-btn" data-md="link" title="link (Ctrl+K)">link</button>
+            <button type="button" class="md-btn" data-md="link" title="link">link</button>
           </div>
           <textarea id="thread-compose-input" class="compose-textarea" rows="1" placeholder="reply... (@ to mention, **bold**, *italic*, \`code\`)"></textarea>
         </div>
@@ -2158,6 +3059,9 @@ function renderSidePanel() {
     document.getElementById("side-panel-close").addEventListener("click", () => {
       state.rightPanel = null;
       renderSidePanel();
+    });
+    document.getElementById("thread-btn-summarize").addEventListener("click", () => {
+      openSummaryDialog(rp.roomId, rp.root.event_id);
     });
     const msgsEl = document.getElementById("thread-messages");
     const threadCtx = { roomId: rp.roomId, threadId: rp.root.event_id };
@@ -2193,7 +3097,12 @@ function renderSidePanel() {
       autoResizeTextarea(input);
       threadSuggestionsEl.style.display = "none";
       const { ids, html } = buildMentionHtml(body, state.threadComposeMentions);
-      state.threadComposeMentions = [];
+      // In-place clear, same reasoning as the main compose box's two spots
+      // above — a live reply/edit echo appends in place (`appendThreadMessage`)
+      // rather than rebuilding the whole panel every time (see its own doc
+      // comment), so this array can easily outlive any one `renderSidePanel()`
+      // call's `wireMentionAutocomplete` closure too.
+      state.threadComposeMentions.length = 0;
 
       if (state.pendingEdit && state.pendingEdit.threadId === rp.root.event_id) {
         send("EditMessage", {
@@ -2256,6 +3165,46 @@ function renderSidePanel() {
     return;
   }
 
+  if (rp.kind === "user-search") {
+    let html = `<div id="side-panel-header"><span>messages from ${escapeHtml(rp.userId)}</span><button id="side-panel-close" class="small-btn">[x]</button></div><div id="side-panel-body">`;
+    if (rp.loading) {
+      html += `<div style="padding:12px;text-align:center;">${loadingHtml("scanning every room, this can take a while...")}</div>`;
+    } else {
+      if (rp.truncated) {
+        html += `<div style="color:var(--text-weak);font-size:12px;margin-bottom:8px;">some very active rooms may be missing older messages — narrow the date range for more complete results</div>`;
+      }
+      if (rp.results.length === 0) {
+        html += `<div style="color:var(--text-weak)">no messages found from this user in this date range</div>`;
+      }
+      // One room-name header per *run* of consecutive same-room hits (not
+      // once per message) — same idea as the main timeline grouping
+      // consecutive messages from the same sender.
+      let lastRoomId = null;
+      for (const hit of rp.results) {
+        if (hit.room_id !== lastRoomId) {
+          html += `<div class="thread-room-name">${escapeHtml(hit.room_name)}</div>`;
+          lastRoomId = hit.room_id;
+        }
+        html += `<div class="thread-row" data-room="${hit.room_id}" data-event="${hit.event.event_id}">
+          <div class="sender" style="color:${senderColor(hit.event.sender)}">${escapeHtml(hit.event.sender_name)}</div>
+          <div class="thread-row-body">${escapeHtml(truncate(hit.event.body || "", 120))}</div>
+          <div class="thread-row-meta">${new Date(hit.event.timestamp).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
+        </div>`;
+      }
+    }
+    html += "</div>";
+    el.sidePanel.innerHTML = html;
+    document.getElementById("side-panel-close").addEventListener("click", () => {
+      state.rightPanel = null;
+      renderSidePanel();
+    });
+    el.sidePanel.querySelectorAll(".thread-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        openMatrixToLink(row.dataset.room, row.dataset.event);
+      });
+    });
+  }
+
   if (rp.kind === "security") {
     renderSecurityPanel();
   }
@@ -2266,7 +3215,10 @@ function renderSidePanel() {
 // =========================================================================
 
 el.btnSecurity.addEventListener("click", () => {
+  closeChatsMenu();
   state.rightPanel = { kind: "security" };
+  state.lvxApiKeyConfigured = null;
+  send("GetLvxApiKeyStatus");
   renderSidePanel();
 });
 
@@ -2299,6 +3251,20 @@ function renderSecurityPanel() {
   if (state.keyImportStatus) {
     html += `<div style="margin-top:8px;font-size:12px;color:var(--text-weak);">${escapeHtml(state.keyImportStatus)}</div>`;
   }
+  html += `<hr style="border-color:var(--border);margin:14px 0;">
+    <label style="font-size:12px;color:var(--text-weak);">LVX API key (for [ summarize ])</label>
+    <div style="font-size:11px;color:var(--text-weak);margin:2px 0 6px;">${
+      state.lvxApiKeyConfigured === null
+        ? "checking..."
+        : state.lvxApiKeyConfigured
+          ? "currently configured — paste a new one to replace it, or clear below"
+          : "not set — summarize will fail until one's set here or via the LVX_API_KEY env var"
+    }</div>
+    <input type="password" id="sec-lvx-api-key" style="width:100%;" placeholder="sk-..." autocomplete="off" />
+    <div style="display:flex;gap:8px;margin-top:8px;">
+      <button id="sec-lvx-api-key-save" style="flex:1;">save</button>
+      <button id="sec-lvx-api-key-clear" style="flex:1;">clear</button>
+    </div>`;
   html += "</div>";
   el.sidePanel.innerHTML = html;
 
@@ -2319,6 +3285,17 @@ function renderSecurityPanel() {
   });
   document.getElementById("sec-import-keys").addEventListener("click", () => {
     el.importKeysFileInput.click();
+  });
+  document.getElementById("sec-lvx-api-key-save").addEventListener("click", () => {
+    const input = document.getElementById("sec-lvx-api-key");
+    const key = input.value.trim();
+    if (!key) return;
+    send("SetLvxApiKey", { api_key: key });
+    input.value = "";
+  });
+  document.getElementById("sec-lvx-api-key-clear").addEventListener("click", () => {
+    send("SetLvxApiKey", { api_key: "" });
+    document.getElementById("sec-lvx-api-key").value = "";
   });
 }
 
@@ -2381,6 +3358,12 @@ function handleBackendEvent(evt) {
     case "Rooms":
       state.rooms = data;
       renderRooms();
+      if (state.reloadingRooms) {
+        state.reloadingRooms = false;
+        el.btnReloadRooms.disabled = false;
+        el.btnReloadRooms.textContent = "[ reload ]";
+        showToast("room list reloaded");
+      }
       break;
     case "Timeline":
       state.timelines[data.room_id] = data.events;
@@ -2391,7 +3374,11 @@ function handleBackendEvent(evt) {
         state.pendingScrollTarget = null;
         // `renderTimeline()` just ran synchronously above, but give the
         // browser a tick to actually paint before measuring for scroll.
-        setTimeout(() => scrollToMessage("timeline", eventId), 50);
+        setTimeout(() => findAndScrollToMessage(data.room_id, eventId), 50);
+      }
+      if (state.pendingThreadLink?.roomId === data.room_id) {
+        const { threadRootId, eventId } = state.pendingThreadLink;
+        setTimeout(() => resolveThreadLink(data.room_id, threadRootId, eventId), 50);
       }
       break;
     case "TimelinePrepend": {
@@ -2403,21 +3390,48 @@ function handleBackendEvent(evt) {
         renderTimeline();
         el.timeline.scrollTop = el.timeline.scrollHeight - prevHeight;
       }
+      if (state.pendingScrollSearch?.roomId === data.room_id) {
+        const eventId = state.pendingScrollSearch.eventId;
+        setTimeout(() => findAndScrollToMessage(data.room_id, eventId), 50);
+      }
+      if (state.pendingThreadLink?.roomId === data.room_id) {
+        const { threadRootId, eventId } = state.pendingThreadLink;
+        setTimeout(() => resolveThreadLink(data.room_id, threadRootId, eventId), 50);
+      }
       break;
     }
-    case "NewMessage":
+    case "NewMessage": {
       if (!state.timelines[data.room_id]) state.timelines[data.room_id] = [];
       state.timelines[data.room_id].push(data.event);
       if (data.room_id === state.selectedRoom) {
         appendMessage(data.room_id, data.event);
-        // A live message landing in the room you're actively looking at
-        // shouldn't make it show up as unread in the sidebar a moment
-        // later — keep it marked read as messages arrive, not just once
-        // when the room is first opened.
-        send("MarkRoomRead", { room_id: data.room_id });
+      }
+      // Update the room list's preview text/ordering/unread badge right
+      // as the message arrives, instead of waiting for the backend's own
+      // debounced `Event::Rooms` refresh (up to ~800ms later) — which,
+      // for a room that's never been opened this session, can't compute
+      // an up-to-date preview at all (`Room::latest_event()` needs
+      // machinery this app doesn't run; see `refresh_rooms`'s comment on
+      // the backend side). Without this, a new message in a room you
+      // haven't opened just silently didn't move it up or show a preview
+      // until you happened to trigger some other room-list refresh.
+      const room = state.rooms.find((r) => r.room_id === data.room_id);
+      if (room) {
+        room.last_message = data.event.body;
+        room.last_message_ts = data.event.timestamp;
+        // Bumped unconditionally, even for the room you're currently
+        // looking at — read state is only ever cleared by explicitly
+        // pressing "[ mark read ]" (see `el.btnMarkRead`'s handler), not
+        // just by a message happening to arrive while the room's open.
+        room.unread_count = (room.unread_count || 0) + 1;
+        // Same ordering `refresh_rooms` uses server-side: invites first,
+        // then most recent activity.
+        state.rooms.sort((a, b) => (b.is_invite - a.is_invite) || b.last_message_ts - a.last_message_ts);
+        renderRooms();
       }
       maybeNotify(data.room_id, data.event);
       break;
+    }
     case "ThreadReply": {
       const key = `${data.room_id}|${data.thread_root_id}`;
       const openHere =
@@ -2454,10 +3468,48 @@ function handleBackendEvent(evt) {
       if (
         state.rightPanel &&
         state.rightPanel.kind === "thread" &&
+        state.rightPanel.roomId === data.room_id &&
         state.rightPanel.root.event_id === data.thread_root_id
       ) {
         state.rightPanel.events = data.events;
+        state.threadPaginationReachedStart.delete(`${data.room_id}|${data.thread_root_id}`);
         renderSidePanel();
+        // Default to loading the whole thread rather than just the latest
+        // page — keep requesting older pages until the server says there's
+        // nothing left. `LoadMoreThreadReplies` is a no-op (immediate
+        // `reached_start: true`) once the first page already covered the
+        // whole thread, so this is safe to always fire.
+        send("LoadMoreThreadReplies", { room_id: data.room_id, thread_root_id: data.thread_root_id });
+      }
+      if (
+        state.pendingThreadScrollTarget?.roomId === data.room_id &&
+        state.pendingThreadScrollTarget?.threadRootId === data.thread_root_id
+      ) {
+        const eventId = state.pendingThreadScrollTarget.eventId;
+        setTimeout(() => tryScrollToThreadMessage(data.room_id, data.thread_root_id, eventId), 50);
+      }
+      break;
+    case "ThreadEventsPrepend":
+      if (
+        state.rightPanel &&
+        state.rightPanel.kind === "thread" &&
+        state.rightPanel.roomId === data.room_id &&
+        state.rightPanel.root.event_id === data.thread_root_id
+      ) {
+        state.rightPanel.events = [...data.events, ...state.rightPanel.events];
+        if (data.reached_start) {
+          state.threadPaginationReachedStart.add(`${data.room_id}|${data.thread_root_id}`);
+        } else {
+          send("LoadMoreThreadReplies", { room_id: data.room_id, thread_root_id: data.thread_root_id });
+        }
+        renderSidePanel();
+      }
+      if (
+        state.pendingThreadScrollTarget?.roomId === data.room_id &&
+        state.pendingThreadScrollTarget?.threadRootId === data.thread_root_id
+      ) {
+        const eventId = state.pendingThreadScrollTarget.eventId;
+        setTimeout(() => tryScrollToThreadMessage(data.room_id, data.thread_root_id, eventId), 50);
       }
       break;
     case "ThreadsList":
@@ -2485,13 +3537,23 @@ function handleBackendEvent(evt) {
     case "Members":
       state.roomMembers[data.room_id] = data.members;
       break;
-    case "Summary":
-      state.summaries[data.room_id] = data.text;
-      state.summarizing = false;
-      el.btnSummarize.textContent = "[ summarize ]";
-      el.btnSummarize.disabled = false;
-      if (data.room_id === state.selectedRoom) renderSummary();
+    case "Summary": {
+      const req = state.summaryRequest;
+      if (req && req.roomId === data.room_id && req.threadRootId === data.thread_root_id) {
+        const body = document.getElementById("summary-dialog-body");
+        // `renderMarkdown`, not `textContent` — the LLM's response is
+        // markdown-formatted (headers, **bold**, `- ` bullet lines,
+        // blank-line-separated paragraphs), and `textContent` collapses
+        // all of that structure into one unbroken wall of text since
+        // plain-text newlines don't survive default CSS `white-space`
+        // handling. Safe the same way every other `renderMarkdown` call
+        // in this app is — it escapes the raw text before adding any
+        // markup, so this can't execute anything even though the LLM's
+        // output is ultimately derived from other people's messages.
+        if (body) body.innerHTML = renderMarkdown(data.text);
+      }
       break;
+    }
     case "MessageDeleted": {
       const ev = findEvent(data.room_id, data.event_id);
       if (ev) {
@@ -2642,14 +3704,41 @@ function handleBackendEvent(evt) {
       state.recoveryStatus = data;
       if (state.rightPanel?.kind === "security") renderSidePanel();
       break;
+    case "LvxApiKeyStatus":
+      state.lvxApiKeyConfigured = data.configured;
+      if (state.rightPanel?.kind === "security") renderSidePanel();
+      break;
     case "RoomKeysImported":
       state.keyImportStatus = `imported ${data.imported} of ${data.total} session${data.total === 1 ? "" : "s"}`;
       showToast(state.keyImportStatus);
       if (state.rightPanel?.kind === "security") renderSidePanel();
       break;
+    case "AllUsers":
+      state.allUsers = data.users;
+      state.allUsersLoading = false;
+      renderUserSearchDialogList();
+      break;
+    case "UserMessagesSearchResult":
+      if (state.rightPanel?.kind === "user-search" && state.rightPanel.userId === data.user_id) {
+        state.rightPanel.loading = false;
+        state.rightPanel.results = data.results;
+        state.rightPanel.truncated = data.truncated;
+        renderSidePanel();
+      }
+      break;
     case "Error":
       console.error("backend error:", data);
       showToast(data);
+      // A failed `Command::Summarize` (bad/missing key, request error,
+      // ...) surfaces here as a generic `Event::Error`, not something
+      // `case "Summary"` ever sees — without this, an open summary
+      // dialog just sat on "summarizing..." forever with no visible
+      // explanation beyond a toast that's already faded by the time
+      // anyone thinks to look back at the dialog.
+      if (state.summaryRequest) {
+        const body = document.getElementById("summary-dialog-body");
+        if (body) body.textContent = data;
+      }
       break;
     default:
       break;
@@ -2744,26 +3833,51 @@ function scrollToMessage(containerId, eventId) {
     showToast("original message isn't loaded — try loading more history");
     return;
   }
-  target.scrollIntoView({ behavior: "smooth", block: "center" });
+  // Instant, not smooth — a smooth scroll animates over however far the
+  // target is (can be many screens away, e.g. a shared link into a long
+  // room), so it could still be mid-scroll once the highlight below
+  // starts fading out, leaving nothing visible by the time the message
+  // actually settles into view. Jumping straight there removes that race
+  // entirely — the flash is guaranteed to start once the message is
+  // already on screen.
+  target.scrollIntoView({ block: "center" });
+  // Force a reflow between remove/add so clicking the same link/preview
+  // again while still highlighted restarts the CSS animation from 0%,
+  // rather than the class already being present making the second
+  // `add("jump-highlight")` a silent no-op.
+  target.classList.remove("jump-highlight");
+  void target.offsetWidth;
   target.classList.add("jump-highlight");
-  setTimeout(() => target.classList.remove("jump-highlight"), 1600);
+  setTimeout(() => target.classList.remove("jump-highlight"), 2200);
 }
 
 // =========================================================================
 // Share message (matrix.to links)
 // =========================================================================
 
-function buildMatrixToLink(roomId, eventId) {
+function buildMatrixToLink(roomId, eventId, threadRootId) {
   // Room/event IDs (`!xyz:server`, `$xyz`) don't contain characters that
   // need percent-encoding, and matrix.to links are conventionally shown
   // "clean" (`:` literal, not `%3A`) — encoding them would still work when
   // clicked here (the handler below decodes), but would look broken
   // pasted anywhere that doesn't bother decoding first.
-  return `https://matrix.to/#/${roomId}/${eventId}`;
+  const link = `https://matrix.to/#/${roomId}/${eventId}`;
+  // Standard matrix.to links have no way to say "this event is a reply
+  // inside thread X" — a thread reply is completely absent from a room's
+  // main timeline (only the thread's root message appears there, as a
+  // reply-count summary), so a plain client following this link has
+  // nowhere to even look for it. `?thread=` is our own extension: ignored
+  // by every other client (it's just an unrecognized query param), but
+  // lets `openMatrixToLink` below go straight to the right thread panel
+  // instead of paginating the entire room history hunting for an event
+  // that was never going to be there.
+  return threadRootId && threadRootId !== eventId
+    ? `${link}?thread=${threadRootId}`
+    : link;
 }
 
-async function shareMessage(roomId, eventId) {
-  const link = buildMatrixToLink(roomId, eventId);
+async function shareMessage(roomId, eventId, threadRootId) {
+  const link = buildMatrixToLink(roomId, eventId, threadRootId);
   try {
     await navigator.clipboard.writeText(link);
     showToast("message link copied — paste it to share");
@@ -2787,17 +3901,122 @@ async function shareMessage(roomId, eventId) {
 /** Recognizes our own shared links (and anyone else's matrix.to links with
  * the same room-then-event shape) in message bodies and jumps to the
  * target instead of trying to open a browser — switching rooms first if
- * the link points somewhere other than the one currently open. */
+ * the link points somewhere other than the one currently open. Our own
+ * `?thread=` extension (see `buildMatrixToLink`) is picked out of the
+ * query string here too, so a shared thread reply routes to
+ * `openMatrixToLink`'s thread-aware path instead of the plain-timeline
+ * one, which would never find it. */
 document.addEventListener("click", (e) => {
   const a = e.target.closest("a[href]");
   if (!a) return;
-  const m = a.getAttribute("href")?.match(/^https:\/\/matrix\.to\/#\/(![^/?]+)\/(\$[^/?]+)/);
+  const m = a.getAttribute("href")?.match(/^https:\/\/matrix\.to\/#\/(![^/?]+)\/(\$[^/?]+)(\?[^#]*)?/);
   if (!m) return;
   e.preventDefault();
-  openMatrixToLink(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+  const threadRootId = m[3] ? new URLSearchParams(m[3]).get("thread") : null;
+  openMatrixToLink(decodeURIComponent(m[1]), decodeURIComponent(m[2]), threadRootId ? decodeURIComponent(threadRootId) : null);
 });
 
-function openMatrixToLink(roomId, eventId) {
+/** Scrolls to `eventId` in `roomId`'s main timeline like `scrollToMessage`
+ * does, but — unlike that one — doesn't just give up with a toast when the
+ * message isn't in whatever page happens to be loaded yet. A shared link
+ * routinely points at a message from well before the room's most recent
+ * page (that's the whole point of sharing one), and landing in the right
+ * room with no way to tell which message it was is worse than just
+ * waiting a moment: this keeps calling `PaginateBack` (via
+ * `state.pendingScrollSearch`, resumed from the `TimelinePrepend` handler
+ * in `poll_events`) until the target turns up or the room's actual start
+ * is reached, so the caller only ever needs to fire this once. */
+function findAndScrollToMessage(roomId, eventId) {
+  if (state.selectedRoom !== roomId) {
+    // User navigated elsewhere while this was mid-search — drop it rather
+    // than keep silently paginating a room they're not even looking at.
+    state.pendingScrollSearch = null;
+    return;
+  }
+  if (el.timeline.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`)) {
+    state.pendingScrollSearch = null;
+    scrollToMessage("timeline", eventId);
+    return;
+  }
+  if (state.reachedStart.has(roomId)) {
+    state.pendingScrollSearch = null;
+    showToast("couldn't find that message — it may be deleted, or from before you joined this room");
+    return;
+  }
+  const alreadySearching =
+    state.pendingScrollSearch?.roomId === roomId && state.pendingScrollSearch?.eventId === eventId;
+  if (!alreadySearching) showToast("loading older messages to find the shared one...");
+  state.pendingScrollSearch = { roomId, eventId };
+  paginateBack(roomId);
+}
+
+/** Resolves a `?thread=` link's target: finds the thread root's event
+ * data (auto-paginating `roomId`'s main timeline for it, same as
+ * `findAndScrollToMessage` — a thread root is just a normal timeline
+ * event), opens that thread panel once found, then hands off to
+ * `tryScrollToThreadMessage` for the actual reply. Resumed from
+ * `TimelinePrepend` via `state.pendingThreadLink` on every retry, so the
+ * caller only needs to trigger this once. */
+function resolveThreadLink(roomId, threadRootId, eventId) {
+  if (state.selectedRoom !== roomId) {
+    state.pendingThreadLink = null;
+    return;
+  }
+  const root =
+    (state.threadsByRoom[roomId] || []).find((e) => e.event_id === threadRootId) ||
+    (state.timelines[roomId] || []).find((e) => e.event_id === threadRootId);
+  if (root) {
+    state.pendingThreadLink = null;
+    const alreadyOpen =
+      state.rightPanel?.kind === "thread" &&
+      state.rightPanel.roomId === roomId &&
+      state.rightPanel.root.event_id === threadRootId;
+    if (!alreadyOpen) openThread(roomId, root);
+    state.pendingThreadScrollTarget = { roomId, threadRootId, eventId };
+    // In case it's already fully loaded (e.g. the thread was open before,
+    // or the target is the root itself) — `ThreadEvents` below covers the
+    // rest for a fresh load.
+    setTimeout(() => tryScrollToThreadMessage(roomId, threadRootId, eventId), 50);
+    return;
+  }
+  if (state.reachedStart.has(roomId)) {
+    state.pendingThreadLink = null;
+    showToast("couldn't find that thread — the original message may be deleted, or from before you joined this room");
+    return;
+  }
+  state.pendingThreadLink = { roomId, threadRootId, eventId };
+  paginateBack(roomId);
+}
+
+/** Once the right thread panel is open, checks whether its target reply
+ * has shown up yet — `Event::ThreadEvents`'s handler already auto-loads a
+ * thread all the way back to its start on its own (see that case's
+ * comment), so this doesn't need to drive pagination itself, just keep
+ * checking after each page that handler brings in until the target turns
+ * up or there's nothing left to load. */
+function tryScrollToThreadMessage(roomId, threadRootId, eventId) {
+  const stillOpen =
+    state.rightPanel?.kind === "thread" &&
+    state.rightPanel.roomId === roomId &&
+    state.rightPanel.root.event_id === threadRootId;
+  if (!stillOpen) {
+    state.pendingThreadScrollTarget = null;
+    return;
+  }
+  const msgsEl = document.getElementById("thread-messages");
+  if (msgsEl?.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`)) {
+    state.pendingThreadScrollTarget = null;
+    scrollToMessage("thread-messages", eventId);
+    return;
+  }
+  if (state.threadPaginationReachedStart.has(`${roomId}|${threadRootId}`)) {
+    state.pendingThreadScrollTarget = null;
+    showToast("couldn't find that message in the thread — it may have been deleted");
+  }
+  // Still loading — left as-is, `ThreadEventsPrepend` re-triggers this.
+}
+
+function openMatrixToLink(roomId, eventId, threadRootId) {
   if (!state.rooms.some((r) => r.room_id === roomId)) {
     showToast("that room isn't in your room list");
     return;
@@ -2813,8 +4032,18 @@ function openMatrixToLink(roomId, eventId) {
   if (state.selectedRoom !== roomId) {
     selectRoom(roomId);
   }
+  if (threadRootId) {
+    // Needs the room's timeline loaded first regardless — that's where
+    // the thread's root message data comes from (see `resolveThreadLink`).
+    if (alreadyLoaded) {
+      setTimeout(() => resolveThreadLink(roomId, threadRootId, eventId), 50);
+    } else {
+      state.pendingThreadLink = { roomId, threadRootId, eventId };
+    }
+    return;
+  }
   if (alreadyLoaded) {
-    setTimeout(() => scrollToMessage("timeline", eventId), 50);
+    setTimeout(() => findAndScrollToMessage(roomId, eventId), 50);
   } else {
     state.pendingScrollTarget = { roomId, eventId };
   }

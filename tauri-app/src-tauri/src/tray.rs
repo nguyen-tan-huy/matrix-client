@@ -17,23 +17,32 @@ mod linux {
     use ksni::{Icon, MenuItem, Status, Tray, TrayMethods};
     use tauri::{AppHandle, Manager};
 
-    /// Draws a plain filled circle at `size`x`size` as an ARGB32 (network
-    /// byte order) pixmap `ksni::Icon` — no bundled PNG asset, no
-    /// dependency on the system icon theme resolving a name.
-    fn draw_dot_icon(size: i32, rgb: [u8; 3]) -> Icon {
-        let mut data = Vec::with_capacity((size * size * 4) as usize);
-        let center = (size - 1) as f32 / 2.0;
-        let radius = center * 0.82;
-        for y in 0..size {
-            for x in 0..size {
-                let dx = x as f32 - center;
-                let dy = y as f32 - center;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let alpha = ((radius + 1.0 - dist).clamp(0.0, 1.0) * 255.0) as u8;
-                data.extend_from_slice(&[alpha, rgb[0], rgb[1], rgb[2]]);
+    /// The app's real icon, decoded once and reused for every
+    /// `icon_pixmap()` call — StatusNotifierItem wants raw ARGB32
+    /// (network byte order, i.e. A,R,G,B per pixel) pixel data, not a PNG,
+    /// so this decodes `icons/tray-icon.png` and reorders its RGBA bytes
+    /// into that layout once at startup rather than on every call.
+    /// A dedicated source rather than reusing `icons/128x128.png`: the
+    /// other one is padded down to ~65% of its canvas so Android's
+    /// adaptive-icon mask doesn't crop the dog's ears/paws off — the
+    /// desktop tray has no such mask and just looked small with all that
+    /// empty margin around it.
+    fn app_icon_pixmap() -> Icon {
+        static ICON: std::sync::OnceLock<Icon> = std::sync::OnceLock::new();
+        ICON.get_or_init(|| {
+            let bytes = include_bytes!("../icons/tray-icon.png");
+            let img = image::load_from_memory(bytes)
+                .expect("bundled tray icon PNG failed to decode")
+                .into_rgba8();
+            let (width, height) = img.dimensions();
+            let mut data = Vec::with_capacity((width * height * 4) as usize);
+            for px in img.pixels() {
+                let [r, g, b, a] = px.0;
+                data.extend_from_slice(&[a, r, g, b]);
             }
-        }
-        Icon { width: size, height: size, data }
+            Icon { width: width as i32, height: height as i32, data }
+        })
+        .clone()
     }
 
     struct MatrixTray {
@@ -70,11 +79,16 @@ mod linux {
         }
 
         fn icon_pixmap(&self) -> Vec<Icon> {
-            vec![draw_dot_icon(22, [90, 150, 230])]
+            vec![app_icon_pixmap()]
         }
 
         fn icon_name(&self) -> String {
-            "mail-message-new".to_string()
+            // Empty so hosts that prefer a themed name over the pixmap
+            // (when one resolves) fall back to `icon_pixmap()` instead —
+            // there's no reason to show a generic mail icon over the
+            // app's own one now that it's an actual pixmap, not a
+            // hand-drawn dot with no icon of its own to be a fallback for.
+            String::new()
         }
 
         fn status(&self) -> Status {

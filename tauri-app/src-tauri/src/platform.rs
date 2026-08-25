@@ -136,7 +136,22 @@ pub fn open_url(url: &str) -> Result<(), String> {
 pub fn show_notification(room_id: &str, thread_id: Option<&str>, title: &str, body: &str) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
     let app = APP_HANDLE.get().ok_or("app not initialized yet")?;
-    let mut builder = app.notification().builder().title(title).body(body).extra("room_id", room_id);
+    // `icon` (a plain white silhouette, `res/drawable/ic_notification.png`)
+    // is what shows in the status bar itself — Android tints that one
+    // down to just its alpha channel regardless of what's supplied, so a
+    // full-color icon there comes out as an illegible blob. `large_icon`
+    // is the bigger one shown inside the expanded notification, where
+    // color is fine — a separate `ic_notification_large.png` asset for
+    // that. iOS has no such split; `icon`/`large_icon` are simply ignored
+    // there.
+    let mut builder = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .icon("ic_notification")
+        .large_icon("ic_notification_large")
+        .extra("room_id", room_id);
     if let Some(thread_id) = thread_id {
         builder = builder.extra("thread_id", thread_id);
     }

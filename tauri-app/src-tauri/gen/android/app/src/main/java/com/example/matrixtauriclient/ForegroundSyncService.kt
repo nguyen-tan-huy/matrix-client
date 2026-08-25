@@ -26,17 +26,29 @@ import androidx.core.app.NotificationCompat
  */
 class ForegroundSyncService : Service() {
     companion object {
-        const val CHANNEL_ID = "matrix_sync_channel"
+        // A channel's importance can't be changed by re-creating it with
+        // the same ID once Android has already seen it — only the user
+        // can change that, in system settings, or a fresh ID gets a fresh
+        // channel. This one changed from MIN to LOW (see below), so it
+        // needs a new ID to actually take effect on a device that already
+        // had the old channel from a previous install.
+        const val CHANNEL_ID = "matrix_sync_channel_v2"
         const val NOTIFICATION_ID = 1
     }
 
     override fun onCreate() {
         super.onCreate()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // `IMPORTANCE_MIN` hides the icon from the status bar entirely
+            // (it only shows up if you pull the notification shade down)
+            // — `IMPORTANCE_LOW` is the lowest level that still keeps a
+            // persistent status-bar icon, like the always-visible Wi-Fi/
+            // battery ones, while still making no sound and not popping
+            // up/interrupting anything (that only starts at `DEFAULT`).
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Matrix sync",
-                NotificationManager.IMPORTANCE_MIN
+                NotificationManager.IMPORTANCE_LOW
             )
             channel.description = "Keeps Matrix connected so messages and notifications arrive instantly"
             channel.setShowBadge(false)
@@ -48,9 +60,16 @@ class ForegroundSyncService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Matrix")
             .setContentText("Connected — syncing messages")
-            .setSmallIcon(R.mipmap.ic_launcher)
+            // Not `R.mipmap.ic_launcher` — Android tints a status-bar small
+            // icon down to just its alpha channel (ignoring color info
+            // entirely), so a full-color launcher icon there either shows
+            // up as a solid, illegible blob or gets silently swapped for a
+            // generic system icon on some OEMs. `ic_notification` is a
+            // proper white-silhouette-on-transparent asset generated
+            // specifically for this from the same app icon.
+            .setSmallIcon(R.drawable.ic_notification)
             .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
 

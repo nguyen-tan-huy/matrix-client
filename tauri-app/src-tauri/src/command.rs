@@ -14,6 +14,12 @@ pub enum Command {
         homeserver: String,
     },
     StartSync,
+    /// Recomputes the whole room list (names, previews, unread counts) from
+    /// the client's current local state and re-sends it to the frontend —
+    /// the same full scan `StartSync` does once on startup, exposed as a
+    /// user-triggered "reload" so the room list/unread badges can be forced
+    /// to catch up without waiting for `dirty_rooms` to pick it up.
+    RefreshRooms,
     LoadTimeline {
         room_id: String,
     },
@@ -81,8 +87,13 @@ pub enum Command {
         /// automatic fallback every thread reply also carries).
         reply_to_event_id: Option<String>,
     },
+    /// Summarizes a chat transcript via the internal LLM proxy — the main
+    /// room timeline when `thread_root_id` is `None`, or that one
+    /// thread's replies (root + everything loaded in the open thread
+    /// panel) when it's `Some`. Answered with `Event::Summary`.
     Summarize {
         room_id: String,
+        thread_root_id: Option<String>,
     },
     /// Redacts (deletes) a message. Only actually succeeds server-side for
     /// your own messages or if you have redaction power in the room — the
@@ -118,6 +129,20 @@ pub enum Command {
     RecoverWithKey {
         recovery_key: String,
     },
+    /// Sets (or, with an empty string, clears) the API key
+    /// `Command::Summarize` sends to Longvan's LLM proxy — the security
+    /// panel's "LVX API key" field, persisted to `config.json` so it
+    /// survives restarts without needing the `LVX_API_KEY` env var.
+    /// Answered with `Event::LvxApiKeyStatus`.
+    SetLvxApiKey {
+        api_key: String,
+    },
+    /// Whether an LVX API key is currently available (from either the UI
+    /// setting above or the `LVX_API_KEY` env var) — the security panel
+    /// asks this when it opens, so it can show "configured"/"not set"
+    /// without ever reading the actual key back. Answered with
+    /// `Event::LvxApiKeyStatus`.
+    GetLvxApiKeyStatus,
     /// Imports E2EE room keys from a file exported by Element (Settings →
     /// Security & Privacy → Export keys) — a passphrase-encrypted Megolm
     /// session export. Restores the ability to decrypt history the app's
@@ -294,4 +319,25 @@ pub enum Command {
         scope: String, // "room" | "personal"
         shortcode: String,
     },
+    /// Searches every joined (non-space) room's full history for messages
+    /// sent by `user_id` (`@name:server`), most recent first — "show me
+    /// everything this person has said, across every room". Not lazy —
+    /// scans every room's whole history (bounded by `from_ts`/`to_ts` if
+    /// given) in one go rather than a "load more" page at a time, so nothing
+    /// gets silently left out; can take a while on an account with many/busy
+    /// rooms and an unbounded date range. `from_ts`/`to_ts` are
+    /// `origin_server_ts` millisecond bounds (inclusive), or `None` for an
+    /// open-ended search on that side. Answered with
+    /// `Event::UserMessagesSearchResult`.
+    SearchUserMessages {
+        user_id: String,
+        from_ts: Option<i64>,
+        to_ts: Option<i64>,
+    },
+    /// Lists every joined member across every joined (non-space) room,
+    /// deduplicated by user id — backs the "pick a user" list in the
+    /// `Command::SearchUserMessages` dialog, so picking someone doesn't
+    /// require already knowing/typing their exact `@name:server` id.
+    /// Answered with `Event::AllUsers`.
+    ListAllUsers,
 }
