@@ -1,5 +1,7 @@
 mod command;
 mod event;
+#[cfg(target_os = "linux")]
+mod gtk_theme;
 mod matrix;
 mod models;
 mod platform;
@@ -123,6 +125,13 @@ pub fn run() {
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
+    // Cloned before `event_tx` itself is moved into the worker thread
+    // below — `gtk_theme::watch` (Linux only) pushes `Event::SystemTheme`
+    // through this same channel, reusing the exact plumbing `poll_events`
+    // already delivers every other `Event` to `app.js` through, rather
+    // than needing a second one just for this.
+    #[cfg(target_os = "linux")]
+    let theme_event_tx = event_tx.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -246,6 +255,11 @@ pub fn run() {
             tauri::async_runtime::spawn(tray::run(app.handle().clone()));
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             tray::setup(app.handle())?;
+
+            // Syncs the UI's colors to the running GTK/Sway theme instead
+            // of the static built-in palette — see `gtk_theme.rs`.
+            #[cfg(target_os = "linux")]
+            gtk_theme::watch(app.handle().clone(), theme_event_tx);
 
             // Closing the window (the X button) hides it instead of
             // quitting on desktop — the sync loop and tray keep running in

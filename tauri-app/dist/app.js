@@ -107,6 +107,19 @@ const state = {
   // room name, the thread's first message, and its latest reply.
   // Cleared whenever the panel is (re)opened, not kept across sessions.
   threadsListFilter: "",
+  // Mirrors `unreadOnly` for the room list (`[ unread ]` there) — the
+  // "all threads" ("+" scope: null) view used to hardcode this to `true`
+  // with no way to see anything else, which combined badly with "unread"
+  // for a thread meaning, specifically, "a reply arrived over live sync
+  // *this session*" (there's no real per-thread read-receipt tracking —
+  // see `scanAllRoomThreads`'s comment): right after launch, before
+  // anything's arrived live yet, that made the panel look empty even
+  // with plenty of genuinely-unread threads sitting in already-loaded
+  // room data. Defaults to off, same as the room list's own toggle.
+  threadsListUnreadOnly: false,
+  // Set once `scanAllRoomThreads` has fired, so it only ever runs once
+  // per app launch (see the `Rooms` event handler).
+  threadsScanStarted: false,
 
   verificationEmojis: null,
   recoveryStatus: null,
@@ -2673,6 +2686,19 @@ el.btnRoomThreads.addEventListener("click", openRoomThreadsList);
  * `el.roomFilter`'s keydown listener does for the room list). Returns
  * whether it actually handled `key`, so callers know whether to
  * `preventDefault()`. */
+/** Whether a thread root `t` (from `state.threadsByRoom[roomId]`) counts
+ * as unread — prefers the server-derived `t.is_unread` (this account's
+ * actual threaded read receipt vs. the thread's latest reply, computed in
+ * `thread_is_unread` in `worker.rs`) whenever it's known. Falls back to
+ * the older session-local `unreadThreads` heuristic only for the rare
+ * case that couldn't be determined (`is_unread` is `null`/`undefined` —
+ * e.g. the room lookup failed backend-side), so a thread never silently
+ * stops being flagged unread just because the real answer wasn't
+ * available for one specific fetch. */
+function isThreadUnread(roomId, t) {
+  return t.is_unread ?? state.unreadThreads.has(`${roomId}|${t.event_id}`);
+}
+
 function navigateThreadsList(key) {
   const rows = state.visibleThreadRows;
   if (rows.length === 0) return false;
@@ -2709,18 +2735,36 @@ function openRoomThreadsList() {
   renderSidePanel();
 }
 
+/** Fetches the first page of threads for every joined, non-space room —
+ * once, right after the room list first has anything in it (see the
+ * `Rooms` event handler). Without this, "all threads" had no data for a
+ * room until either the user opened that room's own thread list, or a
+ * `ThreadReply` happened to arrive over live sync sometime this session
+ * — which, right after launch, is nothing: the panel looked empty no
+ * matter how much real thread activity a room actually had. Genuinely
+ * "3000+ requests on a large account" in the worst case (the reason this
+ * used to be scoped down to a guessed subset of rooms instead), but each
+ * one is a single cheap paginated `/threads` call routed through its own
+ * dedicated runtime (`Command::ListThreads`, see `worker.rs`) rather than
+ * the ambient one — it can't block anything else this app is doing
+ * meanwhile, only take a while to finish on a very large account. */
+function scanAllRoomThreads() {
+  for (const room of state.rooms) {
+    if (room.is_space || room.is_invite) continue;
+    send("ListThreads", { room_id: room.room_id });
+  }
+}
+
 el.btnGlobalThreads.addEventListener("click", () => {
-  // This view only ever shows *unread* threads (see `unreadOnly` in
-  // `renderSidePanel`'s `threads-list` branch) — so a room with nothing in
-  // `state.unreadThreads` contributes nothing to it no matter what
-  // `ListThreads` comes back with. Used to fetch it for every room
-  // regardless (3000+ requests on a large account, almost all thrown
-  // away by that same filter); this only asks for the rooms that could
-  // actually show up, which `state.unreadThreads` already tracks live via
-  // `ThreadReply` sync events — no eager whole-account scan needed.
-  const roomsWithUnreadThreads = new Set([...state.unreadThreads].map((k) => k.split("|")[0]));
-  for (const roomId of roomsWithUnreadThreads) {
-    send("ListThreads", { room_id: roomId });
+  // `scanAllRoomThreads` already covers every room that existed at
+  // launch — this just tops up any room it couldn't have known about yet
+  // (joined/created after that scan ran), so opening the panel is never
+  // missing data for a room this account is in *right now*.
+  for (const room of state.rooms) {
+    if (room.is_space || room.is_invite) continue;
+    if (!(room.room_id in state.threadsByRoom)) {
+      send("ListThreads", { room_id: room.room_id });
+    }
   }
   state.rightPanel = { kind: "threads-list", scope: null };
   state.threadsListActiveIndex = -1;
@@ -2729,12 +2773,20 @@ el.btnGlobalThreads.addEventListener("click", () => {
 });
 
 function updateThreadsButtonBadge() {
-  const anyUnread = state.unreadThreads.size > 0;
+  // `isThreadUnread` prefers the server-derived flag over the
+  // session-local `unreadThreads` Set (see its own doc comment) — using
+  // it here too means these two badges agree with what "all threads"/a
+  // room's own thread list actually show, instead of a plain
+  // `unreadThreads.size` check that only ever reflects replies that
+  // happened to arrive live this session.
+  const anyUnread = Object.entries(state.threadsByRoom).some(([roomId, threads]) =>
+    threads.some((t) => isThreadUnread(roomId, t)),
+  );
   el.btnGlobalThreads.textContent = anyUnread ? "[ threads ● ]" : "[ threads ]";
   el.btnGlobalThreads.style.color = anyUnread ? "#5ac878" : "";
 
   const roomUnread = state.selectedRoom
-    ? [...state.unreadThreads].some((k) => k.startsWith(state.selectedRoom + "|"))
+    ? (state.threadsByRoom[state.selectedRoom] || []).some((t) => isThreadUnread(state.selectedRoom, t))
     : false;
   el.btnRoomThreads.textContent = roomUnread ? "[ threads ● ]" : "[ threads ]";
   el.btnRoomThreads.style.color = roomUnread ? "#5ac878" : "";
@@ -2829,11 +2881,19 @@ function renderThreadsListPanel() {
   if (!shellReady) {
     el.sidePanel.dataset.threadsListScope = String(rp.scope);
     el.sidePanel.innerHTML = `<div id="side-panel-header"><span>${rp.scope === null ? "all threads" : "threads"}</span><button id="side-panel-close" class="small-btn">[x]</button></div>
-      <div id="threads-filter-row"><input id="threads-filter" placeholder="search threads..." value="${escapeHtml(state.threadsListFilter)}" /></div>
+      <div id="threads-filter-row">
+        <input id="threads-filter" placeholder="search threads..." value="${escapeHtml(state.threadsListFilter)}" />
+        <button id="threads-unread-only" class="small-btn${state.threadsListUnreadOnly ? " selected" : ""}">[ unread ]</button>
+      </div>
       <div id="side-panel-body"></div>`;
     document.getElementById("side-panel-close").addEventListener("click", () => {
       state.rightPanel = null;
       renderSidePanel();
+    });
+    document.getElementById("threads-unread-only").addEventListener("click", () => {
+      state.threadsListUnreadOnly = !state.threadsListUnreadOnly;
+      document.getElementById("threads-unread-only").classList.toggle("selected", state.threadsListUnreadOnly);
+      renderThreadsListRows();
     });
     const filterInput = document.getElementById("threads-filter");
     filterInput.addEventListener("input", () => {
@@ -2880,7 +2940,7 @@ function renderThreadsListRows() {
   const bodyEl = document.getElementById("side-panel-body");
   if (!bodyEl) return;
 
-  const unreadOnly = rp.scope === null;
+  const unreadOnly = state.threadsListUnreadOnly;
   const query = normalizeForSearch(state.threadsListFilter.trim());
   /** A thread matches if the room it's in, its first message, or its
    * latest reply mention the search text — covers "I remember someone
@@ -2897,27 +2957,27 @@ function renderThreadsListRows() {
     .map(([roomId, threads]) => {
       const roomName = state.rooms.find((r) => r.room_id === roomId)?.name || roomId;
       const filtered = threads.filter(
-        (t) =>
-          (!unreadOnly || state.unreadThreads.has(`${roomId}|${t.event_id}`)) &&
-          threadMatches(roomName, t),
+        (t) => (!unreadOnly || isThreadUnread(roomId, t)) && threadMatches(roomName, t),
       );
       return { roomId, roomName, threads: filtered };
     })
     .filter((r) => r.threads.length > 0);
 
-  // Flattened across rooms and sorted by whichever's most recently
-  // active — a thread's latest reply if it has one, its own send time
-  // otherwise — rather than grouped under alphabetical room-name
-  // headers. The room-per-row label below (`rp.scope === null` only —
-  // implied otherwise) is what keeps that legible once threads from
-  // different rooms interleave.
-  const allThreads = rooms.flatMap((r) =>
-    r.threads.map((t) => ({ roomId: r.roomId, roomName: r.roomName, t })),
-  );
-  allThreads.sort((a, b) => (b.t.latest_reply_ts ?? b.t.timestamp) - (a.t.latest_reply_ts ?? a.t.timestamp));
+  // A thread's own activity time (latest reply if it has one, its own
+  // send time otherwise) sorts threads *within* a room; a room's most
+  // recent such time — across all of its own matching threads — sorts
+  // the rooms themselves, so the whole panel still surfaces recent
+  // activity near the top even though it's grouped by room rather than
+  // one flat interleaved-by-time list.
+  const activityOf = (t) => t.latest_reply_ts ?? t.timestamp;
+  for (const r of rooms) {
+    r.threads.sort((a, b) => activityOf(b) - activityOf(a));
+  }
+  rooms.sort((a, b) => activityOf(b.threads[0]) - activityOf(a.threads[0]));
 
+  const totalThreads = rooms.reduce((n, r) => n + r.threads.length, 0);
   let html = "";
-  if (allThreads.length === 0) {
+  if (totalThreads === 0) {
     html += `<div style="color:var(--text-weak)">${
       query
         ? "no threads match your search"
@@ -2927,26 +2987,32 @@ function renderThreadsListRows() {
     }</div>`;
   }
   state.visibleThreadRows = [];
-  for (const { roomId, roomName, t } of allThreads) {
-    const rowIndex = state.visibleThreadRows.length;
-    state.visibleThreadRows.push({ roomId, eventId: t.event_id });
-    const unread = state.unreadThreads.has(`${roomId}|${t.event_id}`);
-    // "First message" is the thread root itself (`t`); "last message"
-    // is its bundled latest-reply preview (see `latest_reply_*` on
-    // `TimelineEvent` — comes straight off the root event's own
-    // server-side aggregation, no per-thread fetch needed just to
-    // list them). Absent for a thread with 0 replies.
-    const lastMsgHtml = t.latest_reply_body
-      ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${escapeHtml(truncate(t.latest_reply_body, 80))}</div>`
-      : "";
-    const roomTagHtml = rp.scope === null ? `<div class="thread-row-room">${escapeHtml(roomName)}</div>` : "";
-    html += `<div class="thread-row${rowIndex === state.threadsListActiveIndex ? " kbd-active" : ""}" data-room="${roomId}" data-event="${t.event_id}">
-      ${roomTagHtml}
+  for (const r of rooms) {
+    // Only meaningful once threads from different rooms are mixed
+    // together — the room-scoped view (`rp.scope` a single room id) is
+    // already unambiguous without repeating that room's own name back at
+    // the top of it.
+    if (rp.scope === null) html += `<div class="thread-room-name">${escapeHtml(r.roomName)}</div>`;
+    for (const t of r.threads) {
+      const roomId = r.roomId;
+      const rowIndex = state.visibleThreadRows.length;
+      state.visibleThreadRows.push({ roomId, eventId: t.event_id });
+      const unread = isThreadUnread(roomId, t);
+      // "First message" is the thread root itself (`t`); "last message"
+      // is its bundled latest-reply preview (see `latest_reply_*` on
+      // `TimelineEvent` — comes straight off the root event's own
+      // server-side aggregation, no per-thread fetch needed just to
+      // list them). Absent for a thread with 0 replies.
+      const lastMsgHtml = t.latest_reply_body
+        ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${escapeHtml(truncate(t.latest_reply_body, 80))}</div>`
+        : "";
+      html += `<div class="thread-row${rowIndex === state.threadsListActiveIndex ? " kbd-active" : ""}" data-room="${roomId}" data-event="${t.event_id}">
       <div class="sender" style="color:${senderColor(t.sender)}">${unread ? '<span class="unread-dot">●</span> ' : ""}${escapeHtml(t.sender_name)}</div>
       <div class="thread-row-body">${escapeHtml(truncate(t.body || "", 80))}</div>
       ${lastMsgHtml}
       <div class="thread-row-meta">${t.thread_count || 0} replies →</div>
     </div>`;
+    }
   }
   if (state.threadsListActiveIndex >= state.visibleThreadRows.length) {
     state.threadsListActiveIndex = state.visibleThreadRows.length - 1;
@@ -3339,9 +3405,40 @@ el.importKeysFileInput.addEventListener("change", () => {
 // Backend events
 // =========================================================================
 
+/** Overrides the built-in `:root` palette (see `style.css`) with the
+ * running GTK/Sway theme's own resolved colors — sent once at startup and
+ * again on every live theme switch (see `gtk_theme.rs`, Linux desktop
+ * only). Inline styles on `documentElement` outrank the stylesheet
+ * regardless of specificity, so this is enough on its own; nothing in
+ * `style.css` needs to change. `--danger` and `--radius` are deliberately
+ * left alone — GTK themes don't reliably name an equivalent for either,
+ * and the built-in values for both already read fine against an
+ * arbitrary theme's bg/text. */
+function applySystemTheme(theme) {
+  const root = document.documentElement.style;
+  root.setProperty("--bg", theme.bg);
+  root.setProperty("--bg-alt", theme.bg_alt);
+  root.setProperty("--border", theme.border);
+  root.setProperty("--text", theme.text);
+  root.setProperty("--text-weak", theme.text_weak);
+  root.setProperty("--accent", theme.accent);
+  root.setProperty("--accent-strong", theme.accent_strong);
+  // Native form-control chrome (scrollbars, checkboxes, ...) needs its
+  // own light/dark hint independent of the custom properties above —
+  // derived from the theme's actual background rather than assumed,
+  // since a GTK theme's "dark" *name* and its resolved bg color don't
+  // always agree (a light theme with a dark accent, for instance).
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(theme.bg.slice(i, i + 2), 16));
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  document.documentElement.style.colorScheme = luminance < 0.5 ? "dark" : "light";
+}
+
 function handleBackendEvent(evt) {
   const { type, data } = evt;
   switch (type) {
+    case "SystemTheme":
+      applySystemTheme(data);
+      break;
     case "SessionChecked":
       if (data) {
         enterChat();
@@ -3363,6 +3460,16 @@ function handleBackendEvent(evt) {
         el.btnReloadRooms.disabled = false;
         el.btnReloadRooms.textContent = "[ reload ]";
         showToast("room list reloaded");
+      }
+      // First time the room list actually has rooms in it — kick off a
+      // one-time background fetch of every room's threads (see
+      // `scanAllRoomThreads`), same reasoning as the room list's own
+      // startup refresh: "all threads" should have real data the moment
+      // it's opened, not just whatever `ThreadReply` happened to arrive
+      // live since launch.
+      if (!state.threadsScanStarted && state.rooms.length > 0) {
+        state.threadsScanStarted = true;
+        scanAllRoomThreads();
       }
       break;
     case "Timeline":
@@ -3448,10 +3555,26 @@ function handleBackendEvent(evt) {
       }
       const bump = (list) => {
         const t = list?.find((e) => e.event_id === data.thread_root_id);
-        if (t) t.thread_count = (t.thread_count || 0) + 1;
+        if (t) {
+          t.thread_count = (t.thread_count || 0) + 1;
+          // Keep the server-derived unread flag (see `TimelineEvent::is_unread`
+          // in the Rust model) in sync with what just happened, rather than
+          // letting it go stale until the next `ListThreads` re-fetch:
+          // a live reply while the thread isn't open is new unread content;
+          // one that arrived *while* it's open doesn't leave anything
+          // unread behind (see the `MarkThreadRead` call below).
+          t.is_unread = !openHere;
+        }
       };
       bump(state.threadsByRoom[data.room_id]);
       bump(state.timelines[data.room_id]);
+      if (openHere) {
+        send("MarkThreadRead", {
+          room_id: data.room_id,
+          thread_root_id: data.thread_root_id,
+          event_id: data.event.event_id,
+        });
+      }
       // The "🧵 N replies →" badge on the thread root as shown in the
       // *main* timeline (not the thread panel — that suppresses its own
       // copy of the badge on the root) — patch just that one row instead
@@ -3480,6 +3603,22 @@ function handleBackendEvent(evt) {
         // `reached_start: true`) once the first page already covered the
         // whole thread, so this is safe to always fire.
         send("LoadMoreThreadReplies", { room_id: data.room_id, thread_root_id: data.thread_root_id });
+        // Opening a thread reads it — send the real (server-side,
+        // account-wide) threaded receipt for whatever's the latest reply
+        // in what just loaded, same moment `openThread` already clears
+        // the session-local `unreadThreads` flag. A thread with 0 replies
+        // has nothing to mark: `is_unread` is always `false` for those
+        // already (see `thread_is_unread` in `worker.rs`).
+        if (data.events.length > 0) {
+          const latestEventId = data.events[data.events.length - 1].event_id;
+          send("MarkThreadRead", { room_id: data.room_id, thread_root_id: data.thread_root_id, event_id: latestEventId });
+          const markRead = (list) => {
+            const t = list?.find((e) => e.event_id === data.thread_root_id);
+            if (t) t.is_unread = false;
+          };
+          markRead(state.threadsByRoom[data.room_id]);
+          markRead(state.timelines[data.room_id]);
+        }
       }
       if (
         state.pendingThreadScrollTarget?.roomId === data.room_id &&
@@ -3520,6 +3659,7 @@ function handleBackendEvent(evt) {
       else state.threadsListReachedEnd.delete(data.room_id);
       state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
+      updateThreadsButtonBadge();
       break;
     case "ThreadsListAppend": {
       const existing = state.threadsByRoom[data.room_id] || [];
@@ -3532,6 +3672,7 @@ function handleBackendEvent(evt) {
       if (data.reached_end) state.threadsListReachedEnd.add(data.room_id);
       state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
+      updateThreadsButtonBadge();
       break;
     }
     case "Members":

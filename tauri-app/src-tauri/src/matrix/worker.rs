@@ -1572,6 +1572,20 @@ async fn handle(
             refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
         }
 
+        Command::MarkThreadRead { room_id, thread_root_id, event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let root_event_id = OwnedEventId::try_from(thread_root_id.as_str())?;
+            let event_id = OwnedEventId::try_from(event_id.as_str())?;
+
+            use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+            use matrix_sdk::ruma::events::receipt::ReceiptThread;
+            room.send_single_receipt(ReceiptType::Read, ReceiptThread::Thread(root_event_id), event_id)
+                .await?;
+        }
+
         Command::CreateRoom {
             name,
             is_public,
@@ -1950,6 +1964,7 @@ async fn handle(
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    is_unread: None,
                 };
                 tx.send(Event::NewMessage { room_id, event }).ok();
             }
@@ -2823,6 +2838,21 @@ async fn parse_raw_message_event(
     let latest_reply_ts = latest_event
         .and_then(|e| e.get("origin_server_ts"))
         .and_then(|v| v.as_i64());
+    // The server's own answer to "is this thread unread", derived from
+    // this account's actual *threaded* read receipt (`m.receipt` with
+    // `thread_id` — MSC3771) for it, if one exists — not a session-local
+    // guess. Deliberately not gated on this app being the one that sent
+    // that receipt: receipts are account-wide state, so a thread read via
+    // Element (or any other client) on the same account correctly shows
+    // as read here too. A thread with no replies yet has nothing to be
+    // behind on, so it's simply never unread.
+    let is_unread = match (thread_count, latest_event.and_then(|e| e.get("event_id")).and_then(|v| v.as_str())) {
+        (Some(count), Some(latest_event_id)) if count > 0 => {
+            thread_is_unread(client, room_id, &event_id, latest_event_id).await
+        }
+        (Some(0), _) => Some(false),
+        _ => None,
+    };
 
     Some(crate::models::TimelineEvent {
         event_id,
@@ -2845,6 +2875,39 @@ async fn parse_raw_message_event(
         latest_reply_sender_name,
         latest_reply_body,
         latest_reply_ts,
+        is_unread,
+    })
+}
+
+/// Whether `root_event_id` (a thread root in `room_id`) is unread, per this
+/// account's own threaded read receipt for it (`m.receipt`/`thread_id`,
+/// MSC3771) — `None` if that can't be determined (room not found, no
+/// logged-in user, invalid event id), `Some(true)` if there's no such
+/// receipt yet or it points at an older event than `latest_event_id`.
+/// Reads straight from the local sync store (`Room::load_user_receipt`) —
+/// no network round trip, since receipts already flow in continuously as
+/// `m.receipt` ephemeral events over `/sync`.
+async fn thread_is_unread(
+    client: &Client,
+    room_id: &str,
+    root_event_id: &str,
+    latest_event_id: &str,
+) -> Option<bool> {
+    use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
+
+    let room = RoomId::parse(room_id).ok().and_then(|id| client.get_room(&id))?;
+    let user_id = client.user_id()?;
+    let root_event_id = OwnedEventId::try_from(root_event_id).ok()?;
+
+    let read = room
+        .load_user_receipt(ReceiptType::Read, ReceiptThread::Thread(root_event_id), user_id)
+        .await
+        .ok()
+        .flatten();
+
+    Some(match read {
+        Some((read_event_id, _)) => read_event_id.as_str() != latest_event_id,
+        None => true,
     })
 }
 
@@ -3132,6 +3195,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    is_unread: None,
                 };
 
                 if let Some(thread_root_id) = thread_root_id {
@@ -3206,6 +3270,7 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    is_unread: None,
                 };
                 tx.send(Event::NewMessage { room_id: room.room_id().to_string(), event })
                     .ok();

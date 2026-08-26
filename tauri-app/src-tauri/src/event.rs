@@ -10,6 +10,12 @@ pub enum Event {
     SessionChecked(bool),
     LoggedIn,
     LoginError(String),
+    /// The running GTK theme's resolved colors (Linux desktop only — see
+    /// `gtk_theme.rs`), sent once at startup and again on every live theme
+    /// switch. `app.js` applies these directly as `:root` custom-property
+    /// overrides so the UI matches the system theme (Sway/GTK) exactly,
+    /// auto-dark-mode included, instead of the static built-in palette.
+    SystemTheme(crate::models::SystemTheme),
 
     Rooms(Vec<RoomSummary>),
     Timeline {

@@ -83,6 +83,27 @@ pub struct TimelineEvent {
     /// Same bundled-aggregation source as `latest_reply_sender_name` — the
     /// most recent reply's `origin_server_ts`.
     pub latest_reply_ts: Option<i64>,
+    /// For a thread root only: whether this account's own threaded read
+    /// receipt (server state, not a session-local guess — see
+    /// `thread_is_unread` in `worker.rs`) is behind the thread's latest
+    /// reply. `None` for every other kind of event, and for a thread root
+    /// whose read state couldn't be determined.
+    pub is_unread: Option<bool>,
+}
+
+/// Resolved system-theme colors, straight from the running GTK theme (see
+/// `gtk_theme.rs`) — every field is a `#rrggbb` hex string, matching what
+/// `app.js` sets as CSS custom properties directly. Named to mirror the
+/// `--bg`/`--bg-alt`/etc. custom properties in `style.css` one-to-one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SystemTheme {
+    pub bg: String,
+    pub bg_alt: String,
+    pub border: String,
+    pub text: String,
+    pub text_weak: String,
+    pub accent: String,
+    pub accent_strong: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

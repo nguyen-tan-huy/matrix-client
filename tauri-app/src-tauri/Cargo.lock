@@ -3837,6 +3837,8 @@ dependencies = [
  "base64 0.22.1",
  "directories",
  "futures-util",
+ "gdk",
+ "gtk",
  "image",
  "ksni",
  "matrix-sdk",

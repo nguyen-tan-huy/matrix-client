@@ -1,27 +1,24 @@
-/* Light by default, dark when the OS says so — both follow the same
- * pastel accent/danger hues, only the background/text/border pair swaps. */
+/* Always dark, near-black terminal-tool look (amber accent) — one fixed
+ * palette regardless of OS light/dark setting, rather than the old
+ * light-by-default/dark-when-the-OS-says-so pair. */
 :root {
-  color-scheme: light dark;
-  --bg: #ffffff;
-  --bg-alt: #f2f2f4;
-  --border: #dcdce0;
-  --text: #111114;
-  --text-weak: #767680;
-  --accent: #93b7e6;
-  --accent-strong: #6f9bd1;
+  color-scheme: dark;
+  --bg: #0a0a0c;
+  --bg-alt: #18171b;
+  --border: #2b2930;
+  --text: #e7e4e0;
+  --text-weak: #8d8891;
+  --accent: #d9a441;
+  --accent-strong: #eab659;
   --danger: #e6919c;
   --radius: 8px;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d0d10;
-    --bg-alt: #19181d;
-    --border: #322f38;
-    --text: #f5f4f7;
-    --text-weak: #9a95a5;
-    --accent-strong: #a8cbf5;
-  }
+@media (prefers-color-scheme: light) {
+  /* Deliberately empty — this theme no longer has a light variant, but an
+   * explicit block (even an empty one) documents that the omission is
+   * intentional rather than a leftover gap, for whoever next touches this
+   * file expecting the old light/dark pair. */
 }
 
 * { box-sizing: border-box; }
@@ -146,16 +143,18 @@ button:disabled { color: var(--text-weak); cursor: default; }
 #space-picker button.selected {
   border-color: var(--accent-strong);
   color: var(--accent-strong);
-  background: rgba(147, 183, 230, 0.18);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
   font-weight: bold;
 }
 #room-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
 #room-filter { flex: 1; margin: 0; }
-#btn-unread-only { flex-shrink: 0; }
-#btn-unread-only.selected {
+#btn-unread-only, #threads-unread-only { flex-shrink: 0; }
+/* Shared with the threads-list panel's own "[ unread ]" toggle — same
+ * idea, same look. */
+#btn-unread-only.selected, #threads-unread-only.selected {
   border-color: var(--accent-strong);
   color: var(--accent-strong);
-  background: rgba(147, 183, 230, 0.18);
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
   font-weight: bold;
 }
 #room-list-items {
@@ -451,16 +450,31 @@ button:disabled { color: var(--text-weak); cursor: default; }
 
 .bubble {
   max-width: 100%;
-  padding: 6px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  padding: 8px 12px;
+  border: none;
+  /* Rounder than `var(--radius)` (shared with squarer chrome — buttons,
+   * dialogs, room rows) — a chat bubble reads as a bubble mainly through
+   * this shape, so it gets its own, more generous radius instead. */
+  border-radius: 14px;
+  /* Genuine depth (a shadow, not just a fill-color difference) is what
+   * keeps a bubble legible against *any* page background a GTK theme
+   * could resolve to, including ones where the two fills below end up
+   * close in luminance to `--bg` — the shadow alone still reads. */
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   position: relative; /* anchors `.reaction-trigger` / `.reaction-picker` */
 }
-.bubble.own { background: rgba(147, 183, 230, 0.25); border-color: var(--accent); }
-.bubble.other { background: var(--bg-alt); }
+.bubble.own { background: color-mix(in srgb, var(--accent) 32%, var(--bg)); }
+/* Mixed straight from `--text`/`--bg` rather than reused from `--bg-alt`
+ * (which is *also* derived from the system theme — see `gtk_theme.rs` —
+ * and, for a theme whose own "alt surface" color happens to sit close to
+ * its window background, made every non-own message bubble nearly
+ * invisible). This guarantees a fixed, always-visible amount of contrast
+ * against the page background no matter what the running theme's own
+ * surface color resolves to. */
+.bubble.other { background: color-mix(in srgb, var(--text) 10%, var(--bg)); }
 .bubble.mentioned {
   background: rgba(230, 190, 110, 0.28);
-  border-color: #d9a94a;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 0 0 1px #d9a94a;
   border-left: 3px solid #d9a94a;
 }
 
@@ -471,7 +485,19 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * name above rather than reading as a flat, ownerless list. */
 .bubble.other { padding-left: calc(10px + 1cm); }
 .bubble .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-1cm); }
-.bubble .body { white-space: pre-wrap; word-wrap: break-word; }
+.bubble .body {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  /* A GTK theme's own text color isn't guaranteed to be a crisp white —
+   * some resolve to a fairly muted gray, which reads fine for UI chrome
+   * but leaves the actual message content (the one thing in a bubble that
+   * most needs to pop) looking flat. Lifting toward white and going
+   * slightly bolder than the surrounding UI text makes the content itself
+   * the most prominent thing in the bubble regardless of how bright
+   * `--text` happens to resolve. */
+  color: color-mix(in srgb, var(--text) 88%, white);
+  font-weight: 500;
+}
 .bubble .body p { margin: 0 0 4px 0; }
 .bubble .body p:last-child { margin-bottom: 0; }
 .bubble .body code { background: var(--bg); padding: 0 3px; }
@@ -560,7 +586,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * after switching rooms, so this also pulses the bubble's own background. */
 .jump-highlight .bubble { animation: jump-flash 2.2s ease-out; }
 @keyframes jump-flash {
-  0%, 15% { box-shadow: 0 0 0 3px var(--accent); background-color: rgba(147, 183, 230, 0.5); }
+  0%, 15% { box-shadow: 0 0 0 3px var(--accent); background-color: color-mix(in srgb, var(--accent) 50%, var(--bg)); }
   100% { box-shadow: 0 0 0 3px transparent; background-color: transparent; }
 }
 .thread-badge {
@@ -572,7 +598,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   cursor: pointer;
   display: inline-block;
 }
-.thread-badge:hover { background: rgba(147, 183, 230, 0.25); }
+.thread-badge:hover { background: color-mix(in srgb, var(--accent) 25%, var(--bg)); }
 
 /* A small badge overlapping the bubble's bottom-right corner, not a row
  * inside it — same floating spot `.reaction-trigger` uses for a bubble
@@ -819,10 +845,6 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 .thread-row-meta { color: var(--text-weak); margin-top: 3px; }
 .thread-room-name { color: var(--text-weak); font-size: 11px; margin: 8px 0 2px; }
-/* Per-row room label in the "all threads" view — threads from different
- * rooms are interleaved by recency there (see `renderThreadsListRows`),
- * so each row needs its own room tag instead of one shared group header. */
-.thread-row-room { color: var(--accent); font-size: 10px; margin: 0 0 3px calc(-0.5cm); text-transform: uppercase; letter-spacing: 0.02em; }
 #threads-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
 #threads-filter { flex: 1; margin: 0; }
 

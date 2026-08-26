@@ -213,6 +213,19 @@ pub enum Command {
     MarkRoomRead {
         room_id: String,
     },
+    /// Sends a *threaded* read receipt (`m.receipt` with `thread_id`,
+    /// MSC3771) for `event_id` in the given thread — same idea as
+    /// `MarkRoomRead`, but scoped to one thread instead of the room's main
+    /// timeline. This is what `TimelineEvent::is_unread` (see
+    /// `models.rs`/`thread_is_unread` in `worker.rs`) reads back on the
+    /// next `ListThreads`/`LoadThread`, so a thread read through this app
+    /// stops showing as unread there too, not just in this session's own
+    /// local state.
+    MarkThreadRead {
+        room_id: String,
+        thread_root_id: String,
+        event_id: String,
+    },
     /// Creates a new room, or a new Space if `is_space` is set (a Space is
     /// just a room with `m.room.create`'s `type` set to `m.space` — it
     /// holds no messages of its own, only `m.space.child` links to other

@@ -273,6 +273,7 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         latest_reply_sender_name: None,
         latest_reply_body: None,
         latest_reply_ts: None,
+        is_unread: None,
     })
 }
 
