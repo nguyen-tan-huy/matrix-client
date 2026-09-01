@@ -1,4 +1,41 @@
-use crate::models::{RoomSummary, TimelineEvent};
+use crate::models::{OwnProfile, RoomSummary, TimelineEvent};
+
+/// Which of the two dynamic filtered views of `RoomListService::all_rooms()`
+/// a `RoomListUpdate` came from — the growing main room list, or the
+/// (unpaged, since invite counts are always small) invites view. Each is
+/// its own `entries_with_dynamic_adapters` call (see `matrix/worker.rs`'s
+/// `Command::StartSync`), so each has its own independent index space —
+/// the frontend keeps two separate arrays and concatenates them (invites
+/// first) into the flat `state.rooms` the rest of the UI reads.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub enum RoomListKind {
+    Rooms,
+    Invites,
+}
+
+/// One incremental change to a room list, mapped 1:1 from
+/// `eyeball_im::VectorDiff<matrix_sdk_ui::room_list_service::Room>` (see
+/// `matrix/worker.rs`'s `run_room_list_listener`). Unlike the older
+/// MSC3575-era sliding sync this app briefly targeted, MSC4186 (what this
+/// app's homeserver actually speaks) has no concept of an unsynced
+/// "placeholder" slot — every entry that reaches this stream is a real,
+/// resolved room, so (unlike an earlier draft of this protocol) there's no
+/// `Option`/loading-slot case to represent here.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "op")]
+pub enum RoomListOp {
+    Append { values: Vec<RoomSummary> },
+    Clear,
+    PushFront { value: RoomSummary },
+    PushBack { value: RoomSummary },
+    PopFront,
+    PopBack,
+    Insert { index: u32, value: RoomSummary },
+    Set { index: u32, value: RoomSummary },
+    Remove { index: u32 },
+    Truncate { length: u32 },
+    Reset { values: Vec<RoomSummary> },
+}
 
 /// Sent from the tokio worker thread to the egui UI thread. Mirrors the
 /// `app.emit(...)` calls from the Tauri version. The UI thread polls its
@@ -17,7 +54,21 @@ pub enum Event {
     /// auto-dark-mode included, instead of the static built-in palette.
     SystemTheme(crate::models::SystemTheme),
 
-    Rooms(Vec<RoomSummary>),
+    /// Incremental room-list change, driven by `RoomListService`'s sliding
+    /// sync — replaces the old full-snapshot `Rooms` event so an account
+    /// with thousands of rooms never has to build/send/re-render the whole
+    /// list at once. See `matrix/worker.rs`'s room-list diff-listener tasks.
+    RoomListUpdate {
+        list: RoomListKind,
+        ops: Vec<RoomListOp>,
+    },
+    /// Full snapshot of Space rooms (`m.room.create`'s `type: m.space`) —
+    /// these are deliberately excluded from `RoomListService`'s sliding-sync
+    /// lists server-side, so they're tracked via a small dedicated
+    /// second sliding-sync session instead (see `refresh_spaces` in
+    /// `matrix/worker.rs`). Full replace, not diffed, since the number of
+    /// spaces on any account is always small.
+    Spaces(Vec<RoomSummary>),
     Timeline {
         room_id: String,
         events: Vec<TimelineEvent>,
@@ -213,6 +264,27 @@ pub enum Event {
     AllUsers {
         users: Vec<(String, String)>,
     },
+
+    /// Response to `Command::ResolveSharedEvent`. `found: false` means the
+    /// event doesn't exist (deleted, or no permission) — not the same as
+    /// `found: true, thread_root_id: None`, which means it exists and is a
+    /// plain (non-thread) timeline event.
+    SharedEventResolved {
+        room_id: String,
+        event_id: String,
+        found: bool,
+        thread_root_id: Option<String>,
+    },
+
+    /// Response to `Command::GetOwnProfile`, and again after
+    /// `Command::SetDisplayName`/`SetAvatar` succeed — this app never
+    /// touches per-room membership state directly, so it can't (and
+    /// shouldn't try to) suppress the "changed name/avatar" timeline
+    /// notices a homeserver fans out to other members' clients when a
+    /// global profile changes; that fan-out is server-side, not something
+    /// this client controls. This event only reports the profile write
+    /// itself succeeding.
+    OwnProfile(OwnProfile),
 
     Error(String),
 }

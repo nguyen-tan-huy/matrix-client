@@ -20,10 +20,63 @@ function send(type, data) {
 // count changed and nothing actually needs to move.
 const roomRowEls = new Map();
 
+// The backend already paces syncing thousands of rooms in (see
+// `scheduleGrowRoomList` below), but once they're in `state.rooms`,
+// `renderRooms()` used to still mount a `.room-row` DOM node for every one
+// of them — content-visibility:auto skips layout/paint for the offscreen
+// ones, but building/reordering/measuring (`animateRoomListChanges`) 3000+
+// live nodes on every render is still real, synchronous work, and it's what
+// made the list janky on accounts with thousands of rooms (worst on
+// mobile). Past this threshold, `renderRooms()` switches to only mounting
+// the rows actually scrolled into view (+ overscan), same idea as any
+// virtual-scrolling list. Below it, the simpler always-fully-mounted path
+// (with its nicer FLIP reorder animation) stays in effect — not worth the
+// extra bookkeeping for the common case of a normal-sized account.
+const ROOM_LIST_VIRTUALIZE_THRESHOLD = 150;
+// Rendered just outside the visible viewport so a fast scroll or a
+// PageUp/PageDown jump doesn't flash empty space for a frame before the
+// next window recalculation catches up.
+const ROOM_LIST_OVERSCAN = 8;
+// Fallback until a real row is on screen to measure — kept in sync with
+// `.room-row`'s `contain-intrinsic-size` in style.css, itself just an
+// estimate, so slight drift here only costs a slightly-off scrollbar for
+// one frame, never a layout bug.
+const ROOM_LIST_DEFAULT_ROW_HEIGHT = 37;
+let roomListMeasuredRowHeight = null;
+// Set by `renderRooms()` when it's in the virtualized branch (the full
+// ordered list of *matching* rooms, independent of scroll position); read
+// by `renderRoomListWindow()` on every scroll tick to remount just the
+// visible slice without re-running the filter/sort pass. `null` whenever
+// the list isn't currently virtualized (small account, or the invites tab,
+// which is never large enough to bother).
+let virtualRoomList = null;
+let roomListWindowRafPending = false;
+// The two flow-layout spacers that stand in for the rows currently
+// scrolled out of view, so `#room-list-items`'s natural scroll height
+// still matches "all N rows stacked" even though only a slice of them are
+// actually mounted. Created lazily on first use.
+let roomListTopSpacer = null;
+let roomListBottomSpacer = null;
+
 const state = {
   screen: "login",
   loggingIn: false,
+  // `rooms` stays a flat array (same shape as before this migration) so
+  // every existing `state.rooms.find/.some/.sort` call site keeps working
+  // unchanged — it's derived (see `rebuildRoomsFromEntries`) from the two
+  // index-mirrored arrays below, which are the actual source of truth for
+  // *position* (backend diff ops address a slot by index, within one list).
+  // Both are client-side-paginated views over the backend's growing room
+  // list (see `Command::GrowRoomList`) — every slot is always a real,
+  // already-loaded room; there's no "not synced yet" placeholder concept
+  // to represent here (unlike an earlier draft of this protocol).
+  roomEntries: [],
+  inviteEntries: [],
   rooms: [],
+  // Space rooms, from the separate `Event::Spaces` snapshot — `m.space`
+  // rooms are excluded from the backend's main sliding-sync lists, so they
+  // never appear in `roomEntries`/`rooms` at all.
+  spaces: [],
   selectedRoom: null,
   selectedSpace: null,
   spaceChildren: {}, // space_room_id -> [room_id]
@@ -128,6 +181,13 @@ const state = {
   // never the actual key value, see `Event::LvxApiKeyStatus`). `null`
   // until the panel's asked and gotten an answer.
   lvxApiKeyConfigured: null,
+  // The logged-in user's own profile — `{user_id, display_name, avatar_url}`
+  // — `null` until the profile panel's asked and gotten an `Event::OwnProfile`
+  // answer. Also `"saving"` briefly while a `SetDisplayName`/`SetAvatar`
+  // round trip is in flight, so the panel can show a spinner instead of
+  // silently doing nothing for however long the upload takes.
+  ownProfile: null,
+  ownProfileSaving: false,
   // Set right before switching rooms to follow a matrix.to link — once
   // that room's `Timeline` event lands, scroll to this event and clear it.
   pendingScrollTarget: null, // { roomId, eventId }
@@ -149,6 +209,11 @@ const state = {
   // auto-load of the thread to bring in the specific reply being linked
   // to. Resumed from `ThreadEvents`/`ThreadEventsPrepend`.
   pendingThreadScrollTarget: null, // { roomId, threadRootId, eventId }
+  // Set while waiting on `Command::ResolveSharedEvent` for a plain (no
+  // `?thread=` hint) matrix.to link, to find out whether its target is
+  // actually a thread reply before deciding where to look for it — see
+  // `openMatrixToLink`. Cleared by the matching `SharedEventResolved`.
+  pendingSharedEventResolve: null, // { roomId, eventId }
 };
 
 // ---- DOM refs ----
@@ -165,6 +230,7 @@ const el = {
   roomFilter: document.getElementById("room-filter"),
   btnUnreadOnly: document.getElementById("btn-unread-only"),
   roomListItems: document.getElementById("room-list-items"),
+  btnProfile: document.getElementById("btn-profile"),
   btnSecurity: document.getElementById("btn-security"),
   btnCreateRoom: document.getElementById("btn-create-room"),
   btnReloadRooms: document.getElementById("btn-reload-rooms"),
@@ -199,6 +265,7 @@ const el = {
   memePicker: document.getElementById("meme-picker"),
   fileInput: document.getElementById("file-input"),
   importKeysFileInput: document.getElementById("import-keys-file-input"),
+  avatarFileInput: document.getElementById("avatar-file-input"),
   sidePanel: document.getElementById("side-panel"),
   mainPanel: document.getElementById("main-panel"),
 };
@@ -241,15 +308,24 @@ function enterChat() {
   state.screen = "chat";
   el.loginScreen.classList.add("hidden");
   el.chatScreen.classList.add("active");
-  // The room list otherwise just sits blank until the first "Rooms" event
-  // — which needs a full initial sync to complete first, easily a few
-  // seconds (longer on a flaky connection, e.g. the retry-heavy path
-  // right after an Android OAuth login) — with nothing to tell the user
-  // whether that's still in progress or the app is just stuck.
-  // Nothing further needs to clear this back out — the first `Rooms`
-  // event's `renderRooms()` call replaces these children with real rows
-  // via `appendChild` regardless of what was here before.
-  el.roomListItems.innerHTML = `<div style="padding:12px;font-size:12px;text-align:center;">${loadingHtml("loading rooms...")}</div>`;
+  // The room list otherwise just sits blank until the first
+  // "RoomListUpdate" event — which needs a full initial sync to complete
+  // first, easily a few seconds (longer on a flaky connection, e.g. the
+  // retry-heavy path right after an Android OAuth login) — with nothing to
+  // tell the user whether that's still in progress or the app is just
+  // stuck. `renderRooms()` only ever `appendChild`s the rows it wants
+  // shown — it doesn't clear the container first — so this placeholder
+  // has to be registered in `roomRowEls` under a key `renderRooms()` will
+  // never re-emit, or it'd sit there forever above the real rows once
+  // they start arriving (its own removal-of-anything-not-`keepKeys`
+  // cleanup pass is what actually takes it back out).
+  const loadingPlaceholder = document.createElement("div");
+  loadingPlaceholder.style.cssText = "padding:12px;font-size:12px;text-align:center;";
+  loadingPlaceholder.innerHTML = loadingHtml("loading rooms...");
+  loadingPlaceholder.dataset.rowKey = "startup-loading-placeholder";
+  el.roomListItems.innerHTML = "";
+  el.roomListItems.appendChild(loadingPlaceholder);
+  roomRowEls.set("startup-loading-placeholder", loadingPlaceholder);
 }
 
 // =========================================================================
@@ -290,9 +366,7 @@ el.roomFilter.addEventListener("keydown", (e) => {
     state.roomListActiveIndex =
       (base + delta + state.visibleRoomIds.length) % state.visibleRoomIds.length;
     renderRooms();
-    el.roomListItems
-      .querySelector(".room-row.kbd-active")
-      ?.scrollIntoView({ block: "nearest" });
+    scrollRoomListRowIntoView(state.roomListActiveIndex);
   } else if (e.key === "Enter") {
     const roomId = state.visibleRoomIds[state.roomListActiveIndex] ?? state.visibleRoomIds[0];
     if (roomId) selectRoom(roomId);
@@ -315,6 +389,40 @@ el.btnReloadRooms.addEventListener("click", () => {
   el.btnReloadRooms.textContent = "[ reloading… ]";
   send("RefreshRooms");
 });
+
+// Keeps asking the backend for more of the room list (see
+// `Command::GrowRoomList`) automatically in the background, rather than
+// waiting for the user to scroll near the bottom — this app's actual
+// homeserver protocol (MSC4186 / "Simplified Sliding Sync") only supports
+// a growing-prefix model, not true server-side viewport ranges (see
+// `RoomListOp`'s doc comment on the Rust side). Continuously asking for
+// more here doesn't reintroduce the original "3000 rooms blocks the UI"
+// problem: the server paces the underlying sync itself in small batches
+// (see `SlidingSyncMode::Growing` on the Rust side), so this just reveals
+// whatever's already been synced so far, a little at a time, without ever
+// blocking on one huge fetch.
+let growRoomListTimer = null;
+let lastGrowRoomListCount = -1;
+let growRoomListNoProgressStreak = 0;
+const GROW_ROOM_LIST_BASE_DELAY_MS = 150;
+const GROW_ROOM_LIST_MAX_DELAY_MS = 5000;
+
+function scheduleGrowRoomList() {
+  clearTimeout(growRoomListTimer);
+  const grew = state.roomEntries.length !== lastGrowRoomListCount;
+  lastGrowRoomListCount = state.roomEntries.length;
+  growRoomListNoProgressStreak = grew ? 0 : growRoomListNoProgressStreak + 1;
+  // Back off (up to 5s between attempts) once several rounds in a row
+  // didn't reveal any new room — likely caught up to whatever the server
+  // has synced so far — but never stop entirely, since the server's own
+  // background growing sync (or the account joining a new room) can
+  // still add more later.
+  const delay = Math.min(
+    GROW_ROOM_LIST_MAX_DELAY_MS,
+    GROW_ROOM_LIST_BASE_DELAY_MS * 2 ** Math.min(growRoomListNoProgressStreak, 8),
+  );
+  growRoomListTimer = setTimeout(() => send("GrowRoomList"), delay);
+}
 
 el.btnUnreadOnly.addEventListener("click", () => {
   state.unreadOnly = !state.unreadOnly;
@@ -342,16 +450,122 @@ function normalizeForSearch(s) {
  * Left/Right moves it) rather than every button being tabbable, the
  * standard pattern for a tab-like button group — see its keydown handler
  * below. */
-function renderSpacePicker() {
-  const spaces = state.rooms.filter((r) => r.is_space && !r.is_invite);
-  el.spacePicker.innerHTML = "";
-  if (spaces.length === 0) return;
+// A backend room-list diff can race a live `NewMessage`'s own optimistic
+// unread-count bump (see that handler below): both are triggered by the
+// same incoming event, but if the backend computed its `RoomSummary`
+// before the server's own unread count had caught up (observed to be
+// *every* time in practice — the notification count isn't available yet
+// in the same sliding-sync response that carries the message), applying
+// that diff wholesale would silently wipe the bump back down to 0. This
+// isn't limited to `Set` diffs: a room jumping to the top of the list (the
+// overwhelmingly common case) arrives as `Remove` + `PushFront`/`Insert`
+// instead, whose value is a brand new object with no relation to the
+// bumped one that just got removed — so the protection has to be keyed by
+// `room_id`, independent of *which* op or index carries the value, not
+// just diffed against "the old value at this same index" (that only
+// covers `Set`). `applyUnreadFloor` keeps the highest unread count seen
+// for each room instead of blindly trusting whichever arrived last. Rooms
+// just marked read via the "[ mark read ]" button are exempted for a few
+// seconds (see `recentlyMarkedRead`) so that action still actually zeroes
+// the badge instead of this protection fighting it.
+const recentlyMarkedRead = new Map(); // room_id -> Date.now() it was marked
+const RECENTLY_MARKED_READ_WINDOW_MS = 5000;
+const knownUnreadCounts = new Map(); // room_id -> highest unread_count observed
 
-  const entries = [{ id: null, label: "[ all ]", title: "all rooms" }, ...spaces.map((s) => ({
+function applyUnreadFloor(value) {
+  if (!value) return value;
+  const markedAt = recentlyMarkedRead.get(value.room_id);
+  if (markedAt && Date.now() - markedAt < RECENTLY_MARKED_READ_WINDOW_MS) {
+    knownUnreadCounts.set(value.room_id, value.unread_count);
+    return value;
+  }
+  const floor = knownUnreadCounts.get(value.room_id) || 0;
+  if (value.unread_count < floor) {
+    return { ...value, unread_count: floor };
+  }
+  knownUnreadCounts.set(value.room_id, value.unread_count);
+  return value;
+}
+
+/** Applies one backend `RoomListOp` to `entries` (either `state.roomEntries`
+ * or `state.inviteEntries`) in place — a straight port of
+ * `eyeball_im::VectorDiff`'s semantics (see the Rust `RoomListOp` enum in
+ * `event.rs`). */
+function applyRoomListOp(entries, op) {
+  switch (op.op) {
+    case "Append":
+      entries.push(...op.values.map(applyUnreadFloor));
+      break;
+    case "Clear":
+      entries.length = 0;
+      break;
+    case "PushFront":
+      entries.unshift(applyUnreadFloor(op.value));
+      break;
+    case "PushBack":
+      entries.push(applyUnreadFloor(op.value));
+      break;
+    case "PopFront":
+      entries.shift();
+      break;
+    case "PopBack":
+      entries.pop();
+      break;
+    case "Insert":
+      entries.splice(op.index, 0, applyUnreadFloor(op.value));
+      break;
+    case "Set":
+      entries[op.index] = applyUnreadFloor(op.value);
+      break;
+    case "Remove":
+      entries.splice(op.index, 1);
+      break;
+    case "Truncate":
+      entries.length = op.length;
+      break;
+    case "Reset":
+      entries.length = 0;
+      entries.push(...op.values.map(applyUnreadFloor));
+      break;
+    default:
+      console.warn("unknown RoomListOp", op);
+  }
+}
+
+/** Rebuilds the flat `state.rooms` array — what every other part of the UI
+ * reads — from the two index-mirrored source arrays, invites first (same
+ * ordering convention `refresh_rooms` used before this migration). */
+function rebuildRoomsFromEntries() {
+  state.rooms = [...state.inviteEntries, ...state.roomEntries];
+}
+
+// Sentinel `selectedSpace` value for the dedicated "invites" tab — not a
+// real space room ID, so every place that treats `selectedSpace` as one
+// (looking up `spaceChildren`, sending `ListSpaceChildren`) has to check
+// for this first. Room invites used to always show mixed in at the top of
+// every tab (including "[ all ]"); pulled out into its own tab instead so
+// the regular tabs only ever show rooms already joined, and an invite
+// doesn't clutter every other view until it's dealt with.
+const INVITES_TAB = "__invites__";
+
+function renderSpacePicker() {
+  const spaces = state.spaces.filter((r) => !r.is_invite);
+  el.spacePicker.innerHTML = "";
+  if (spaces.length === 0 && state.inviteEntries.length === 0) return;
+
+  const entries = [{ id: null, label: "[ all ]", title: "all rooms" }];
+  if (state.inviteEntries.length > 0) {
+    entries.push({
+      id: INVITES_TAB,
+      label: `[ invites (${state.inviteEntries.length}) ]`,
+      title: "room invites",
+    });
+  }
+  entries.push(...spaces.map((s) => ({
     id: s.room_id,
     label: s.name,
     title: s.name,
-  }))];
+  })));
 
   for (const entry of entries) {
     const btn = document.createElement("button");
@@ -389,7 +603,7 @@ el.spacePicker.addEventListener("keydown", (e) => {
 
 function selectSpace(spaceId) {
   state.selectedSpace = spaceId;
-  if (spaceId && !state.spaceChildren[spaceId]) {
+  if (spaceId && spaceId !== INVITES_TAB && !state.spaceChildren[spaceId]) {
     send("ListSpaceChildren", { space_room_id: spaceId });
   }
   renderRooms();
@@ -409,9 +623,15 @@ function renderInviteRow(room) {
         <button data-accept>accept</button>
         <button data-decline>decline</button>
       </div>`;
-    row.querySelector("[data-accept]").addEventListener("click", () =>
-      send("AcceptInvite", { room_id: room.room_id }),
-    );
+    row.querySelector("[data-accept]").addEventListener("click", () => {
+      send("AcceptInvite", { room_id: room.room_id });
+      // Jump straight into the room being accepted instead of leaving the
+      // user on the invites tab looking at a list entry that's about to
+      // disappear from it — the room is already in `state.rooms` (as the
+      // invite itself) with a real name, so this works immediately, no
+      // need to wait for the accept to round-trip first.
+      selectRoom(room.room_id);
+    });
     row.querySelector("[data-decline]").addEventListener("click", () =>
       send("DeclineInvite", { room_id: room.room_id }),
     );
@@ -492,38 +712,87 @@ function renderRoomRow(room, rowIndex) {
 function renderRooms() {
   renderSpacePicker();
   const filter = normalizeForSearch(state.roomFilter.trim());
-  const spaceFilter = state.selectedSpace ? state.spaceChildren[state.selectedSpace] : null;
-  state.visibleRoomIds = [];
+  // The invites tab itself only shows up in the picker while there's at
+  // least one invite (see `renderSpacePicker`) — if the last one just got
+  // accepted/declined while this tab was open, fall back to "[ all ]"
+  // instead of leaving `selectedSpace` pointed at a tab that no longer
+  // exists (which would otherwise render an empty list forever).
+  if (state.selectedSpace === INVITES_TAB && state.inviteEntries.length === 0) {
+    state.selectedSpace = null;
+  }
+  const onInvitesTab = state.selectedSpace === INVITES_TAB;
+  const spaceFilter =
+    state.selectedSpace && !onInvitesTab ? state.spaceChildren[state.selectedSpace] : null;
 
+  // Matching is separated from mounting: this pass only decides *which*
+  // rooms belong in the list and in what order, so the (potentially
+  // thousands-long) result can be handed to the virtualized window path
+  // below without ever building a row for one that won't actually be
+  // shown on screen.
+  const matchedRooms = [];
+  for (const room of state.rooms) {
+    if (room.is_invite || onInvitesTab || room.is_space) continue;
+    if (filter && !normalizeForSearch(room.name).includes(filter)) continue;
+    if (spaceFilter && !spaceFilter.includes(room.room_id)) continue;
+    if (state.unreadOnly && !(room.unread_count > 0)) continue;
+    matchedRooms.push(room);
+  }
+  state.visibleRoomIds = matchedRooms.map((room) => room.room_id);
+  if (state.roomListActiveIndex >= state.visibleRoomIds.length) {
+    state.roomListActiveIndex = state.visibleRoomIds.length - 1;
+  }
+
+  const virtualize = !onInvitesTab && matchedRooms.length > ROOM_LIST_VIRTUALIZE_THRESHOLD;
+  if (virtualize) {
+    virtualRoomList = matchedRooms;
+    // Anything cached from a previous render that's no longer in the
+    // matched set at all (room left, filtered out) is evicted here —
+    // rows merely scrolled out of the current window are *not* touched,
+    // they stay cached in `roomRowEls` for `renderRoomListWindow()` to
+    // reuse the moment they scroll back into view.
+    const keepKeys = new Set(state.visibleRoomIds.map((id) => "room:" + id));
+    for (const [key, node] of roomRowEls) {
+      if (keepKeys.has(key)) continue;
+      roomRowEls.delete(key);
+      node.remove();
+    }
+    renderRoomListWindow();
+    return;
+  }
+  virtualRoomList = null;
+  roomListTopSpacer?.remove();
+  roomListBottomSpacer?.remove();
+
+  // The FLIP animation below (`animateRoomListChanges`) needs a
+  // `getBoundingClientRect()` per already-rendered row — fine at this
+  // (below-virtualization-threshold) size, so it stays enabled outside
+  // active filtering, where sliding a reordered room into place is worth
+  // the extra measuring. Skipped while filtering: the search-as-you-type
+  // case gets no benefit from the animation (results are still settling
+  // keystroke to keystroke) and re-triggers this function most often.
+  const filtering = Boolean(filter) || Boolean(spaceFilter) || state.unreadOnly;
   const prevRects = new Map();
-  for (const [key, node] of roomRowEls) {
-    if (node.isConnected) prevRects.set(key, node.getBoundingClientRect());
+  if (!filtering) {
+    for (const [key, node] of roomRowEls) {
+      if (node.isConnected) prevRects.set(key, node.getBoundingClientRect());
+    }
   }
 
   const keepKeys = new Set();
   const orderedRows = [];
 
-  for (const room of state.rooms) {
-    if (room.is_invite) {
-      const { key, row } = renderInviteRow(room);
-      keepKeys.add(key);
-      orderedRows.push(row);
-      continue;
-    }
-    if (room.is_space) continue;
-    if (filter && !normalizeForSearch(room.name).includes(filter)) continue;
-    if (spaceFilter && !spaceFilter.includes(room.room_id)) continue;
-    if (state.unreadOnly && !(room.unread_count > 0)) continue;
-
-    const rowIndex = state.visibleRoomIds.length;
-    state.visibleRoomIds.push(room.room_id);
-    const { key, row } = renderRoomRow(room, rowIndex);
+  for (let i = 0; i < matchedRooms.length; i++) {
+    const { key, row } = renderRoomRow(matchedRooms[i], i);
     keepKeys.add(key);
     orderedRows.push(row);
   }
-
-  if (state.roomListActiveIndex >= state.visibleRoomIds.length) {
-    state.roomListActiveIndex = state.visibleRoomIds.length - 1;
+  if (onInvitesTab) {
+    for (const room of state.rooms) {
+      if (!room.is_invite) continue;
+      const { key, row } = renderInviteRow(room);
+      keepKeys.add(key);
+      orderedRows.push(row);
+    }
   }
 
   const showEmptyPlaceholder = state.unreadOnly && orderedRows.length === 0;
@@ -556,7 +825,16 @@ function renderRooms() {
   // insertBefore bookkeeping needed.
   for (const row of orderedRows) el.roomListItems.appendChild(row);
 
-  animateRoomListChanges(prevRects, orderedRows, exiting);
+  if (filtering) {
+    // No FLIP pass — see the comment above `filtering`'s declaration.
+    // Exiting rows (filtered out) are just removed outright rather than
+    // faded, same reasoning: the fade is nice on a live list update, not
+    // worth the extra measuring while search results are still settling
+    // keystroke to keystroke.
+    for (const row of exiting) row.remove();
+  } else {
+    animateRoomListChanges(prevRects, orderedRows, exiting);
+  }
 }
 
 /** FLIP-animates whatever `renderRooms()` just changed: rows that moved
@@ -624,6 +902,92 @@ function animateRoomListChanges(prevRects, orderedRows, exiting) {
 
 function roomKeyOf(row) {
   return row.dataset.rowKey;
+}
+
+/** Mounts only the slice of `virtualRoomList` that's actually scrolled
+ * into view (+ overscan), flanked by two spacers sized to stand in for
+ * the rows on either side that aren't mounted — so `#room-list-items`'s
+ * scroll height still reflects "all N rows stacked" even though far
+ * fewer than N ever touch the DOM. Reuses the same `renderRoomRow` cache
+ * as the non-virtualized path, so a row that scrolls back into view after
+ * scrolling away is patched in place rather than rebuilt. Called by
+ * `renderRooms()` whenever it decides to virtualize, and again on every
+ * scroll/resize of the list while it's virtualized. */
+function renderRoomListWindow() {
+  if (!virtualRoomList) return;
+  const total = virtualRoomList.length;
+  if (!roomListTopSpacer) {
+    roomListTopSpacer = document.createElement("div");
+    roomListTopSpacer.className = "room-list-spacer";
+  }
+  if (!roomListBottomSpacer) {
+    roomListBottomSpacer = document.createElement("div");
+    roomListBottomSpacer.className = "room-list-spacer";
+  }
+
+  const rowHeight = roomListMeasuredRowHeight || ROOM_LIST_DEFAULT_ROW_HEIGHT;
+  const container = el.roomListItems;
+  const viewportHeight = container.clientHeight || 400;
+  let startIndex = Math.floor(container.scrollTop / rowHeight) - ROOM_LIST_OVERSCAN;
+  let endIndex = Math.ceil((container.scrollTop + viewportHeight) / rowHeight) + ROOM_LIST_OVERSCAN;
+  startIndex = Math.max(0, Math.min(startIndex, total - 1));
+  endIndex = Math.max(startIndex, Math.min(endIndex, total - 1));
+
+  const windowRows = [];
+  for (let i = startIndex; i <= endIndex; i++) {
+    const { row } = renderRoomRow(virtualRoomList[i], i);
+    windowRows.push(row);
+  }
+
+  roomListTopSpacer.style.height = startIndex * rowHeight + "px";
+  roomListBottomSpacer.style.height = (total - endIndex - 1) * rowHeight + "px";
+  // `replaceChildren` both moves the window's rows into place (existing
+  // nodes get relocated, not cloned) and detaches whatever fell out of
+  // the window last time — no manual bookkeeping needed for that half.
+  container.replaceChildren(roomListTopSpacer, ...windowRows, roomListBottomSpacer);
+
+  // Refine the row-height estimate the spacers use once there's a real
+  // row on screen to measure, so the scrollbar thumb settles to its true
+  // size/position instead of staying pinned to the `contain-intrinsic-size`
+  // guess forever.
+  if (roomListMeasuredRowHeight == null && windowRows.length > 0) {
+    const measured = windowRows[0].getBoundingClientRect().height;
+    if (measured > 0) roomListMeasuredRowHeight = measured;
+  }
+}
+
+el.roomListItems.addEventListener("scroll", () => {
+  if (!virtualRoomList) return;
+  if (roomListWindowRafPending) return;
+  roomListWindowRafPending = true;
+  requestAnimationFrame(() => {
+    roomListWindowRafPending = false;
+    renderRoomListWindow();
+  });
+});
+window.addEventListener("resize", () => {
+  if (virtualRoomList) renderRoomListWindow();
+});
+
+/** Same job as a plain `.room-row.kbd-active` `scrollIntoView()` (see the
+ * room-filter arrow-key handler), but works while the list is virtualized
+ * too, where the target row may not be mounted at all yet — scrolls the
+ * container to where that row *will* be, then mounts the window there. */
+function scrollRoomListRowIntoView(index) {
+  if (index < 0) return;
+  if (!virtualRoomList) {
+    el.roomListItems.querySelector(".room-row.kbd-active")?.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  const rowHeight = roomListMeasuredRowHeight || ROOM_LIST_DEFAULT_ROW_HEIGHT;
+  const container = el.roomListItems;
+  const top = index * rowHeight;
+  const bottom = top + rowHeight;
+  if (top < container.scrollTop) container.scrollTop = top;
+  else if (bottom > container.scrollTop + container.clientHeight) {
+    container.scrollTop = bottom - container.clientHeight;
+  }
+  renderRoomListWindow();
 }
 
 el.btnCreateRoom.addEventListener("click", () => {
@@ -715,7 +1079,6 @@ function selectRoom(roomId) {
   // mouse click resume from the room that's now open rather than there.
   const idx = state.visibleRoomIds.indexOf(roomId);
   if (idx !== -1) state.roomListActiveIndex = idx;
-  state.rightPanel = null;
   el.roomMenu.style.display = "none";
   cancelReply();
   cancelEdit();
@@ -723,6 +1086,24 @@ function selectRoom(roomId) {
   el.timelineTitle.textContent = room ? room.name : roomId;
   el.timelineHeaderActions.style.display = "flex";
   el.composeRow.style.display = "flex";
+  // Opening a room opens its threads list by default (rather than
+  // leaving `rightPanel` closed until the user hits Ctrl+T) — same
+  // request/state shape as `openRoomThreadsList()`, inlined instead of
+  // calling it since that function also calls `renderSidePanel()` itself,
+  // which happens below anyway. Desktop-width only: below the same
+  // `720px`/`500px` breakpoint `renderSidePanel()` uses elsewhere (see its
+  // `isNarrowLayout` comment), `#side-panel` is a full-screen overlay, so
+  // this would otherwise bury the timeline the user just tapped to see
+  // behind the thread list on every single room open.
+  const isNarrowLayout = window.matchMedia("(max-width: 720px), (max-height: 500px)").matches;
+  if (isNarrowLayout) {
+    state.rightPanel = null;
+  } else {
+    send("ListThreads", { room_id: roomId });
+    state.rightPanel = { kind: "threads-list", scope: roomId };
+    state.threadsListActiveIndex = -1;
+    state.threadsListFilter = "";
+  }
   renderRooms();
   renderSidePanel();
   if (!state.timelineLoaded.has(roomId)) {
@@ -730,6 +1111,7 @@ function selectRoom(roomId) {
     send("LoadTimeline", { room_id: roomId });
   } else {
     renderTimeline();
+    maybeAutoLoadMore(roomId);
   }
   // Deliberately not auto-marking read just for opening the room — read
   // state only ever changes via the explicit "[ mark read ]" button (see
@@ -857,6 +1239,29 @@ function openSummaryDialog(roomId, threadRootId) {
 // Timeline rendering
 // =========================================================================
 
+/** Scrolls `container` to its bottom, correcting for `.msg-row`'s
+ * `content-visibility: auto` (see style.css) — its rows still off-screen
+ * at the moment this runs are sized by their `contain-intrinsic-size`
+ * *estimate*, not their real rendered height, since the browser hasn't
+ * determined which of them are actually in view yet (that only happens
+ * during layout/paint, not synchronously in this script). Reading
+ * `scrollHeight` and setting `scrollTop` from it right after appending a
+ * bunch of rows therefore targets a value that's shorter than the true
+ * final height whenever real content is taller than the estimate (a
+ * multi-line message, an image, a grouped block, ...) — reliably leaving
+ * the last message or two just out of view, needing an extra manual
+ * scroll to actually reach them. Setting `scrollTop` again a couple of
+ * frames later, once layout has caught up, closes that gap — imperceptible
+ * since it's already close, just not exact. */
+function scrollToBottom(container) {
+  container.scrollTop = container.scrollHeight;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+    });
+  });
+}
+
 function renderTimeline() {
   const events = state.timelines[state.selectedRoom] || [];
   el.timeline.innerHTML = "";
@@ -889,7 +1294,7 @@ function renderTimeline() {
     el.timeline.appendChild(renderMessage(event, { roomId: state.selectedRoom, threadId: null }, { grouped }));
     prev = event;
   }
-  el.timeline.scrollTop = el.timeline.scrollHeight;
+  scrollToBottom(el.timeline);
   updateJumpLatestVisibility();
 }
 
@@ -944,8 +1349,97 @@ function appendMessage(roomId, event) {
     el.timeline.scrollHeight - el.timeline.scrollTop - el.timeline.clientHeight < 120;
   const grouped = isGrouped(events[events.length - 2], event);
   el.timeline.appendChild(renderMessage(event, { roomId, threadId: null }, { grouped }));
-  if (wasNearBottom) el.timeline.scrollTop = el.timeline.scrollHeight;
+  if (wasNearBottom) scrollToBottom(el.timeline);
   updateJumpLatestVisibility();
+}
+
+/** Inserts older messages (from a `TimelinePrepend`) at the top instead of
+ * tearing down and rebuilding the whole timeline the way a plain
+ * `renderTimeline()` call does. That full rebuild was the actual source of
+ * the jarring scroll jump on "load more": it destroys and recreates every
+ * already-rendered row too, including ones with images that had already
+ * finished loading — those images then have to reload from scratch, and
+ * each one popping back in shifts the layout (and the scroll position)
+ * again, *after* the scroll-position fixup below already ran. Leaving
+ * existing rows untouched avoids all of that. `prevEvents`/`allEvents` are
+ * the timeline's event list just before/after this page loaded — the new
+ * messages are exactly `allEvents`'s extra prefix over `prevEvents`. */
+function prependMessages(roomId, prevEvents, allEvents) {
+  const newCount = allEvents.length - prevEvents.length;
+  const loadMoreRow = document.getElementById("load-more-row");
+  // Falls back to a full render for anything this incremental path isn't
+  // built to handle correctly (no new events despite being called, or no
+  // rows to insert relative to — e.g. this was the very first page).
+  if (newCount <= 0 || prevEvents.length === 0 || !loadMoreRow) {
+    renderTimeline();
+    return;
+  }
+
+  const newEvents = allEvents.slice(0, newCount);
+  const scrollTopBefore = el.timeline.scrollTop;
+  const scrollHeightBefore = el.timeline.scrollHeight;
+
+  const frag = document.createDocumentFragment();
+  let prev = null;
+  for (const event of newEvents) {
+    const grouped = isGrouped(prev, event);
+    frag.appendChild(renderMessage(event, { roomId, threadId: null }, { grouped }));
+    prev = event;
+  }
+  // The first already-rendered message's grouping may change now that a
+  // new predecessor immediately precedes it (was previously the room's
+  // very first message, so never grouped).
+  const firstOldRow = loadMoreRow.nextElementSibling;
+  if (firstOldRow) {
+    const firstOldEvent = prevEvents[0];
+    const grouped = isGrouped(newEvents[newEvents.length - 1], firstOldEvent);
+    firstOldRow.replaceWith(renderMessage(firstOldEvent, { roomId, threadId: null }, { grouped }));
+  }
+
+  el.timeline.insertBefore(frag, loadMoreRow.nextSibling);
+
+  if (state.reachedStart.has(roomId)) {
+    loadMoreRow.remove();
+  } else {
+    loadMoreRow.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.textContent = "load more messages";
+    btn.addEventListener("click", () => paginateBack(roomId));
+    loadMoreRow.appendChild(btn);
+  }
+
+  // Standard "keep the reading position anchored" formula for prepending
+  // above the current scroll position — not just the height delta alone
+  // (which silently assumed `scrollTopBefore` was 0, off by however far
+  // past the top pagination actually triggers, see the scroll listener
+  // below).
+  el.timeline.scrollTop = scrollTopBefore + (el.timeline.scrollHeight - scrollHeightBefore);
+  updateJumpLatestVisibility();
+}
+
+/** Keeps pulling older messages automatically for as long as the loaded
+ * history doesn't even fill the visible timeline area — without this, a
+ * room with only a handful of synced messages left the "load more
+ * messages" button sitting there requiring a click before there was even
+ * anything to scroll, unlike the room list's own auto-grow
+ * (`scheduleGrowRoomList`) which this mirrors. Once there's enough content
+ * to scroll, the existing scroll-near-top listener below takes over as
+ * usual. A `setTimeout` gives the browser a paint first so
+ * `scrollHeight`/`clientHeight` reflect the DOM just inserted, and
+ * `paginateBack`'s own `paginationInFlight` guard keeps this from
+ * double-firing while a page is already in flight — the next
+ * `TimelinePrepend` response re-checks and keeps going until either the
+ * viewport is full or `reachedStart`. */
+function maybeAutoLoadMore(roomId) {
+  if (roomId !== state.selectedRoom) return;
+  if (state.reachedStart.has(roomId) || state.paginationInFlight.has(roomId)) return;
+  setTimeout(() => {
+    if (roomId !== state.selectedRoom) return;
+    if (state.reachedStart.has(roomId) || state.paginationInFlight.has(roomId)) return;
+    if (el.timeline.scrollHeight <= el.timeline.clientHeight) {
+      paginateBack(roomId);
+    }
+  }, 0);
 }
 
 function paginateBack(roomId) {
@@ -985,7 +1479,7 @@ el.btnJumpLatest.addEventListener("click", () => {
   // frame or two, since that WebView's layout doesn't keep up with each
   // intermediate scroll position the way it does with a single instant
   // jump. A plain `scrollTop` assignment resolves in one paint instead.
-  el.timeline.scrollTop = el.timeline.scrollHeight;
+  scrollToBottom(el.timeline);
   updateJumpLatestVisibility();
 });
 
@@ -1111,6 +1605,24 @@ function renderMessage(event, ctx, opts = {}) {
   const row = document.createElement("div");
   row.className = `msg-row ${side}` + (opts.grouped ? " grouped" : "");
   row.dataset.eventId = event.event_id;
+
+  // Avatar sits to the left of another person's bubble, same as the
+  // sender name right below it — shown only on the first bubble of a
+  // consecutive group (an empty same-width spacer on the rest, so every
+  // bubble in the group still lines up under the first one instead of
+  // sliding left to fill the gap). Own messages never get one — they're
+  // always "you", right-aligned, no avatar needed.
+  if (!event.is_own) {
+    if (!opts.grouped) {
+      row.appendChild(renderAvatar(event.sender_avatar_url, event.sender_name, event.sender, 28));
+    } else {
+      const spacer = document.createElement("div");
+      spacer.className = "avatar-spacer";
+      spacer.style.width = "28px";
+      spacer.style.height = "28px";
+      row.appendChild(spacer);
+    }
+  }
 
   const col = document.createElement("div");
   col.className = "msg-col";
@@ -1276,10 +1788,22 @@ function renderMessage(event, ctx, opts = {}) {
 
   // A message with a thread stays flagged all the time, not just on
   // hover — otherwise it's easy to miss that replies exist at all.
-  if (!ctx.threadId && event.thread_count) {
+  //
+  // `event.thread_count` comes from the raw event's bundled
+  // `unsigned.m.relations.m.thread` aggregation (see `convert.rs`), which
+  // this homeserver only reliably includes for recently-synced events —
+  // older messages pulled in via pagination (`PaginateBack`/`LoadTimeline`)
+  // routinely came back with it missing even though the message genuinely
+  // has a thread, so the badge silently never showed for a room's earlier
+  // history. `state.threadsByRoom` (fetched separately via the `/threads`
+  // endpoint, see `scanAllRoomThreads`) doesn't have that gap, so fall back
+  // to its count whenever the bundled one is absent.
+  const threadCount =
+    event.thread_count || state.threadsByRoom[ctx.roomId]?.find((t) => t.event_id === event.event_id)?.thread_count;
+  if (!ctx.threadId && threadCount) {
     const badge = document.createElement("div");
     badge.className = "thread-badge";
-    badge.textContent = `🧵 ${event.thread_count} ${event.thread_count === 1 ? "reply" : "replies"} →`;
+    badge.textContent = `🧵 ${threadCount} ${threadCount === 1 ? "reply" : "replies"} →`;
     badge.addEventListener("click", () => openThread(ctx.roomId, event));
     bubble.appendChild(badge);
   }
@@ -1338,7 +1862,7 @@ function renderMessage(event, ctx, opts = {}) {
   menuTrigger.addEventListener("click", (e) => {
     e.stopPropagation();
     const items = [];
-    if (!ctx.threadId && !event.thread_count) {
+    if (!ctx.threadId && !threadCount) {
       items.push({ label: "thread", onClick: () => openThread(ctx.roomId, event) });
     }
     items.push({ label: "reply", onClick: () => startReply(ctx.roomId, ctx.threadId, event) });
@@ -1369,6 +1893,14 @@ function renderMessage(event, ctx, opts = {}) {
   bubble.appendChild(menuTrigger);
 
   row.appendChild(col);
+
+  // Re-applies a still-active "jump to this message" highlight across a
+  // rebuild of this exact row — see `lastJumpHighlightedEventId`'s doc
+  // comment for why that's tracked by event ID rather than a DOM
+  // reference in the first place.
+  if (event.event_id === lastJumpHighlightedEventId) {
+    row.classList.add("jump-highlight");
+  }
 
   return row;
 }
@@ -2300,8 +2832,8 @@ const SHORTCUTS = [
   ["↑ / ↓ (threads list)", "move through the threads list"],
   ["Enter (threads list)", "open the highlighted thread"],
   ["← / → (in tags)", "switch space/tag"],
-  ["Alt+↑ / Alt+↓", "previous / next room in the list"],
-  ["Ctrl+Shift+U", "toggle unread-only filter"],
+  ["Ctrl+↑ / Ctrl+↓", "previous / next room in the list"],
+  ["Ctrl+Shift+L", "toggle unread-only filter"],
   ["Ctrl+Shift+R", "mark current room as read"],
   ["Esc", "close dialog / menu"],
   ["?", "show this list"],
@@ -2409,7 +2941,13 @@ document.addEventListener("keydown", (e) => {
     showShortcutsHelp();
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "u") {
+  // Not Ctrl+Shift+U: on Linux, IBus intercepts that combo at the input
+  // method level to trigger its own "Unicode code point entry" mode
+  // whenever a text field has focus (the room search box, in practice) —
+  // before the keydown event ever reaches this listener, so
+  // `preventDefault()` here can't stop it. Confirmed by testing: it typed
+  // a literal "u" into the search box instead of toggling the filter.
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
     e.preventDefault();
     el.btnUnreadOnly.click();
     return;
@@ -2419,7 +2957,7 @@ document.addEventListener("keydown", (e) => {
     el.btnMarkRead.click();
     return;
   }
-  if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
     e.preventDefault();
     if (state.visibleRoomIds.length === 0) return;
     const currentIndex = state.visibleRoomIds.indexOf(state.selectedRoom);
@@ -2672,6 +3210,23 @@ el.btnUserSearch.addEventListener("click", () => {
 el.btnMarkRead.addEventListener("click", () => {
   if (!state.selectedRoom) return;
   send("MarkRoomRead", { room_id: state.selectedRoom });
+  // Optimistic, same reasoning as the live `NewMessage` unread bump below —
+  // the backend no longer round-trips a room-list refresh after
+  // `MarkRoomRead` itself (sliding sync's own diff stream will eventually
+  // echo the server's confirmation), so clear the badge here instead of
+  // waiting for that.
+  const room = state.rooms.find((r) => r.room_id === state.selectedRoom);
+  if (room) {
+    room.unread_count = 0;
+    knownUnreadCounts.set(room.room_id, 0);
+    // Exempts this room from `applyUnreadFloor`'s stale-count protection
+    // for a few seconds — otherwise the very next room-list diff (which
+    // may still carry the server's pre-receipt count) would look exactly
+    // like the race that protection exists for, and get "corrected" right
+    // back up instead of actually zeroing.
+    recentlyMarkedRead.set(state.selectedRoom, Date.now());
+    renderRooms();
+  }
   showToast("marked as read");
 });
 
@@ -2816,7 +3371,7 @@ function appendThreadMessage(rootEventId, event) {
   const wasNearBottom =
     panelBody.scrollHeight - panelBody.scrollTop - panelBody.clientHeight < 120;
   msgsEl.appendChild(renderMessage(event, threadCtx, { grouped: isGrouped(prevReply, event) }));
-  if (wasNearBottom) panelBody.scrollTop = panelBody.scrollHeight;
+  if (wasNearBottom) scrollToBottom(panelBody);
 }
 
 /** Thread-panel counterpart to `rerenderMessageInPlace` — patches one
@@ -3144,7 +3699,7 @@ function renderSidePanel() {
     // `#side-panel-body` does (`overflow-y: auto`) — so that's what needs
     // scrolling to the newest reply, same as the main timeline does.
     const panelBody = document.getElementById("side-panel-body");
-    panelBody.scrollTop = panelBody.scrollHeight;
+    scrollToBottom(panelBody);
 
     const threadSuggestionsEl = document.getElementById("thread-mention-suggestions");
     const threadInputEl = document.getElementById("thread-compose-input");
@@ -3274,7 +3829,138 @@ function renderSidePanel() {
   if (rp.kind === "security") {
     renderSecurityPanel();
   }
+  if (rp.kind === "profile") {
+    renderProfilePanel();
+  }
 }
+
+// =========================================================================
+// Own profile — avatar / display name
+// =========================================================================
+
+el.btnProfile.addEventListener("click", () => {
+  closeChatsMenu();
+  state.rightPanel = { kind: "profile" };
+  state.ownProfile = null;
+  send("GetOwnProfile");
+  renderSidePanel();
+});
+
+/** Small circular avatar element — `mxcUri` is `TimelineEvent.sender_avatar_url`
+ * / `OwnProfile.avatar_url` (or null/undefined for "no avatar set"). Falls
+ * back to a colored circle with the name's first letter while the real
+ * image is loading (or if there is none), same idea as `senderColor` gives
+ * every sender a stable color for their name — reused here so a given
+ * person's fallback circle and their sender-name color always match. `size`
+ * is in px; defaults to the message-row avatar size. */
+function renderAvatar(mxcUri, name, idForColor, size = 28) {
+  const wrap = document.createElement("div");
+  wrap.className = "avatar";
+  wrap.style.width = `${size}px`;
+  wrap.style.height = `${size}px`;
+  wrap.style.fontSize = `${Math.round(size * 0.45)}px`;
+
+  const cached = mxcUri && state.imageCache[mxcUri];
+  if (cached) {
+    const img = document.createElement("img");
+    img.src = cached;
+    img.alt = name || "";
+    wrap.appendChild(img);
+  } else {
+    wrap.style.background = senderColor(idForColor || name || "");
+    wrap.textContent = (name || "?").trim().charAt(0).toUpperCase() || "?";
+    if (mxcUri) {
+      // Lets `patchAvatarsWithImage` find every avatar slot showing this
+      // mxc (a sender can have several on screen at once — one per
+      // message group) once `Command::FetchImage` answers, without
+      // needing a full re-render of whatever contains them.
+      wrap.dataset.mxc = mxcUri;
+      requestImage(mxcUri);
+    }
+  }
+  return wrap;
+}
+
+/** Swaps the initials-fallback circle for the real image, in place, on
+ * every currently-rendered avatar slot for `mxcUri` — same "patch, don't
+ * re-render" reasoning as `patchMessagesWithMedia`. */
+function patchAvatarsWithImage(mxcUri) {
+  const cached = state.imageCache[mxcUri];
+  if (!cached) return;
+  document.querySelectorAll(`.avatar[data-mxc="${CSS.escape(mxcUri)}"]`).forEach((wrap) => {
+    delete wrap.dataset.mxc;
+    wrap.style.background = "";
+    wrap.textContent = "";
+    const img = document.createElement("img");
+    img.src = cached;
+    wrap.appendChild(img);
+  });
+}
+
+function renderProfilePanel() {
+  const p = state.ownProfile;
+  let html = `<div id="side-panel-header"><span>profile</span><button id="side-panel-close" class="small-btn">[x]</button></div>
+    <div id="side-panel-body">`;
+  if (!p) {
+    html += `<div style="color:var(--text-weak);font-size:12px;">loading...</div></div>`;
+    el.sidePanel.innerHTML = html;
+    document.getElementById("side-panel-close").addEventListener("click", () => {
+      state.rightPanel = null;
+      renderSidePanel();
+    });
+    return;
+  }
+
+  html += `<div id="profile-avatar-row" style="display:flex;align-items:center;gap:12px;">
+      <div id="profile-avatar-slot"></div>
+      <div>
+        <div style="font-size:12px;color:var(--text-weak);">${escapeHtml(p.user_id)}</div>
+        <button id="profile-change-avatar" class="small-btn" ${state.ownProfileSaving ? "disabled" : ""}>change avatar...</button>
+      </div>
+    </div>
+    <hr style="border-color:var(--border);margin:14px 0;">
+    <label style="font-size:12px;color:var(--text-weak);">display name</label>
+    <input type="text" id="profile-display-name" style="width:100%;margin-top:4px;" value="${escapeHtml(p.display_name)}" ${state.ownProfileSaving ? "disabled" : ""} />
+    <button id="profile-save-name" style="width:100%;margin-top:8px;" ${state.ownProfileSaving ? "disabled" : ""}>save name</button>
+    <div style="margin-top:10px;font-size:11px;color:var(--text-weak);">
+      changing your name or avatar here updates it everywhere (Element included) — other members' clients decide on their own how to show that change in a room's timeline, this app has no control over that part.
+    </div>`;
+  html += "</div>";
+  el.sidePanel.innerHTML = html;
+
+  document.getElementById("profile-avatar-slot").appendChild(
+    renderAvatar(p.avatar_url, p.display_name, p.user_id, 56),
+  );
+
+  document.getElementById("side-panel-close").addEventListener("click", () => {
+    state.rightPanel = null;
+    renderSidePanel();
+  });
+  document.getElementById("profile-change-avatar").addEventListener("click", () => {
+    el.avatarFileInput.click();
+  });
+  document.getElementById("profile-save-name").addEventListener("click", () => {
+    const name = document.getElementById("profile-display-name").value.trim();
+    if (!name || name === p.display_name) return;
+    state.ownProfileSaving = true;
+    renderSidePanel();
+    send("SetDisplayName", { name });
+  });
+}
+
+el.avatarFileInput.addEventListener("change", () => {
+  const file = el.avatarFileInput.files[0];
+  el.avatarFileInput.value = "";
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    const bytes = Array.from(new Uint8Array(reader.result));
+    state.ownProfileSaving = true;
+    if (state.rightPanel?.kind === "profile") renderSidePanel();
+    send("SetAvatar", { bytes, mime: file.type || "image/png" });
+  };
+  reader.readAsArrayBuffer(file);
+});
 
 // =========================================================================
 // Security / verification
@@ -3452,30 +4138,45 @@ function handleBackendEvent(evt) {
     case "LoginError":
       showLoginError(data);
       break;
-    case "Rooms":
-      state.rooms = data;
+    case "RoomListUpdate": {
+      const entries = data.list === "Invites" ? state.inviteEntries : state.roomEntries;
+      for (const op of data.ops) applyRoomListOp(entries, op);
+      rebuildRoomsFromEntries();
       renderRooms();
-      if (state.reloadingRooms) {
-        state.reloadingRooms = false;
-        el.btnReloadRooms.disabled = false;
-        el.btnReloadRooms.textContent = "[ reload ]";
-        showToast("room list reloaded");
-      }
+      if (data.list !== "Invites") scheduleGrowRoomList();
       // First time the room list actually has rooms in it — kick off a
       // one-time background fetch of every room's threads (see
       // `scanAllRoomThreads`), same reasoning as the room list's own
       // startup refresh: "all threads" should have real data the moment
       // it's opened, not just whatever `ThreadReply` happened to arrive
-      // live since launch.
+      // live since launch. Note this only ever sees rooms actually loaded
+      // into the current page/growing-batch so far, not necessarily every
+      // room on the account yet — same limitation as
+      // `Command::ListAllUsers`/`SearchUserMessages` on a very large
+      // account.
       if (!state.threadsScanStarted && state.rooms.length > 0) {
         state.threadsScanStarted = true;
         scanAllRoomThreads();
       }
       break;
+    }
+    case "Spaces":
+      state.spaces = data;
+      renderSpacePicker();
+      if (state.reloadingRooms) {
+        state.reloadingRooms = false;
+        el.btnReloadRooms.disabled = false;
+        el.btnReloadRooms.textContent = "[ reload ]";
+        showToast("spaces reloaded");
+      }
+      break;
     case "Timeline":
       state.timelines[data.room_id] = data.events;
       state.timelineLoaded.add(data.room_id);
-      if (data.room_id === state.selectedRoom) renderTimeline();
+      if (data.room_id === state.selectedRoom) {
+        renderTimeline();
+        maybeAutoLoadMore(data.room_id);
+      }
       if (state.pendingScrollTarget?.roomId === data.room_id) {
         const eventId = state.pendingScrollTarget.eventId;
         state.pendingScrollTarget = null;
@@ -3491,11 +4192,11 @@ function handleBackendEvent(evt) {
     case "TimelinePrepend": {
       state.paginationInFlight.delete(data.room_id);
       if (data.reached_start) state.reachedStart.add(data.room_id);
+      const prevEvents = state.timelines[data.room_id] || [];
       state.timelines[data.room_id] = data.events;
       if (data.room_id === state.selectedRoom) {
-        const prevHeight = el.timeline.scrollHeight;
-        renderTimeline();
-        el.timeline.scrollTop = el.timeline.scrollHeight - prevHeight;
+        prependMessages(data.room_id, prevEvents, data.events);
+        maybeAutoLoadMore(data.room_id);
       }
       if (state.pendingScrollSearch?.roomId === data.room_id) {
         const eventId = state.pendingScrollSearch.eventId;
@@ -3531,6 +4232,7 @@ function handleBackendEvent(evt) {
         // pressing "[ mark read ]" (see `el.btnMarkRead`'s handler), not
         // just by a message happening to arrive while the room's open.
         room.unread_count = (room.unread_count || 0) + 1;
+        knownUnreadCounts.set(room.room_id, room.unread_count);
         // Same ordering `refresh_rooms` uses server-side: invites first,
         // then most recent activity.
         state.rooms.sort((a, b) => (b.is_invite - a.is_invite) || b.last_message_ts - a.last_message_ts);
@@ -3659,6 +4361,10 @@ function handleBackendEvent(evt) {
       else state.threadsListReachedEnd.delete(data.room_id);
       state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
+      // Picks up any thread badges the main timeline couldn't show yet —
+      // see `renderMessage`'s `threadCount` fallback comment for why the
+      // per-message bundled data alone isn't always enough.
+      if (data.room_id === state.selectedRoom) renderTimeline();
       updateThreadsButtonBadge();
       break;
     case "ThreadsListAppend": {
@@ -3672,6 +4378,7 @@ function handleBackendEvent(evt) {
       if (data.reached_end) state.threadsListReachedEnd.add(data.room_id);
       state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
+      if (data.room_id === state.selectedRoom) renderTimeline();
       updateThreadsButtonBadge();
       break;
     }
@@ -3740,6 +4447,7 @@ function handleBackendEvent(evt) {
       // input), which for a room with several images in flight felt like
       // it never stopped jumping.
       patchMessagesWithMedia(data.key);
+      patchAvatarsWithImage(data.key);
       // A meme-picker thumbnail finishing its download — re-render
       // whichever picker is currently open (if any) so it swaps from
       // blank to the actual image instead of staying empty until the
@@ -3849,6 +4557,11 @@ function handleBackendEvent(evt) {
       state.lvxApiKeyConfigured = data.configured;
       if (state.rightPanel?.kind === "security") renderSidePanel();
       break;
+    case "OwnProfile":
+      state.ownProfile = data;
+      state.ownProfileSaving = false;
+      if (state.rightPanel?.kind === "profile") renderSidePanel();
+      break;
     case "RoomKeysImported":
       state.keyImportStatus = `imported ${data.imported} of ${data.total} session${data.total === 1 ? "" : "s"}`;
       showToast(state.keyImportStatus);
@@ -3867,6 +4580,41 @@ function handleBackendEvent(evt) {
         renderSidePanel();
       }
       break;
+    case "SharedEventResolved": {
+      if (
+        state.pendingSharedEventResolve?.roomId !== data.room_id ||
+        state.pendingSharedEventResolve?.eventId !== data.event_id
+      ) {
+        // Stale — the user followed a different link (or navigated away)
+        // before this round-trip came back.
+        break;
+      }
+      state.pendingSharedEventResolve = null;
+      if (!data.found) {
+        showToast("couldn't find that message — it may be deleted, or you may not have access to it");
+        break;
+      }
+      const alreadyLoaded = state.timelineLoaded.has(data.room_id);
+      if (data.thread_root_id) {
+        // Same "needs the room's main timeline loaded first, for the
+        // thread root's data" handoff `openMatrixToLink` uses for an
+        // explicit `?thread=` link.
+        if (alreadyLoaded) {
+          resolveThreadLink(data.room_id, data.thread_root_id, data.event_id);
+        } else {
+          state.pendingThreadLink = {
+            roomId: data.room_id,
+            threadRootId: data.thread_root_id,
+            eventId: data.event_id,
+          };
+        }
+      } else if (alreadyLoaded) {
+        findAndScrollToMessage(data.room_id, data.event_id);
+      } else {
+        state.pendingScrollTarget = { roomId: data.room_id, eventId: data.event_id };
+      }
+      break;
+    }
     case "Error":
       console.error("backend error:", data);
       showToast(data);
@@ -3879,6 +4627,10 @@ function handleBackendEvent(evt) {
       if (state.summaryRequest) {
         const body = document.getElementById("summary-dialog-body");
         if (body) body.textContent = data;
+      }
+      if (state.ownProfileSaving) {
+        state.ownProfileSaving = false;
+        if (state.rightPanel?.kind === "profile") renderSidePanel();
       }
       break;
     default:
@@ -3961,12 +4713,32 @@ function maybeNotify(roomId, event, threadId = null) {
   send("ShowNotification", { room_id: roomId, thread_id: threadId, title, body });
 }
 
-/** Jumps to and briefly highlights the message a reply-preview points at.
- * `containerId` is `"timeline"` for the main view or `"thread-messages"`
- * for the thread panel — whichever one this reply-preview was rendered
- * in, since the target can only possibly be loaded there. Silently no-ops
- * (well, a toast) if it isn't currently loaded — e.g. it's further back
- * than "load more messages" has fetched yet. */
+// The event ID `scrollToMessage` last marked with `.jump-highlight` (see
+// below) — tracked by ID rather than the DOM node itself, because a
+// thread panel (and the main timeline, on a full `renderTimeline()`)
+// rebuilds its message rows from scratch on plenty of things that aren't
+// "the user jumped somewhere else" — e.g. `ThreadEventsPrepend` bringing
+// in another page while auto-loading a thread's full history (see
+// `resolveThreadLink`'s doc comment). A DOM-node reference would just go
+// stale the moment that happened, silently losing the highlight; tracking
+// the ID instead lets `renderMessage` re-apply it on every render no
+// matter how many times the row underneath gets torn down and rebuilt.
+let lastJumpHighlightedEventId = null;
+// Clears `lastJumpHighlightedEventId` (and the class along with it) 30s
+// after the most recent jump — `null` whenever nothing's pending. Kept as
+// a real timer handle (not just a timestamp) so a second jump within that
+// window can cancel and restart it, rather than the earlier jump's timeout
+// firing partway through and clearing the *new* target early.
+let jumpHighlightTimer = null;
+
+/** Jumps to and highlights the message a reply-preview or shared
+ * matrix.to link points at. `containerId` is `"timeline"` for the main
+ * view or `"thread-messages"` for the thread panel — whichever one this
+ * reply-preview was rendered in, since the target can only possibly be
+ * loaded there. Silently no-ops (well, a toast) if it isn't currently
+ * loaded — e.g. it's further back than "load more messages" has fetched
+ * yet. The highlight clears itself after 30s (or immediately, moved
+ * rather than left behind, if another jump happens first). */
 function scrollToMessage(containerId, eventId) {
   const container = document.getElementById(containerId);
   const target = container?.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`);
@@ -3976,20 +4748,31 @@ function scrollToMessage(containerId, eventId) {
   }
   // Instant, not smooth — a smooth scroll animates over however far the
   // target is (can be many screens away, e.g. a shared link into a long
-  // room), so it could still be mid-scroll once the highlight below
-  // starts fading out, leaving nothing visible by the time the message
-  // actually settles into view. Jumping straight there removes that race
-  // entirely — the flash is guaranteed to start once the message is
-  // already on screen.
+  // room), which would otherwise leave the highlight below appearing on a
+  // message that's still sliding into place rather than already settled
+  // on screen.
   target.scrollIntoView({ block: "center" });
-  // Force a reflow between remove/add so clicking the same link/preview
-  // again while still highlighted restarts the CSS animation from 0%,
-  // rather than the class already being present making the second
-  // `add("jump-highlight")` a silent no-op.
-  target.classList.remove("jump-highlight");
-  void target.offsetWidth;
+  if (lastJumpHighlightedEventId && lastJumpHighlightedEventId !== eventId) {
+    // Best-effort clear of the *previous* target, wherever its row
+    // currently lives (main timeline or a thread panel) — `renderMessage`
+    // simply won't re-apply the class once `lastJumpHighlightedEventId`
+    // has moved on, so this only matters for a row that's still mounted
+    // from before and would otherwise keep showing a stale highlight.
+    document
+      .querySelectorAll(`[data-event-id="${CSS.escape(lastJumpHighlightedEventId)}"].jump-highlight`)
+      .forEach((row) => row.classList.remove("jump-highlight"));
+  }
   target.classList.add("jump-highlight");
-  setTimeout(() => target.classList.remove("jump-highlight"), 2200);
+  lastJumpHighlightedEventId = eventId;
+
+  if (jumpHighlightTimer) clearTimeout(jumpHighlightTimer);
+  jumpHighlightTimer = setTimeout(() => {
+    document
+      .querySelectorAll(`[data-event-id="${CSS.escape(eventId)}"].jump-highlight`)
+      .forEach((row) => row.classList.remove("jump-highlight"));
+    lastJumpHighlightedEventId = null;
+    jumpHighlightTimer = null;
+  }, 30000);
 }
 
 // =========================================================================
@@ -4067,6 +4850,18 @@ document.addEventListener("click", (e) => {
  * `state.pendingScrollSearch`, resumed from the `TimelinePrepend` handler
  * in `poll_events`) until the target turns up or the room's actual start
  * is reached, so the caller only ever needs to fire this once. */
+// Generous upper bound on how many `PaginateBack` pages a "jump to shared
+// message" search will chase before giving up — without this, a search
+// that never finds its target (and never gets a `reached_start: true`
+// either — this homeserver has known sync quirks, see `GrowRoomList`'s
+// doc comment on the Rust side) would otherwise show its one "loading..."
+// toast and then hang silently forever, with zero further feedback and no
+// way to tell "still working" from "stuck".
+const SCROLL_SEARCH_MAX_ATTEMPTS = 40;
+// How long one `PaginateBack` round-trip gets before this assumes the
+// response was lost and forces a retry — see the watchdog comment below.
+const SCROLL_SEARCH_WATCHDOG_MS = 8000;
+
 function findAndScrollToMessage(roomId, eventId) {
   if (state.selectedRoom !== roomId) {
     // User navigated elsewhere while this was mid-search — drop it rather
@@ -4084,10 +4879,39 @@ function findAndScrollToMessage(roomId, eventId) {
     showToast("couldn't find that message — it may be deleted, or from before you joined this room");
     return;
   }
-  const alreadySearching =
-    state.pendingScrollSearch?.roomId === roomId && state.pendingScrollSearch?.eventId === eventId;
-  if (!alreadySearching) showToast("loading older messages to find the shared one...");
-  state.pendingScrollSearch = { roomId, eventId };
+  const attempts =
+    (state.pendingScrollSearch?.roomId === roomId && state.pendingScrollSearch?.eventId === eventId
+      ? state.pendingScrollSearch.attempts
+      : 0) + 1;
+  if (attempts > SCROLL_SEARCH_MAX_ATTEMPTS) {
+    state.pendingScrollSearch = null;
+    showToast("couldn't find that message after searching a long way back — giving up");
+    return;
+  }
+  if (attempts === 1) {
+    showToast("loading older messages to find the shared one...");
+  } else if (attempts % 10 === 0) {
+    // Periodic proof-of-life — the first toast alone fades in 6s (see
+    // `showToast`) long before a deep search finishes, which otherwise
+    // looks identical to "nothing is happening" from here on.
+    showToast(`still searching for that message... (${attempts} pages so far)`);
+  }
+  const searchToken = { roomId, eventId, attempts };
+  state.pendingScrollSearch = searchToken;
+  // `paginateBack` no-ops if a page request for this room is already
+  // marked in flight — normally the *next* `TimelinePrepend` clears that
+  // flag and re-triggers this function on its own (see that event's
+  // handler). If that response is ever lost instead of arriving, nothing
+  // else would ever clear the flag, and this search would sit forever on
+  // whatever attempt it was on. This watchdog force-clears it and retries
+  // rather than trusting the flag indefinitely — `searchToken` identity
+  // check means it's a no-op once the search has already moved on
+  // (found, gave up, or the room changed) by the time it fires.
+  setTimeout(() => {
+    if (state.pendingScrollSearch !== searchToken) return;
+    state.paginationInFlight.delete(roomId);
+    findAndScrollToMessage(roomId, eventId);
+  }, SCROLL_SEARCH_WATCHDOG_MS);
   paginateBack(roomId);
 }
 
@@ -4125,7 +4949,33 @@ function resolveThreadLink(roomId, threadRootId, eventId) {
     showToast("couldn't find that thread — the original message may be deleted, or from before you joined this room");
     return;
   }
-  state.pendingThreadLink = { roomId, threadRootId, eventId };
+  const attempts =
+    (state.pendingThreadLink?.roomId === roomId &&
+    state.pendingThreadLink?.threadRootId === threadRootId &&
+    state.pendingThreadLink?.eventId === eventId
+      ? // `openMatrixToLink`/`SharedEventResolved` set this initially
+        // without an `attempts` field — only this function's own retries
+        // add one, so the very first call here needs the `|| 0` fallback
+        // too (bare `undefined + 1` is `NaN`, which would never trip the
+        // `> SCROLL_SEARCH_MAX_ATTEMPTS` cap below).
+        state.pendingThreadLink.attempts || 0
+      : 0) + 1;
+  if (attempts > SCROLL_SEARCH_MAX_ATTEMPTS) {
+    state.pendingThreadLink = null;
+    showToast("couldn't find that thread after searching a long way back — giving up");
+    return;
+  }
+  // Same watchdog `findAndScrollToMessage` uses, and for the same reason
+  // — see its comment. A thread root is just a normal timeline event
+  // found via the exact same `PaginateBack` mechanism, so it's exposed to
+  // the exact same "response silently lost" risk.
+  const searchToken = { roomId, threadRootId, eventId, attempts };
+  state.pendingThreadLink = searchToken;
+  setTimeout(() => {
+    if (state.pendingThreadLink !== searchToken) return;
+    state.paginationInFlight.delete(roomId);
+    resolveThreadLink(roomId, threadRootId, eventId);
+  }, SCROLL_SEARCH_WATCHDOG_MS);
   paginateBack(roomId);
 }
 
@@ -4183,11 +5033,16 @@ function openMatrixToLink(roomId, eventId, threadRootId) {
     }
     return;
   }
-  if (alreadyLoaded) {
-    setTimeout(() => findAndScrollToMessage(roomId, eventId), 50);
-  } else {
-    state.pendingScrollTarget = { roomId, eventId };
-  }
+  // A plain link (no `?thread=` hint — either a link this app made for a
+  // non-thread message, or anyone else's ordinary matrix.to link) might
+  // still point at a thread reply: those are filtered out of the main
+  // timeline entirely (see `Command::ResolveSharedEvent`'s doc comment on
+  // the Rust side), so `findAndScrollToMessage` would paginate the *entire*
+  // room history and still never find one. Ask the server which case this
+  // is before deciding where to look — resolved in the `SharedEventResolved`
+  // handler below.
+  state.pendingSharedEventResolve = { roomId, eventId };
+  send("ResolveSharedEvent", { room_id: roomId, event_id: eventId });
 }
 
 // ---- Boot ----

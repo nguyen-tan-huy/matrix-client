@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use matrix_sdk::config::SyncSettings;
+use eyeball_im::VectorDiff;
+use futures_util::StreamExt;
 use matrix_sdk::ruma::{OwnedEventId, RoomId};
 use matrix_sdk::Client;
+use matrix_sdk_ui::sync_service::SyncService;
 use matrix_sdk_ui::timeline::{RoomExt, Timeline};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 
 use crate::command::Command;
-use crate::event::Event;
+use crate::event::{Event, RoomListKind, RoomListOp};
 use crate::matrix::convert::convert_items;
 use crate::models::RoomSummary;
 
@@ -125,7 +127,7 @@ async fn mutate_pack_content(
             .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok());
         let mut value = existing.unwrap_or_else(|| serde_json::json!({}));
         mutate(&mut value);
-        let raw = matrix_sdk::ruma::serde::Raw::new(&value)?.cast();
+        let raw = matrix_sdk::ruma::serde::Raw::new(&value)?.cast_unchecked();
         client
             .account()
             .set_account_data_raw(
@@ -333,7 +335,7 @@ async fn build_client(homeserver: &str) -> anyhow::Result<Client> {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredSession {
     homeserver: String,
-    session: matrix_sdk::matrix_auth::MatrixSession,
+    session: matrix_sdk::authentication::matrix::MatrixSession,
 }
 
 fn persist_session(client: &Client, homeserver: &str) -> anyhow::Result<()> {
@@ -369,22 +371,6 @@ struct WorkerState {
     /// replies. Absent from the map entirely before the first page loads;
     /// `Some(None)` once the room's oldest thread has been reached.
     thread_list_cursors: HashMap<String, Option<String>>,
-    /// room_id -> (display name, is-encrypted), as last computed by
-    /// `refresh_rooms`. This is what keeps `refresh_rooms` fast on an
-    /// account with thousands of rooms — recomputing `Room::display_name()`
-    /// (a real member-list/store lookup for any room without an explicit
-    /// `m.room.name`, e.g. most DMs) and `Room::is_encrypted()` for every
-    /// single room on every refresh was the actual O(rooms) cost. Now
-    /// those two are only ever recomputed for a room that's actually in
-    /// the current call's dirty set (see `refresh_rooms`'s `dirty`
-    /// parameter) — everything else is served straight from here.
-    room_summary_cache: HashMap<String, (String, bool)>,
-    /// Room IDs that changed since the last `refresh_rooms` call — filled
-    /// in by the sync callback (see `Command::StartSync`) and drained by
-    /// its debouncer task, which passes exactly this set through so a
-    /// burst of activity in a handful of rooms doesn't force a full
-    /// re-scan of every room in the account.
-    dirty_rooms: std::collections::HashSet<String>,
     /// Rooms confirmed read via `Command::MarkRoomRead`, persisted to
     /// `read_state.json` (see that file's doc comment) so it survives a
     /// restart. The read receipt sent to the server is fire-and-forget:
@@ -395,15 +381,26 @@ struct WorkerState {
     /// launch — a room correctly marked read still shows its old unread
     /// badge, possibly forever if nothing else happens in it. An entry
     /// here overrides that stale count to 0. It's removed the moment this
-    /// room shows up in a live sync response again (see `Command::StartSync`'s
-    /// debouncer, which clears it before draining into `dirty_rooms`) —
-    /// at that point the server has necessarily sent *something* new for
-    /// the room (our own receipt being echoed back, if nothing else), so
-    /// its `unread_notification_counts()` is fresh and can be trusted
-    /// directly again. That's what keeps this from becoming the same
-    /// permanent, never-invalidated override that caused the badge to
-    /// hide genuinely new messages before.
+    /// room next shows up in a room-list diff (see `entry_to_summary`,
+    /// which clears it directly — no debounce needed since each diff is
+    /// already scoped to just the room(s) it touched) — at that point the
+    /// server has necessarily sent *something* new for the room (our own
+    /// receipt being echoed back, if nothing else), so its
+    /// `unread_notification_counts()` is fresh and can be trusted directly
+    /// again. That's what keeps this from becoming the same permanent,
+    /// never-invalidated override that caused the badge to hide genuinely
+    /// new messages before.
     confirmed_read: std::collections::HashSet<String>,
+    /// Drives the main room list (sliding sync) — `None` until
+    /// `Command::StartSync` runs. Kept mainly so `sync_service` isn't
+    /// dropped (which would tear down the background sync tasks); nothing
+    /// currently reads it back out.
+    sync_service: Option<Arc<SyncService>>,
+    /// Lets `Command::GrowRoomList` grow the client-side display window of
+    /// the main (non-invite) room list — see `Command::StartSync`'s
+    /// `filters::new_filter_joined()` listener task, which is what creates
+    /// this controller in the first place.
+    room_list_controller: Option<matrix_sdk_ui::room_list_service::RoomListDynamicEntriesController>,
 }
 
 /// Dedicated runtime for `FetchImage`/`PlayVideo`. A room with many images
@@ -457,9 +454,9 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         thread_timelines: HashMap::new(),
         thread_reply_cursors: HashMap::new(),
         thread_list_cursors: HashMap::new(),
-        room_summary_cache: HashMap::new(),
-        dirty_rooms: std::collections::HashSet::new(),
         confirmed_read: load_read_state(),
+        sync_service: None,
+        room_list_controller: None,
     }));
 
     // Normally the frontend asks for this itself (`send("CheckSession")`
@@ -506,7 +503,8 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
             | Command::LoadMoreThreadReplies { .. }
             | Command::ListThreads { .. }
             | Command::SearchUserMessages { .. }
-            | Command::ListAllUsers => {
+            | Command::ListAllUsers
+            | Command::ResolveSharedEvent { .. } => {
                 let cmd_for_task = cmd;
                 timeline_runtime().spawn(async move {
                     if let Err(err) = handle(cmd_for_task, state, tx.clone()).await {
@@ -739,100 +737,172 @@ async fn handle(
             register_sticker_handler(&client, tx.clone());
             crate::matrix::verification::register_verification_handler(&client, tx.clone());
 
-            tracing::info!("starting sync loop");
+            tracing::info!("starting sync (RoomListService / sliding sync, MSC4186)");
 
-            // `refresh_rooms` recomputes `display_name()`/`is_encrypted()`
-            // (both real, `.await`-ed lookups — see `room_summary_cache`'s
-            // doc comment) only for whichever rooms are in its `dirty` set,
-            // reusing the cache for everything else. Calling it straight
-            // from the sync callback for *every room the response touched*
-            // (as this used to, indirectly, by rescanning the whole
-            // account each time) meant one full scan per sync response —
-            // during the initial backfill of a large account, dozens of
-            // responses land in quick succession, turning startup into
-            // O(ticks × rooms) and stalling the room list for a long time.
-            // The callback now just records which room IDs changed into
-            // `state.dirty_rooms`; the debouncer task below drains
-            // whatever accumulated there and coalesces however many ticks
-            // land within its window into a single scan of just those
-            // rooms.
-            let state2 = state.clone();
-            let tx3 = tx.clone();
-            tokio::spawn(async move {
-                let tick = std::sync::atomic::AtomicU64::new(0);
-                let result = client
-                    .sync_with_callback(SyncSettings::default(), move |resp| {
-                        let state2 = state2.clone();
-                        let tick = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        tracing::debug!(
-                            tick,
-                            joined = resp.rooms.join.len(),
-                            left = resp.rooms.leave.len(),
-                            invited = resp.rooms.invite.len(),
-                            to_device = resp.to_device.len(),
-                            "sync response received"
-                        );
-                        async move {
-                            let changed = resp
-                                .rooms
-                                .join
-                                .keys()
-                                .chain(resp.rooms.leave.keys())
-                                .chain(resp.rooms.invite.keys())
-                                .map(|id| id.to_string());
-                            state2.lock().await.dirty_rooms.extend(changed);
-                            matrix_sdk::LoopCtrl::Continue
-                        }
-                    })
-                    .await;
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "sync loop ended");
-                    let _ = tx3.send(Event::Error(format!("sync ended: {e}")));
-                }
-            });
+            // `SyncService` is the SDK's own recommended entry point for
+            // driving `RoomListService` — its own `sync()` stream is
+            // explicitly documented as "should be used only for testing".
+            // This replaces the old unbounded `client.sync_with_callback`
+            // loop. `RoomListService::all_rooms()` starts small and grows
+            // in the background (`SlidingSyncMode::Growing`), which is what
+            // keeps an account with thousands of rooms from stalling the
+            // room list on startup — contrast the removed
+            // `client.rooms()`-based `refresh_rooms`, which pulled every
+            // room in the account on every refresh.
+            let sync_service = SyncService::builder(client.clone()).build().await?;
+            let room_list_service = sync_service.room_list_service();
+            sync_service.start().await;
+            state.lock().await.sync_service = Some(Arc::new(sync_service));
 
-            let state3 = state.clone();
-            let tx4 = tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                    let dirty = {
-                        let mut guard = state3.lock().await;
-                        let dirty = std::mem::take(&mut guard.dirty_rooms);
-                        // These rooms just showed up in an actual sync
-                        // response, so their `unread_notification_counts()`
-                        // is fresh — safe to drop any `confirmed_read`
-                        // override now and trust the server's count
-                        // directly again (see that field's doc comment).
-                        let mut any_removed = false;
-                        for room_id in &dirty {
-                            any_removed |= guard.confirmed_read.remove(room_id);
-                        }
-                        if any_removed {
-                            save_read_state(&guard.confirmed_read);
-                        }
-                        dirty
-                    };
-                    if !dirty.is_empty() {
-                        if let Err(e) = refresh_rooms(&state3, &tx4, Some(&dirty)).await {
-                            tracing::warn!(error = %e, "refresh_rooms failed after sync tick");
-                        }
+            // TEMP diagnostics — logs every RoomListService state
+            // transition (Init/SettingUp/Running/...) so we can see
+            // whether it ever reaches `Running` (which is what flips
+            // `all_rooms` from its small initial selective range into
+            // `Growing` mode).
+            {
+                let mut state_stream = room_list_service.state();
+                tokio::spawn(async move {
+                    while let Some(s) = futures_util::StreamExt::next(&mut state_stream).await {
+                        tracing::info!(?s, "RoomListService state changed");
                     }
-                }
-            });
+                });
+            }
 
-            // Kick an initial room list refresh immediately after starting.
-            // `dirty: None` here means "everything" — the cache starts
-            // empty, so this is the one unavoidable full scan.
-            refresh_rooms(&state, &tx, None).await?;
+            let room_list = Arc::new(room_list_service.all_rooms().await?);
+
+            // TEMP diagnostics — `add_one_page()` silently no-ops if the
+            // server hasn't reported a `maximum_number_of_rooms` yet (or
+            // if the display limit has already caught up to it), which is
+            // exactly the kind of thing that would explain "grow never
+            // does anything." This logs every change to that value.
+            {
+                let mut loading_state_stream = room_list.loading_state();
+                tokio::spawn(async move {
+                    while let Some(s) =
+                        futures_util::StreamExt::next(&mut loading_state_stream).await
+                    {
+                        tracing::info!(?s, "RoomList loading_state changed");
+                    }
+                });
+            }
+
+            // Main (non-invite) room list — client-side-paginated over
+            // whatever `all_rooms` has synced so far (starts at `PAGE_SIZE`,
+            // grows one page at a time via `Command::GrowRoomList`). See
+            // `RoomListOp`'s doc comment for why MSC4186 only supports this
+            // "growing prefix" model rather than true server-side viewport
+            // ranges.
+            {
+                const PAGE_SIZE: usize = 50;
+                let room_list = room_list.clone();
+                let state = state.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (stream, controller) = room_list.entries_with_dynamic_adapters(PAGE_SIZE);
+                    // Stream only starts yielding after a filter is set —
+                    // `new_filter_joined()` also happens to be exactly the
+                    // "not an invite, not left" set this view wants.
+                    controller.set_filter(Box::new(
+                        matrix_sdk_ui::room_list_service::filters::new_filter_joined(),
+                    ));
+                    state.lock().await.room_list_controller = Some(controller);
+                    run_room_list_listener(stream, RoomListKind::Rooms, false, state, tx).await;
+                });
+            }
+
+            // Invites — a second, independent filtered/paginated view over
+            // the *same* underlying `all_rooms` list (MSC4186 doesn't split
+            // invites into their own list the way the older MSC3575 draft
+            // did). Invite counts are always small, so one large fixed page
+            // covers any realistic account without needing to grow it.
+            {
+                const INVITES_PAGE_SIZE: usize = 200;
+                let room_list = room_list.clone();
+                let state = state.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (stream, controller) =
+                        room_list.entries_with_dynamic_adapters(INVITES_PAGE_SIZE);
+                    controller.set_filter(Box::new(
+                        matrix_sdk_ui::room_list_service::filters::new_filter_invite(),
+                    ));
+                    run_room_list_listener(stream, RoomListKind::Invites, true, state, tx).await;
+                });
+            }
+
+            // Spaces (`m.room.create`'s `type: m.space`) are hardcoded out
+            // of `RoomListService`'s own list server-side, and MSC4186 only
+            // supports *excluding* room types from a list filter, not
+            // including only specific ones — so there's no way to ask this
+            // same list for "just the spaces" either. This second, small,
+            // unfiltered sliding-sync session's only job is to get spaces
+            // into the local store at all; `refresh_spaces` (called
+            // whenever this session reports a change) still just reads
+            // `client.rooms()` filtered to `is_space()`, same as the very
+            // first version of this code — safe now because this session
+            // guarantees the local store actually knows about them.
+            {
+                let client = client.clone();
+                let state = state.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_spaces_catchall_sync(client, state, tx).await {
+                        tracing::warn!(error = %e, "spaces catch-all sliding sync failed");
+                    }
+                });
+            }
+
+            // See `run_invites_catchall_sync`'s doc comment — without this,
+            // an invite to a room ranked far below the main list's growing
+            // frontier (by recency) could take arbitrarily long, or never,
+            // to actually surface in the invites tab.
+            {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_invites_catchall_sync(client).await {
+                        tracing::warn!(error = %e, "invites catch-all sliding sync failed");
+                    }
+                });
+            }
+
+            // Nothing left needs `dirty_rooms`'s old "clear stale
+            // confirmed_read overrides" job to run on a fixed timer anymore
+            // — `entry_to_summary` (called straight from each diff as it
+            // arrives, no debounce) clears them the moment a room shows up
+            // fresh in any diff. See that field's doc comment.
         }
 
         Command::RefreshRooms => {
-            refresh_rooms(&state, &tx, None).await?;
+            // No "rescan everything" primitive exists under sliding sync
+            // (the room list is always live) — this now just forces an
+            // immediate Spaces re-scan instead of waiting for the spaces
+            // catch-all session's own next change notification.
+            refresh_spaces(&state, &tx).await?;
+        }
+
+        Command::GrowRoomList => {
+            let controller = state.lock().await.room_list_controller.take();
+            match &controller {
+                Some(_) => tracing::info!("GrowRoomList: calling add_one_page()"),
+                None => tracing::warn!("GrowRoomList: no room_list_controller in state"),
+            }
+            if let Some(controller) = controller {
+                controller.add_one_page();
+                state.lock().await.room_list_controller = Some(controller);
+            }
         }
 
         Command::LoadTimeline { room_id } => {
             let client = get_client(&state).await?;
+            // `room_list_service::Room::subscribe()` — which used to force
+            // the server to keep sending this room's events regardless of
+            // its position in the synced list — doesn't exist in this SDK
+            // version, so this just resolves the room directly. In
+            // practice this is less of a gap than it sounds: opening a
+            // room is itself activity that bumps its recency, keeping it
+            // near the top of `all_rooms`' growing prefix, and the
+            // `Timeline` built below has its own live event-cache
+            // subscription independent of the room list's own sync range.
             let room = client
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
@@ -866,7 +936,7 @@ async fn handle(
                         true
                     })
                     .build()
-                    .await,
+                    .await?,
             );
             state
                 .lock()
@@ -878,17 +948,36 @@ async fn handle(
             // live sync updates from here on, it does not backfill already
             // synced history on its own. Paginate backwards once up front so
             // opening a room actually shows recent messages.
-            if let Err(e) = timeline
-                .paginate_backwards(matrix_sdk_ui::timeline::PaginationOptions::until_num_items(
-                    20, 20,
-                ))
-                .await
-            {
-                tracing::warn!(error = %e, room_id, "initial backward pagination failed");
+            //
+            // In this SDK version `paginate_backwards` is "lazy": one call
+            // can return quickly having fetched few or even zero *new*
+            // events while still reporting `reached_start: false` — its own
+            // doc comment says a subsequent call is what actually triggers
+            // the event cache's real network pagination. Keep calling until
+            // either the room's start is reached or enough items have
+            // accumulated, capped so a slow homeserver can't hang this
+            // command forever.
+            for _ in 0..10 {
+                if timeline.items().await.len() >= 20 {
+                    break;
+                }
+                match timeline.paginate_backwards(20).await {
+                    Ok(true) => {
+                        tracing::info!(room_id, "LoadTimeline: reached room start");
+                        break;
+                    }
+                    Ok(false) => continue,
+                    Err(e) => {
+                        tracing::warn!(error = %e, room_id, "initial backward pagination failed");
+                        break;
+                    }
+                }
             }
 
             let items = timeline.items().await;
+            tracing::info!(room_id, raw_items = items.len(), "LoadTimeline: raw item count");
             let events = convert_items(&client, &items).await;
+            tracing::info!(room_id, converted_events = events.len(), "LoadTimeline: converted event count");
             tx.send(Event::Timeline { room_id, events }).ok();
         }
 
@@ -912,32 +1001,35 @@ async fn handle(
             // fallback below rather than propagated with `?`, so a
             // transient pagination error doesn't leave the UI's
             // "in flight" guard stuck forever for this room.
-            // `until_num_items`, not `simple_request` — since the main
-            // timeline's event_filter (see `Command::LoadTimeline`) drops
-            // thread replies, a single `simple_request` batch of raw
-            // server events can filter down to barely any actual timeline
-            // items in a room with heavy thread traffic (one new message
-            // shown per "load more" instead of ~20). `until_num_items`
-            // keeps fetching further batches until 20 items actually make
-            // it through the filter, or the room's history is exhausted.
-            if let Err(e) = timeline
-                .paginate_backwards(matrix_sdk_ui::timeline::PaginationOptions::until_num_items(
-                    20, 20,
-                ))
-                .await
-            {
-                tracing::warn!(error = %e, room_id, "PaginateBack failed");
-                tx.send(Event::TimelinePrepend {
-                    room_id,
-                    events: Vec::new(),
-                    reached_start: false,
-                })
-                .ok();
-                return Ok(());
+            //
+            // Same "lazy pagination" looping as `Command::LoadTimeline` —
+            // see its comment for why one call isn't enough anymore.
+            let items_before = timeline.items().await.len();
+            let mut reached_start = false;
+            for _ in 0..10 {
+                match timeline.paginate_backwards(20).await {
+                    Ok(true) => {
+                        reached_start = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        if timeline.items().await.len() > items_before {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, room_id, "PaginateBack failed");
+                        tx.send(Event::TimelinePrepend {
+                            room_id,
+                            events: Vec::new(),
+                            reached_start: false,
+                        })
+                        .ok();
+                        return Ok(());
+                    }
+                }
             }
 
-            let reached_start = timeline.back_pagination_status().get()
-                == matrix_sdk_ui::timeline::BackPaginationStatus::TimelineStartReached;
             let items = timeline.items().await;
             let events = convert_items(&client, &items).await;
             tx.send(Event::TimelinePrepend {
@@ -1001,7 +1093,7 @@ async fn handle(
             // which `Timeline` object issued it.
             let timeline = match state.lock().await.room_timelines.get(&room_id).cloned() {
                 Some(t) => t,
-                None => Arc::new(room.timeline().await),
+                None => Arc::new(room.timeline().await?),
             };
             {
                 let mut state = state.lock().await;
@@ -1168,7 +1260,7 @@ async fn handle(
             local_id,
             reply_to_event_id,
         } => {
-            use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
+            use matrix_sdk::ruma::events::relation::Thread;
             use matrix_sdk::ruma::events::room::message::{Relation, RoomMessageEventContent};
 
             let client = get_client(&state).await?;
@@ -1208,9 +1300,9 @@ async fn handle(
                     let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
                     Some(Relation::Thread(Thread::without_fallback(root_event_id)))
                 }
-                (None, Some(reply_id)) => Some(Relation::Reply {
-                    in_reply_to: InReplyTo::new(reply_id),
-                }),
+                (None, Some(reply_id)) => {
+                    Some(Relation::Reply(matrix_sdk::ruma::events::relation::Reply::with_event_id(reply_id)))
+                }
                 (None, None) => None,
             };
 
@@ -1253,7 +1345,7 @@ async fn handle(
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             let content_type: mime::Mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
 
-            let upload = match client.media().upload(&content_type, bytes).await {
+            let upload = match client.media().upload(&content_type, bytes, None).await {
                 Ok(u) => u,
                 Err(e) => {
                     tx.send(Event::MessageSendFailed {
@@ -1334,8 +1426,8 @@ async fn handle(
                     }
 
                     let mut events = Vec::new();
-                    if let Ok(raw_root) = room.event(&root_event_id).await {
-                        if let Ok(value) = raw_root.event.deserialize_as::<serde_json::Value>() {
+                    if let Ok(raw_root) = room.event(&root_event_id, None).await {
+                        if let Ok(value) = raw_root.raw().deserialize_as::<serde_json::Value>() {
                             if let Some(root) = parse_raw_message_event(&client, &room_id, &value).await {
                                 events.push(root);
                             }
@@ -1466,7 +1558,7 @@ async fn handle(
                 None => RoomMessageEventContent::text_plain(body.clone()),
             };
             let mut edit =
-                new_content.make_replacement(ReplacementMetadata::new(target, None), None);
+                new_content.make_replacement(ReplacementMetadata::new(target, None));
             if !mentions.is_empty() {
                 let user_ids: std::collections::BTreeSet<_> = mentions
                     .iter()
@@ -1495,10 +1587,10 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             room.join().await?;
-            // Only this one room actually changed — everyone else's
-            // cached name/encryption is still good (see `refresh_rooms`'s
-            // `dirty` parameter).
-            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
+            // No manual refresh needed: the room moving from the `invites`
+            // list to `all_rooms`/`visible_rooms` server-side produces
+            // diffs on both, which the listener tasks (see
+            // `run_room_list_listener`) forward on their own.
         }
 
         Command::DeclineInvite { room_id } => {
@@ -1507,7 +1599,8 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             room.leave().await?;
-            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
+            // Same reasoning as `AcceptInvite` — the `invites` list's own
+            // diff listener picks up the removal.
         }
 
         Command::InviteUser { room_id, user_id } => {
@@ -1530,7 +1623,13 @@ async fn handle(
                 guard.room_timelines.remove(&room_id);
                 guard.thread_timelines.retain(|(rid, _), _| rid != &room_id);
             }
-            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
+            // No manual room-list refresh needed: once the room actually
+            // disappears from the server's sliding-sync response, the
+            // `all_rooms`/`visible_rooms` diff listener (see
+            // `run_room_list_listener`) picks up the resulting `Remove` on
+            // its own and forwards it to the frontend. There's a small
+            // delay (one sync round trip) before that happens, same as
+            // Element X.
         }
 
         Command::MarkRoomRead { room_id } => {
@@ -1539,17 +1638,15 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
 
-            // `Room::latest_event()` (matrix-sdk-base's own cache) is
-            // reliably empty in this app — never populated without the
-            // RoomListService machinery, which this app doesn't use — so
-            // it silently never had an event to send a receipt for. The
-            // already-loaded per-room `Timeline` (populated by
-            // `Command::LoadTimeline`, and what the UI itself renders
-            // from) actually has events, so get the latest one from there
-            // instead.
+            // The already-loaded per-room `Timeline` (populated by
+            // `Command::LoadTimeline`, and what the UI itself renders from)
+            // is guaranteed to be there and up to date for a room the user
+            // is actively marking read, so get the latest event from it
+            // directly rather than round-tripping through
+            // `RoomListService::room(id).latest_event()`.
             let timeline = state.lock().await.room_timelines.get(&room_id).cloned();
             let latest_event_id = match &timeline {
-                Some(timeline) => timeline.latest_event().await.and_then(|e| e.event_id().map(|id| id.to_owned())),
+                Some(timeline) => timeline.latest_event_id().await,
                 None => None,
             };
 
@@ -1563,13 +1660,12 @@ async fn handle(
                 guard.confirmed_read.insert(room_id.clone());
                 save_read_state(&guard.confirmed_read);
             }
-            // `MarkRoomRead` fires on essentially every message received
-            // while a room is open (see the frontend's live-message
-            // handler), making it by far the most frequent trigger of all
-            // these — scoping it to just this one room is what keeps
-            // reading messages in an active room from ever touching the
-            // other 2999.
-            refresh_rooms(&state, &tx, Some(&std::collections::HashSet::from([room_id]))).await?;
+            // No manual room-list refresh needed here either: the frontend
+            // already zeroes this room's unread badge optimistically the
+            // moment it sends this command (see `app.js`'s mark-read
+            // handler) — it doesn't wait for a round trip. The server will
+            // eventually echo the receipt back through the room-list diff
+            // stream too, confirming the same value.
         }
 
         Command::MarkThreadRead { room_id, thread_root_id, event_id } => {
@@ -1604,17 +1700,23 @@ async fn handle(
             if is_space {
                 request.creation_content = Some(
                     matrix_sdk::ruma::serde::Raw::new(&serde_json::json!({ "type": "m.space" }))?
-                        .cast(),
+                        .cast_unchecked(),
                 );
             }
 
-            let response = client.create_room(request).await?;
-            refresh_rooms(
-                &state,
-                &tx,
-                Some(&std::collections::HashSet::from([response.room_id().to_string()])),
-            )
-            .await?;
+            client.create_room(request).await?;
+            if is_space {
+                // Spaces don't go through `RoomListService` at all (see
+                // `refresh_spaces`) — a new one needs an explicit re-scan
+                // of the dedicated spaces sliding-sync list to show up,
+                // there's no diff listener that would pick it up on its
+                // own the way a regular room's would.
+                refresh_spaces(&state, &tx).await?;
+            }
+            // A regular (non-space) room needs no manual refresh — same
+            // reasoning as `AcceptInvite`/`LeaveRoom`: it'll show up via
+            // the `all_rooms`/`visible_rooms` diff listener once the
+            // server includes it in a sliding-sync response.
         }
 
         Command::ListSpaceChildren { space_room_id } => {
@@ -1676,7 +1778,7 @@ async fn handle(
                     settings
                         .get_default_room_notification_mode(
                             matrix_sdk::notification_settings::IsEncrypted::from(
-                                room.is_encrypted().await.unwrap_or(false),
+                                room.encryption_state().is_encrypted(),
                             ),
                             matrix_sdk::notification_settings::IsOneToOne::from(
                                 room.is_direct().await.unwrap_or(false),
@@ -1717,6 +1819,22 @@ async fn handle(
                 let handle = notify_rust::Notification::new()
                     .summary(&title)
                     .body(&body)
+                    // Without a declared action, clicking the notification
+                    // body on at least mako (confirmed live via
+                    // `dbus-monitor`: identical `Notify` call with an empty
+                    // `actions` array produced only `NotificationClosed`
+                    // reason 2 "dismissed by user" on click, never
+                    // `ActionInvoked`) — and likely other XDG notification
+                    // servers with the same "nothing declared, nothing to
+                    // invoke" behavior — has nothing to invoke, so it just
+                    // dismisses instead of ever firing the `ActionInvoked`
+                    // signal `wait_for_action_async` below is listening
+                    // for. The label ("Open") only matters for a server
+                    // that renders an actual button for it; mako (and
+                    // GNOME/KDE) treat the "default" id specially as "the
+                    // action invoked by clicking the body itself" and never
+                    // show a button for it at all.
+                    .action("default", "Open")
                     .show_async()
                     .await;
                 if let Ok(handle) = handle {
@@ -1737,7 +1855,14 @@ async fn handle(
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 let _ = tokio::task::spawn_blocking(move || {
-                    let handle = notify_rust::Notification::new().summary(&title).body(&body).show();
+                    // See the unix branch's comment above on why an
+                    // explicit "default" action is needed for a body click
+                    // to ever produce a `NotificationResponse::Default`.
+                    let handle = notify_rust::Notification::new()
+                        .summary(&title)
+                        .body(&body)
+                        .action("default", "Open")
+                        .show();
                     if let Ok(handle) = handle {
                         let _ = handle.wait_for_response(|response: &notify_rust::NotificationResponse| {
                             if matches!(response, notify_rust::NotificationResponse::Default) {
@@ -1818,7 +1943,7 @@ async fn handle(
         } => {
             let client = get_client(&state).await?;
             let content_type: mime::Mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
-            let upload = client.media().upload(&content_type, bytes).await?;
+            let upload = client.media().upload(&content_type, bytes, None).await?;
             let url = upload.content_uri.to_string();
 
             mutate_pack_content(&client, &room_id, &scope, |content| {
@@ -1880,6 +2005,41 @@ async fn handle(
             tx.send(Event::AllUsers { users }).ok();
         }
 
+        Command::ResolveSharedEvent { room_id, event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_event_id = OwnedEventId::try_from(event_id.as_str())?;
+
+            let (found, thread_root_id) = match room.event(&parsed_event_id, None).await {
+                Ok(raw_event) => {
+                    // Same raw-JSON check `convert_item` uses to keep thread
+                    // replies out of the main timeline in the first place —
+                    // reused here (rather than ruma's typed `Relation`,
+                    // which only exists on `RoomMessageEventContent`) so
+                    // this works for a shared link to a threaded sticker or
+                    // any other event type too.
+                    let root = raw_event
+                        .raw()
+                        .deserialize_as::<serde_json::Value>()
+                        .ok()
+                        .filter(|v| {
+                            v.pointer("/content/m.relates_to/rel_type").and_then(|v| v.as_str())
+                                == Some("m.thread")
+                        })
+                        .and_then(|v| {
+                            v.pointer("/content/m.relates_to/event_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                        });
+                    (true, root)
+                }
+                Err(_) => (false, None),
+            };
+            tx.send(Event::SharedEventResolved { room_id, event_id, found, thread_root_id }).ok();
+        }
+
         Command::SendMeme { room_id, thread_id, url, shortcode } => {
             tracing::info!(room_id, ?thread_id, url, shortcode, "SendMeme: command received");
             let client = get_client(&state).await?;
@@ -1930,20 +2090,22 @@ async fn handle(
                 // needing to (there, `register_new_message_handler`
                 // already does this for a typed `Relation::Thread` image).
                 let sender = client.user_id().map(|id| id.to_string()).unwrap_or_default();
-                let sender_name = match client.user_id() {
-                    Some(id) => room
-                        .get_member(id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|m| m.display_name().map(|n| n.to_string()))
-                        .unwrap_or_else(|| sender.clone()),
-                    None => sender.clone(),
+                let own_member = match client.user_id() {
+                    Some(id) => room.get_member(id).await.ok().flatten(),
+                    None => None,
                 };
+                let sender_name = own_member
+                    .as_ref()
+                    .and_then(|m| m.display_name().map(|n| n.to_string()))
+                    .unwrap_or_else(|| sender.clone());
+                let sender_avatar_url = own_member
+                    .as_ref()
+                    .and_then(|m| m.avatar_url().map(|u| u.to_string()));
                 let event = crate::models::TimelineEvent {
-                    event_id: response.event_id.to_string(),
+                    event_id: response.response.event_id.to_string(),
                     sender,
                     sender_name,
+                    sender_avatar_url,
                     body: shortcode,
                     msg_type: "image".to_string(),
                     media_url: Some(url),
@@ -2144,9 +2306,79 @@ async fn handle(
                 }
             }
         }
+
+        Command::GetOwnProfile => {
+            let client = get_client(&state).await?;
+            send_own_profile(&client, &tx).await;
+        }
+
+        Command::SetDisplayName { name } => {
+            let client = get_client(&state).await?;
+            let name = name.trim();
+            let value = if name.is_empty() { None } else { Some(name) };
+            match client.account().set_display_name(value).await {
+                Ok(()) => send_own_profile(&client, &tx).await,
+                Err(e) => {
+                    tx.send(Event::Error(format!("failed to set display name: {e}")))
+                        .ok();
+                }
+            }
+        }
+
+        Command::SetAvatar { bytes, mime } => {
+            let client = get_client(&state).await?;
+            let content_type: mime::Mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
+            match client.account().upload_avatar(&content_type, bytes).await {
+                Ok(mxc_uri) => match client.account().set_avatar_url(Some(&mxc_uri)).await {
+                    Ok(()) => send_own_profile(&client, &tx).await,
+                    Err(e) => {
+                        tx.send(Event::Error(format!("failed to set avatar: {e}")))
+                            .ok();
+                    }
+                },
+                Err(e) => {
+                    tx.send(Event::Error(format!("avatar upload failed: {e}")))
+                        .ok();
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Reads the logged-in user's own display name + avatar straight from the
+/// homeserver (not just the local cache — `get_display_name`/`get_avatar_url`
+/// both call `Account::fetch_user_profile` under the hood) and reports it as
+/// `Event::OwnProfile`. Shared by `Command::GetOwnProfile` and by
+/// `SetDisplayName`/`SetAvatar` on success, so the profile panel always
+/// shows what the server actually has rather than the UI's own guess at
+/// what its write did.
+async fn send_own_profile(client: &Client, tx: &UnboundedSender<Event>) {
+    let user_id = match client.user_id() {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+    let display_name = client
+        .account()
+        .get_display_name()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| user_id.clone());
+    let avatar_url = client
+        .account()
+        .get_avatar_url()
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.to_string());
+    tx.send(Event::OwnProfile(crate::models::OwnProfile {
+        user_id,
+        display_name,
+        avatar_url,
+    }))
+    .ok();
 }
 
 async fn get_client(state: &Arc<Mutex<WorkerState>>) -> anyhow::Result<Client> {
@@ -2158,131 +2390,344 @@ async fn get_client(state: &Arc<Mutex<WorkerState>>) -> anyhow::Result<Client> {
         .ok_or_else(|| anyhow::anyhow!("not logged in"))
 }
 
-/// Rebuilds the room list. `dirty` is the set of room IDs whose
-/// `display_name()`/`is_encrypted()` actually need recomputing this call —
-/// `None` means "everything" (only used for the one unavoidable full scan
-/// right after `StartSync`, when the cache is still empty). Every other
-/// room reuses whatever's in `room_summary_cache` from the last time it
-/// was computed. See that field's doc comment for why this matters: those
-/// two calls are the real O(rooms) cost here, and on an account with
-/// thousands of rooms, redoing them for all of them on every refresh (the
-/// original behavior) is what made the room list slow to begin with.
-async fn refresh_rooms(
+/// Converts one `room_list_service::RoomListItem` (a real, resolved room —
+/// MSC4186/this SDK version has no "not-yet-synced placeholder" concept the
+/// way the older MSC3575 draft's `RoomListEntry::Empty` did) into a
+/// `RoomSummary`.
+///
+/// Deliberately does *not* reuse a cross-call cache the way the old
+/// `refresh_rooms` (removed by this migration) did for `display_name()`/
+/// `is_encrypted()` — this is now only ever called for rooms that actually
+/// appear in a diff batch (i.e. currently in the synced growing-list
+/// prefix), not for the whole account on every tick, so recomputing those
+/// two real `.await`-ed lookups fresh every time is cheap.
+async fn entry_to_summary(
+    room: &matrix_sdk_ui::room_list_service::RoomListItem,
+    is_invite: bool,
     state: &Arc<Mutex<WorkerState>>,
-    tx: &UnboundedSender<Event>,
-    dirty: Option<&std::collections::HashSet<String>>,
-) -> anyhow::Result<()> {
-    let client = get_client(state).await?;
-    let (room_timelines, mut summary_cache, confirmed_read) = {
-        let guard = state.lock().await;
-        (
-            guard.room_timelines.clone(),
-            guard.room_summary_cache.clone(),
-            guard.confirmed_read.clone(),
-        )
+) -> RoomSummary {
+    let room_id_str = room.room_id().to_string();
+
+    // This room just showed up in a diff, i.e. sliding sync just sent
+    // something fresh for it — drop any stale `confirmed_read` override
+    // for it now (see that field's doc comment): its
+    // `unread_notification_counts()` below is fresh and can be trusted.
+    {
+        let mut guard = state.lock().await;
+        if guard.confirmed_read.remove(&room_id_str) {
+            save_read_state(&guard.confirmed_read);
+        }
+    }
+
+    let name = room
+        .display_name()
+        .await
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| room_id_str.clone());
+    let is_encrypted = room.encryption_state().is_encrypted();
+
+    // Prefer an already-open `Timeline` (see `Command::LoadTimeline`) for
+    // the preview text — it's what the UI itself renders from when the
+    // room is open, so it's never stale; walk its items from the end to
+    // find the last actual event (skipping virtual items like date
+    // dividers), converting the same way the main timeline view does
+    // (`convert_item`) so every `TimelineItemContent` shape is handled
+    // consistently in one place. Otherwise fall back to
+    // `Room::latest_event()` (`matrix_sdk_base`'s own cache) — reliably
+    // populated here since every sliding-sync list sets a
+    // `timeline_limit`, so the server always sends at least the most
+    // recent event for any room actually synced.
+    let room_timelines = state.lock().await.room_timelines.clone();
+    let (last_message, last_message_ts) = if let Some(timeline) = room_timelines.get(&room_id_str)
+    {
+        let client = room.client();
+        let items = timeline.items().await;
+        let mut result = (None, 0);
+        for item in items.iter().rev() {
+            if let Some(converted) = crate::matrix::convert::convert_item(&client, item).await {
+                result = (Some(converted.body), converted.timestamp);
+                break;
+            }
+        }
+        result
+    } else {
+        // `RoomExt::latest_event()` (same trait `.timeline()` comes from)
+        // gives back matrix-sdk-ui's own richer `LatestEventValue`, with a
+        // typed `TimelineItemContent` already resolved — same shape
+        // `convert_item` reads from a `Timeline`'s items, so extract the
+        // body the same way rather than re-deriving it from raw JSON.
+        match room.latest_event().await {
+            matrix_sdk_ui::timeline::LatestEventValue::Remote { timestamp, content, .. } => {
+                let body = match &content {
+                    matrix_sdk_ui::timeline::TimelineItemContent::MsgLike(msg_like) => {
+                        match &msg_like.kind {
+                            matrix_sdk_ui::timeline::MsgLikeKind::Message(m) => {
+                                Some(m.msgtype().body().to_string())
+                            }
+                            matrix_sdk_ui::timeline::MsgLikeKind::Redacted => {
+                                Some("[message removed]".to_string())
+                            }
+                            matrix_sdk_ui::timeline::MsgLikeKind::Sticker(s) => {
+                                Some(s.content().body.clone())
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                (body, timestamp.get().into())
+            }
+            _ => (None, 0),
+        }
     };
-    let mut summaries = Vec::new();
+
+    // NOT `unread_notification_counts()` (the server-computed one) — its
+    // own doc comment warns it "might be incorrect for encrypted rooms,
+    // since the server doesn't know which events are relevant standalone
+    // messages ... nor can it inspect mentions", and in practice on this
+    // (almost entirely E2EE) account it came back 0 for essentially every
+    // room regardless of how many messages Element showed as unread.
+    // `num_unread_notifications()` is matrix-sdk's own client-side count
+    // (derived from read receipts vs. actual decrypted events), which is
+    // what Element itself falls back to for the same reason.
+    let unread_count = room.num_unread_notifications();
+
+    RoomSummary {
+        room_id: room_id_str,
+        name,
+        last_message,
+        last_message_ts,
+        unread_count,
+        is_encrypted,
+        is_invite,
+        is_space: false,
+        is_loading: false,
+    }
+}
+
+/// Consumes one filtered/paginated view of `RoomListService::all_rooms()`
+/// (see `Command::StartSync`, which builds one of these per
+/// `RoomListKind`) and forwards every diff batch to the frontend as
+/// `Event::RoomListUpdate`, mapping `eyeball_im::VectorDiff<Room>` 1:1 onto
+/// `RoomListOp` (converting each room via `entry_to_summary` along the
+/// way). Runs for as long as the stream keeps producing — i.e. the
+/// lifetime of the sync session — or until the frontend event channel
+/// closes.
+async fn run_room_list_listener(
+    stream: impl futures_util::Stream<Item = Vec<VectorDiff<matrix_sdk_ui::room_list_service::RoomListItem>>>,
+    kind: RoomListKind,
+    is_invite: bool,
+    state: Arc<Mutex<WorkerState>>,
+    tx: UnboundedSender<Event>,
+) {
+    let mut stream = std::pin::pin!(stream);
+    tracing::info!(?kind, "run_room_list_listener: stream started");
+
+    while let Some(diffs) = stream.next().await {
+        let summary: Vec<String> = diffs
+            .iter()
+            .map(|d| match d {
+                VectorDiff::Append { values } => format!("Append({})", values.len()),
+                VectorDiff::Clear => "Clear".to_string(),
+                VectorDiff::PushFront { .. } => "PushFront".to_string(),
+                VectorDiff::PushBack { .. } => "PushBack".to_string(),
+                VectorDiff::PopFront => "PopFront".to_string(),
+                VectorDiff::PopBack => "PopBack".to_string(),
+                VectorDiff::Insert { index, .. } => format!("Insert({index})"),
+                VectorDiff::Set { index, .. } => format!("Set({index})"),
+                VectorDiff::Remove { index } => format!("Remove({index})"),
+                VectorDiff::Truncate { length } => format!("Truncate({length})"),
+                VectorDiff::Reset { values } => format!("Reset({})", values.len()),
+            })
+            .collect();
+        tracing::info!(?kind, ?summary, "run_room_list_listener: diff batch received");
+        let mut ops = Vec::with_capacity(diffs.len());
+        for diff in diffs {
+            let op = match diff {
+                VectorDiff::Append { values } => {
+                    let mut out = Vec::with_capacity(values.len());
+                    for room in values.iter() {
+                        out.push(entry_to_summary(room, is_invite, &state).await);
+                    }
+                    RoomListOp::Append { values: out }
+                }
+                VectorDiff::Clear => RoomListOp::Clear,
+                VectorDiff::PushFront { value } => RoomListOp::PushFront {
+                    value: entry_to_summary(&value, is_invite, &state).await,
+                },
+                VectorDiff::PushBack { value } => RoomListOp::PushBack {
+                    value: entry_to_summary(&value, is_invite, &state).await,
+                },
+                VectorDiff::PopFront => RoomListOp::PopFront,
+                VectorDiff::PopBack => RoomListOp::PopBack,
+                VectorDiff::Insert { index, value } => RoomListOp::Insert {
+                    index: index as u32,
+                    value: entry_to_summary(&value, is_invite, &state).await,
+                },
+                VectorDiff::Set { index, value } => {
+                    let summary = entry_to_summary(&value, is_invite, &state).await;
+                    tracing::info!(
+                        ?kind,
+                        index,
+                        room_id = %summary.room_id,
+                        unread_count = summary.unread_count,
+                        "run_room_list_listener: Set diff computed"
+                    );
+                    RoomListOp::Set {
+                        index: index as u32,
+                        value: summary,
+                    }
+                }
+                VectorDiff::Remove { index } => RoomListOp::Remove { index: index as u32 },
+                VectorDiff::Truncate { length } => RoomListOp::Truncate {
+                    length: length as u32,
+                },
+                VectorDiff::Reset { values } => {
+                    let mut out = Vec::with_capacity(values.len());
+                    for room in values.iter() {
+                        out.push(entry_to_summary(room, is_invite, &state).await);
+                    }
+                    RoomListOp::Reset { values: out }
+                }
+            };
+            ops.push(op);
+        }
+        if tx.send(Event::RoomListUpdate { list: kind, ops }).is_err() {
+            break;
+        }
+    }
+}
+
+/// Drives the small, unfiltered, always-growing sliding-sync session whose
+/// only job is to get Spaces into the local store (see `refresh_spaces`'s
+/// doc comment for why that needs its own session at all under MSC4186).
+/// Calls `refresh_spaces` after the initial sync and again after every
+/// subsequent update — cheap, since `refresh_spaces` itself only iterates
+/// whatever's already in the local store, filtered to `is_space()`.
+/// Invites depend on the invited room's *server-side sort position* (by
+/// recency, mixed in with every joined room) ever falling within the main
+/// room list's currently-synced "growing" range — `entries_with_dynamic_adapters`
+/// (see the `Invites` listener in `Command::StartSync`) only filters/shows
+/// whatever `client.rooms_stream()` already knows about locally, and a room
+/// only enters that local store once *some* sliding-sync list has actually
+/// fetched it from the server. On a large (3000+ room) account, an invite
+/// to an old/quiet room can rank far below where the growing frontier has
+/// reached, so it silently never shows up in the invites tab at all.
+///
+/// The obvious fix — a dedicated sliding-sync list using the server-side
+/// `is_invite` filter (MSC4186 / ruma's `ListFilters::is_invite`), so
+/// ranking wouldn't matter at all — turned out not to work: tested live
+/// against a room confirmed still pending in Element, this homeserver's
+/// `is_invite` filter came back with zero rooms regardless (same rough
+/// shape as its other confirmed MSC4186 bug, the 500 on the rel_type-scoped
+/// `/relations` route — see `fetch_thread_replies_page`). So instead this
+/// uses `SlidingSyncMode::Growing` with *no* filter and no cap — its
+/// request generator (see `sliding_sync/list/request_generator.rs`)
+/// auto-widens its requested range by `batch_size` on every subsequent
+/// tick of the loop below on its own, with no manual driving needed (unlike
+/// `RoomListDynamicEntriesController::add_one_page()`, which only advances
+/// a client-side *display* cap over data some list already fetched, not
+/// the server-side fetch itself) — so this session eventually fetches
+/// every room on the account into the local store, guaranteeing the
+/// invite shows up there eventually regardless of its rank. No `Event`
+/// needs sending from here: the existing `Invites`
+/// `entries_with_dynamic_adapters` listener already watches
+/// `client.rooms_stream()` and picks up each newly-known invited room on
+/// its own the moment this session fetches it.
+async fn run_invites_catchall_sync(client: Client) -> anyhow::Result<()> {
+    use matrix_sdk::sliding_sync::{SlidingSyncList, SlidingSyncMode};
+
+    let list = SlidingSyncList::builder("invites")
+        .sync_mode(SlidingSyncMode::new_growing(200))
+        .timeline_limit(0u32);
+
+    let sliding_sync = client
+        .sliding_sync("invites-catchall")?
+        .add_list(list)
+        .build()
+        .await?;
+
+    let stream = sliding_sync.sync();
+    let mut stream = std::pin::pin!(stream);
+    while let Some(result) = stream.next().await {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "invites catch-all sliding sync tick failed");
+        }
+    }
+    tracing::warn!("invites catch-all sliding sync loop ended");
+    Ok(())
+}
+
+async fn run_spaces_catchall_sync(
+    client: Client,
+    state: Arc<Mutex<WorkerState>>,
+    tx: UnboundedSender<Event>,
+) -> anyhow::Result<()> {
+    let sliding_sync = client.sliding_sync("spaces-catchall")?.build().await?;
+
+    let stream = sliding_sync.sync();
+    let mut stream = std::pin::pin!(stream);
+    while let Some(result) = stream.next().await {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "spaces catch-all sliding sync tick failed");
+            continue;
+        }
+        if let Err(e) = refresh_spaces(&state, &tx).await {
+            tracing::warn!(error = %e, "refresh_spaces failed");
+        }
+    }
+    tracing::warn!("spaces catch-all sliding sync loop ended");
+    Ok(())
+}
+
+/// Rebuilds the Space list from `client.rooms()`, filtered to `is_space()`
+/// — the same approach the very first version of this code used for
+/// *every* room. Spaces are excluded from `RoomListService`'s own list
+/// server-side (MSC4186 only supports *excluding* room types from a list
+/// filter, not including only specific ones, so there's no way to ask for
+/// "just the spaces" instead), which is why `run_spaces_catchall_sync`'s
+/// separate, unfiltered sliding-sync session exists — its only job is to
+/// make sure spaces actually end up in the local store this reads from.
+/// Sends a full replacement snapshot, not a diff — spaces are always few
+/// on any account, so re-reading the whole small set fresh (including
+/// `compute_display_name()`/`is_encrypted()` for each) on every call is
+/// not a performance concern the way it was for the 3000+-room main list
+/// this migration is about.
+async fn refresh_spaces(state: &Arc<Mutex<WorkerState>>, tx: &UnboundedSender<Event>) -> anyhow::Result<()> {
+    let client = get_client(state).await?;
+    let mut spaces = Vec::new();
 
     for room in client.rooms() {
+        if !room.is_space() {
+            continue;
+        }
         let is_invite = match room.state() {
             matrix_sdk::RoomState::Joined => false,
             matrix_sdk::RoomState::Invited => true,
-            _ => continue, // left/banned rooms: skip
+            _ => continue, // left/banned: skip
         };
+        let name = room
+            .display_name()
+            .await
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| room.room_id().to_string());
+        let is_encrypted = room.encryption_state().is_encrypted();
 
-        let room_id_str = room.room_id().to_string();
-        // Recompute for a room this call was actually told changed, or
-        // one that's never been seen before (nothing to reuse yet) — every
-        // other room is served straight from the cache.
-        let needs_recompute = match dirty {
-            Some(dirty) => dirty.contains(&room_id_str),
-            None => true,
-        } || !summary_cache.contains_key(&room_id_str);
-
-        let (name, is_encrypted) = if needs_recompute {
-            let name = room
-                .display_name()
-                .await
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| room.room_id().to_string());
-            let is_encrypted = room.is_encrypted().await.unwrap_or(false);
-            summary_cache.insert(room_id_str.clone(), (name.clone(), is_encrypted));
-            (name, is_encrypted)
-        } else {
-            // `needs_recompute` is false only when this key is present, so
-            // the fallback here is unreachable in practice — just avoids
-            // an `.unwrap()`.
-            summary_cache
-                .get(&room_id_str)
-                .cloned()
-                .unwrap_or_else(|| (room_id_str.clone(), false))
-        };
-
-        // `Room::latest_event()` (matrix-sdk-base's own cache) is
-        // reliably empty in this app — it's never populated without the
-        // RoomListService machinery, which this app doesn't use — so
-        // fall back to it only when there's no better source. For a room
-        // whose `Timeline` is already loaded (i.e. it's been opened this
-        // session — see `Command::LoadTimeline`), that timeline's own
-        // latest event is what the UI itself renders from and always has
-        // real data, so prefer it.
-        let timeline_latest = match room_timelines.get(room.room_id().as_str()) {
-            Some(timeline) => timeline.latest_event().await,
-            None => None,
-        };
-        let (last_message, last_message_ts) = match &timeline_latest {
-            Some(event) => (
-                event.content().as_message().map(|m| m.body().to_string()),
-                event.timestamp().get().into(),
-            ),
-            None => match room.latest_event() {
-                Some(event) => {
-                    let value: serde_json::Value =
-                        event.event().event.deserialize_as().unwrap_or_default();
-                    let body = value
-                        .pointer("/content/body")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    let ts = value
-                        .get("origin_server_ts")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    (body, ts)
-                }
-                None => (None, 0),
-            },
-        };
-
-        summaries.push(RoomSummary {
+        spaces.push(RoomSummary {
             room_id: room.room_id().to_string(),
             name,
-            last_message,
-            last_message_ts,
-            // Server-reported count, unless this room is in
-            // `confirmed_read` (see that field's doc comment) — forced to
-            // 0 while it's present, which only lasts until the room next
-            // shows up in an actual live sync response (cleared by
-            // `Command::StartSync`'s debouncer), so it can never
-            // permanently mask real unread state.
-            unread_count: if confirmed_read.contains(room.room_id().as_str()) {
-                0
-            } else {
-                room.unread_notification_counts().notification_count
-            },
+            last_message: None,
+            last_message_ts: 0,
+            unread_count: 0,
             is_encrypted,
             is_invite,
-            is_space: room.is_space(),
+            is_space: true,
+            is_loading: false,
         });
     }
 
-    // Invites first (need action), then by recent activity.
-    summaries.sort_by(|a, b| {
-        b.is_invite
-            .cmp(&a.is_invite)
-            .then(b.last_message_ts.cmp(&a.last_message_ts))
-    });
-    state.lock().await.room_summary_cache = summary_cache;
-    tx.send(Event::Rooms(summaries)).ok();
+    spaces.sort_by(|a, b| a.name.cmp(&b.name));
+    tx.send(Event::Spaces(spaces)).ok();
     Ok(())
 }
 
@@ -2377,7 +2822,7 @@ async fn fetch_threads_page(
     request.limit = Some(UInt::from(50u32));
     request.include = get_threads::v1::IncludeThreads::All;
 
-    let response = client.send(request, None).await?;
+    let response = client.send(request).await?;
 
     let room = client.get_room(&parsed_room_id);
     let mut page = Vec::new();
@@ -2463,7 +2908,7 @@ async fn search_user_messages(
             };
 
             for raw in &response.chunk {
-                let Ok(value) = raw.event.deserialize_as::<serde_json::Value>() else {
+                let Ok(value) = raw.raw().deserialize_as::<serde_json::Value>() else {
                     continue;
                 };
                 // Checked before the sender match below (and not skipped
@@ -2529,7 +2974,7 @@ async fn parse_thread_root(
     // Same raw-`/threads`-bypasses-decryption issue as `/relations` —
     // see `decrypt_if_needed`'s doc comment.
     let value = match room {
-        Some(room) => decrypt_if_needed(room, raw.cast_ref(), value).await,
+        Some(room) => decrypt_if_needed(room, raw.cast_ref_unchecked(), value).await,
         None => value,
     };
     let mut event = parse_raw_message_event(client, room_id, &value).await?;
@@ -2563,7 +3008,9 @@ async fn fetch_thread_replies_page(
     root_event_id: &matrix_sdk::ruma::EventId,
     from: Option<String>,
 ) -> (Vec<crate::models::TimelineEvent>, Option<String>) {
-    use matrix_sdk::ruma::api::client::relations::get_relating_events_with_rel_type;
+    use matrix_sdk::ruma::api::client::relations::{
+        get_relating_events, get_relating_events_with_rel_type,
+    };
     use matrix_sdk::ruma::events::relation::RelationType;
 
     let mut request = get_relating_events_with_rel_type::v1::Request::new(
@@ -2571,19 +3018,59 @@ async fn fetch_thread_replies_page(
         root_event_id.to_owned(),
         RelationType::Thread,
     );
-    request.from = from;
+    request.from = from.clone();
     request.limit = Some(matrix_sdk::ruma::UInt::from(20u32));
 
-    let response = match client.send(request, None).await {
-        Ok(r) => r,
+    // This homeserver (confirmed via testing) 500s on the `rel_type`-scoped
+    // route specifically (`/relations/{eventId}/m.thread`) for every
+    // thread tried, while the un-scoped route (`/relations/{eventId}`,
+    // just "every relation of any kind", filtered down to `m.thread`
+    // below) works fine — a server-side routing bug on their end, not
+    // something wrong with this request. Falling back rather than just
+    // giving up keeps threads usable on servers with that bug instead of
+    // silently showing 0 replies.
+    let (chunk, next_batch) = match client.send(request).await {
+        Ok(r) => (r.chunk, r.next_batch),
         Err(e) => {
-            tracing::warn!(error = %e, room_id, %root_event_id, "fetching thread relations failed");
-            return (Vec::new(), None);
+            tracing::warn!(
+                error = %e,
+                room_id,
+                %root_event_id,
+                "fetching rel_type-scoped thread relations failed, falling back to unscoped /relations"
+            );
+            let mut fallback_request = get_relating_events::v1::Request::new(
+                room.room_id().to_owned(),
+                root_event_id.to_owned(),
+            );
+            fallback_request.from = from;
+            fallback_request.limit = Some(matrix_sdk::ruma::UInt::from(20u32));
+            match client.send(fallback_request).await {
+                Ok(r) => {
+                    let chunk = r
+                        .chunk
+                        .into_iter()
+                        .filter(|raw| {
+                            raw.get_field::<serde_json::Value>("content")
+                                .ok()
+                                .flatten()
+                                .and_then(|content| content.get("m.relates_to").cloned())
+                                .and_then(|rel| rel.get("rel_type").cloned())
+                                .and_then(|v| v.as_str().map(|s| s == "m.thread"))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    (chunk, r.next_batch)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, room_id, %root_event_id, "fallback thread relations fetch also failed");
+                    return (Vec::new(), None);
+                }
+            }
         }
     };
 
     let mut replies = Vec::new();
-    for raw in &response.chunk {
+    for raw in &chunk {
         if let Ok(value) = raw.deserialize_as::<serde_json::Value>() {
             let value = decrypt_if_needed(room, raw, value).await;
             if let Some(event) = parse_raw_message_event(client, room_id, &value).await {
@@ -2593,7 +3080,7 @@ async fn fetch_thread_replies_page(
     }
     replies.reverse();
 
-    let next_batch = response.next_batch.filter(|n| !n.is_empty());
+    let next_batch = next_batch.filter(|n| !n.is_empty());
     (replies, next_batch)
 }
 
@@ -2614,9 +3101,9 @@ async fn decrypt_if_needed(
     if value.get("type").and_then(|v| v.as_str()) != Some("m.room.encrypted") {
         return value;
     }
-    match room.decrypt_event(raw.cast_ref()).await {
+    match room.decrypt_event(raw.cast_ref_unchecked(), None).await {
         Ok(decrypted) => decrypted
-            .event
+            .raw()
             .deserialize_as::<serde_json::Value>()
             .unwrap_or(value),
         Err(e) => {
@@ -2658,7 +3145,7 @@ async fn fetch_reaction_events(
     );
     request.limit = Some(matrix_sdk::ruma::UInt::from(100u32));
 
-    let response = match client.send(request, None).await {
+    let response = match client.send(request).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, %event_id, "fetching reactions failed");
@@ -2818,6 +3305,7 @@ async fn parse_raw_message_event(
     let mentioned_user_ids = crate::matrix::convert::mentioned_user_ids_from_content(content);
 
     let sender_name = resolve_sender_name(client, room_id, &sender_str).await;
+    let sender_avatar_url = resolve_sender_avatar_url(client, room_id, &sender_str).await;
 
     // A thread root's bundled aggregation (same `unsigned.m.relations.m.thread`
     // block `thread_count` above comes from) also carries the thread's most
@@ -2858,6 +3346,7 @@ async fn parse_raw_message_event(
         event_id,
         sender: sender_str,
         sender_name,
+        sender_avatar_url,
         body,
         msg_type,
         media_url,
@@ -2933,6 +3422,20 @@ async fn resolve_sender_name(client: &Client, room_id: &str, sender_str: &str) -
         },
         Err(_) => sender_str.to_string(),
     }
+}
+
+/// Same lookup as `resolve_sender_name`, for the sender's avatar instead of
+/// their display name.
+async fn resolve_sender_avatar_url(client: &Client, room_id: &str, sender_str: &str) -> Option<String> {
+    let user_id = matrix_sdk::ruma::OwnedUserId::try_from(sender_str).ok()?;
+    let room = matrix_sdk::ruma::RoomId::parse(room_id)
+        .ok()
+        .and_then(|rid| client.get_room(&rid))?;
+    room.get_member(&user_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.avatar_url().map(|u| u.to_string()))
 }
 
 /// Whether `content."m.mentions".user_ids` names `user_id` — used for
@@ -3013,7 +3516,7 @@ async fn download_media_bytes(
 
     let file: matrix_sdk::ruma::events::room::EncryptedFile = serde_json::from_str(encryption_json)?;
     let mut cursor = std::io::Cursor::new(ciphertext);
-    let mut decryptor = matrix_sdk::crypto::AttachmentDecryptor::new(&mut cursor, file.into())?;
+    let mut decryptor = matrix_sdk_crypto::AttachmentDecryptor::new(&mut cursor, file.into())?;
     let mut decrypted = Vec::new();
     std::io::Read::read_to_end(&mut decryptor, &mut decrypted)?;
     Ok(decrypted)
@@ -3125,7 +3628,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                 // through the `/relations` path (`parse_raw_message_event`)
                 // that already had this check.
                 let reply_to_event_id = match &ev.content.relates_to {
-                    Some(Relation::Reply { in_reply_to }) => Some(in_reply_to.event_id.to_string()),
+                    Some(Relation::Reply(reply)) => Some(reply.in_reply_to.event_id.to_string()),
                     Some(Relation::Thread(thread)) if !thread.is_falling_back => {
                         thread.in_reply_to.as_ref().map(|r| r.event_id.to_string())
                     }
@@ -3139,13 +3642,14 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                 // `@user:server` ID instead of their display name — the
                 // other conversion paths (`convert.rs`, `parse_raw_message_event`)
                 // already resolve this, this one just never did.
-                let sender_name = room
-                    .get_member(&ev.sender)
-                    .await
-                    .ok()
-                    .flatten()
+                let member = room.get_member(&ev.sender).await.ok().flatten();
+                let sender_name = member
+                    .as_ref()
                     .and_then(|m| m.display_name().map(|n| n.to_string()))
                     .unwrap_or_else(|| sender.clone());
+                let sender_avatar_url = member
+                    .as_ref()
+                    .and_then(|m| m.avatar_url().map(|u| u.to_string()));
 
                 let (body, msg_type, media_url, thumbnail_url, media_mime, media_encryption) =
                     crate::matrix::convert::message_type_fields(&ev.content.msgtype);
@@ -3178,6 +3682,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     event_id: ev.event_id.to_string(),
                     sender,
                     sender_name,
+                    sender_avatar_url,
                     body,
                     msg_type,
                     media_url,
@@ -3206,6 +3711,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     })
                     .ok();
                 } else {
+                    tracing::info!(room_id = %room_id, "register_new_message_handler: NewMessage received (live event handler fired)");
                     tx.send(Event::NewMessage { room_id, event }).ok();
                 }
             }
@@ -3241,21 +3747,23 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                 }
 
                 let sender = ev.sender.to_string();
-                let sender_name = room
-                    .get_member(&ev.sender)
-                    .await
-                    .ok()
-                    .flatten()
+                let member = room.get_member(&ev.sender).await.ok().flatten();
+                let sender_name = member
+                    .as_ref()
                     .and_then(|m| m.display_name().map(|n| n.to_string()))
                     .unwrap_or_else(|| sender.clone());
+                let sender_avatar_url = member
+                    .as_ref()
+                    .and_then(|m| m.avatar_url().map(|u| u.to_string()));
 
                 let event = crate::models::TimelineEvent {
                     event_id: ev.event_id.to_string(),
                     sender,
                     sender_name,
+                    sender_avatar_url,
                     body: ev.content.body,
                     msg_type: "image".to_string(),
-                    media_url: Some(ev.content.url.to_string()),
+                    media_url: crate::matrix::convert::sticker_mxc_of(&ev.content.source),
                     media_mime: None,
                     media_encryption: None,
                     thumbnail_url: None,

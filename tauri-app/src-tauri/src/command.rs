@@ -14,12 +14,25 @@ pub enum Command {
         homeserver: String,
     },
     StartSync,
-    /// Recomputes the whole room list (names, previews, unread counts) from
-    /// the client's current local state and re-sends it to the frontend —
-    /// the same full scan `StartSync` does once on startup, exposed as a
-    /// user-triggered "reload" so the room list/unread badges can be forced
-    /// to catch up without waiting for `dirty_rooms` to pick it up.
+    /// Under `RoomListService` (sliding sync) there's no "rescan everything"
+    /// primitive anymore — the room list is always live. This now just
+    /// forces an immediate re-scan of Spaces (see `refresh_spaces`, which
+    /// otherwise only runs on its own 800ms-debounced tick) as a
+    /// user-triggered "reload" for that one part still not fully live.
     RefreshRooms,
+    /// The user scrolled near the bottom of the room list — grow the
+    /// client-side display window by one more page (see
+    /// `RoomListDynamicEntriesController::add_one_page`). This is the
+    /// mechanism this app's actual homeserver protocol (MSC4186 /
+    /// "Simplified Sliding Sync") supports: unlike the older MSC3575 draft,
+    /// there's no server-side "sync exactly rows N..M" concept — the server
+    /// just syncs a growing prefix of the (server-sorted) room list, and
+    /// the client asks for a bigger prefix as the user scrolls further.
+    /// What actually keeps a 3000+-room account from stalling on startup is
+    /// that this prefix starts small and only grows on demand, instead of
+    /// the old unbounded `client.rooms()` scan pulling in every room at
+    /// once (see `Command::StartSync`).
+    GrowRoomList,
     LoadTimeline {
         room_id: String,
     },
@@ -353,4 +366,39 @@ pub enum Command {
     /// require already knowing/typing their exact `@name:server` id.
     /// Answered with `Event::AllUsers`.
     ListAllUsers,
+    /// Looks up a single event by ID and reports back (via
+    /// `Event::SharedEventResolved`) whether it exists and, if so, whether
+    /// it's a thread reply — and if it is, that thread's root event ID.
+    /// Exists because a plain `matrix.to` link (the standard shared-message
+    /// format, and what this app itself generates when the shared message
+    /// isn't in a thread) carries no such hint, but a thread reply is
+    /// filtered out of the main room timeline entirely (see
+    /// `convert_item`'s `has_thread_relation` check) — so without this,
+    /// "jump to shared message" for a thread reply would paginate the
+    /// *entire* room history through the wrong timeline and never find it.
+    ResolveSharedEvent {
+        room_id: String,
+        event_id: String,
+    },
+    /// Reads the logged-in user's own global profile (display name +
+    /// avatar) — the profile panel asks this when it opens. Answered with
+    /// `Event::OwnProfile`.
+    GetOwnProfile,
+    /// Sets the logged-in user's global display name. Like Element, this
+    /// only updates the account-wide profile; the homeserver is what
+    /// decides whether/how that then propagates into rooms the user is
+    /// already joined to (see `Event::OwnProfile`'s doc comment). Answered
+    /// with a fresh `Event::OwnProfile` on success, `Event::Error`
+    /// otherwise.
+    SetDisplayName {
+        name: String,
+    },
+    /// Uploads `bytes` as a new avatar image and sets it as the logged-in
+    /// user's global avatar — same upload path as `Command::SendImage`.
+    /// Answered with a fresh `Event::OwnProfile` on success, `Event::Error`
+    /// otherwise.
+    SetAvatar {
+        bytes: Vec<u8>,
+        mime: String,
+    },
 }

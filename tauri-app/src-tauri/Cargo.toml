@@ -18,22 +18,40 @@ anyhow = "1"
 
 tokio = { version = "1", features = ["full"] }
 
-# rustls instead of native-tls: one TLS stack on every target, including
-# Android (no OS-provided TLS lib to link against there, unlike
-# native-tls's schannel/security-framework/openssl per-platform backends).
-matrix-sdk = { version = "0.7", default-features = false, features = [
-    "rustls-tls",
+# Bumped straight to latest (0.18, from the original 0.7) — the homeserver
+# in use here only speaks "Simplified Sliding Sync" (MSC4186), which 0.7
+# doesn't understand at all (404s), and 0.8 (the first version that does
+# support it) turned out to have its own bug: `RoomListService`'s built-in
+# growing-room-list mechanism (`add_one_page()`) silently never grows,
+# because its internal gate depends on the server ever reporting a
+# `maximum_number_of_rooms`, which this server never did in testing. Later
+# releases are the most likely place that got fixed, and going to latest
+# also means TLS backend selection is no longer a feature toggle here at
+# all — rustls is unconditionally baked into `matrix-sdk` as of this
+# version (see its `Cargo.toml`), so neither crate below needs a
+# `rustls-tls` feature listed anymore.
+matrix-sdk = { version = "=0.18.0", default-features = false, features = [
     "e2e-encryption",
     "sqlite",
     "sso-login",
 ] }
-matrix-sdk-ui = { version = "0.7", default-features = false, features = [
-    "rustls-tls",
-    "e2e-encryption",
-] }
+matrix-sdk-ui = { version = "=0.18.0", default-features = false }
+# `matrix_sdk::crypto` (a re-export of this crate matrix-sdk-base provided)
+# is gone in 0.18 — `AttachmentDecryptor` (used to decrypt downloaded
+# media in an encrypted room) now needs this named directly.
+matrix-sdk-crypto = { version = "=0.18.0", default-features = false }
+# Named directly (matrix-sdk/reqwest already pull it in transitively) so
+# `lib.rs`'s `run()` can call `install_default()` on it at startup — see
+# the comment there for why that call is required at all.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
+# Named to match the version matrix-sdk-ui/matrix-sdk already pull in
+# transitively (see Cargo.lock) — promoted to a direct dependency so this
+# crate can name `VectorDiff<T>` itself when converting `RoomListService`'s
+# diff stream into IPC events (see `matrix/worker.rs`'s room-list code).
+eyeball-im = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mime = "0.3"
@@ -82,7 +100,12 @@ tauri-plugin-deep-link = "2"
 # Neither the Android NDK nor iOS ships a linkable libsqlite3 the way
 # desktop OSes do — matrix-sdk-sqlite's `rusqlite` needs to compile its
 # own copy from source there instead of dynamically linking one. Pinning
-# the same version matrix-sdk-sqlite (0.7.1) pulls in makes Cargo unify
+# the same version matrix-sdk-sqlite (0.18.0) pulls in makes Cargo unify
 # the two into one build with this feature turned on, rather than two
 # separate `rusqlite` copies.
-rusqlite = { version = "0.30", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Windows cross-compile (mingw) host has no system libsqlite3 to link
+# against either — same fix as the mobile block above, bundle it.
+[target.'cfg(target_os = "windows")'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }

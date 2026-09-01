@@ -1,0 +1,14 @@
+{
+  "$schema": "./gen/schemas/windows-schema.json",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Matrix",
+        "width": 1100,
+        "height": 720,
+        "decorations": true
+      }
+    ]
+  }
+}

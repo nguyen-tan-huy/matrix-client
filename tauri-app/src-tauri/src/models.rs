@@ -16,6 +16,13 @@ pub struct RoomSummary {
     /// holds no messages of its own, just `m.space.child` links to other
     /// rooms. Drives the space-picker row in the room list.
     pub is_space: bool,
+    /// True when this summary came from a `RoomListEntry::Invalidated` —
+    /// data that was synced at some point but just fell out of the
+    /// server's synced range (e.g. scrolled away from) and may be stale.
+    /// `RoomListEntry::Empty` (never synced at all) isn't represented as a
+    /// `RoomSummary` in the first place — see `entry_to_summary` in
+    /// `matrix/worker.rs`.
+    pub is_loading: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -23,6 +30,13 @@ pub struct TimelineEvent {
     pub event_id: String,
     pub sender: String,
     pub sender_name: String,
+    /// The sender's `mxc://` avatar, resolved the same way `sender_name`
+    /// is (room-specific member profile, or the raw event's bundled
+    /// sender profile for a live/raw-JSON-parsed event) — `None` when
+    /// they have no avatar set. Fetched through the same `FetchImage` /
+    /// `state.imageCache` path as message attachments in `app.js`, keyed
+    /// by this URL.
+    pub sender_avatar_url: Option<String>,
     pub body: String,
     pub msg_type: String, // "text" | "image" | "video" | "file" | "notice" | "other"
     pub media_url: Option<String>, // mxc:// of the main media (image/video/file)
@@ -124,6 +138,17 @@ pub struct UserSearchHit {
     pub room_id: String,
     pub room_name: String,
     pub event: TimelineEvent,
+}
+
+/// The logged-in user's own profile — response to `Command::GetOwnProfile`,
+/// and re-sent after `Command::SetDisplayName`/`SetAvatar` succeed so the
+/// profile panel always reflects what the server actually has, rather than
+/// the UI just assuming its own write went through.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OwnProfile {
+    pub user_id: String,
+    pub display_name: String,
+    pub avatar_url: Option<String>,
 }
 
 /// One image in a room's custom emoji/sticker pack (`im.ponies.room_emotes`

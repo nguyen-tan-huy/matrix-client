@@ -105,6 +105,22 @@ fn read_clipboard_image() -> Result<Option<Vec<u8>>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // rustls can't auto-select a default `CryptoProvider` when more than
+    // one backend is reachable in the dependency graph — and here both
+    // `aws-lc-rs` (reqwest's own default) and `ring` (pulled in
+    // transitively via `rustls-platform-verifier` -> `rustls-webpki`) are,
+    // confirmed via `cargo tree -i ring`/`-i aws-lc-rs`. Without this call,
+    // the very first TLS connection (e.g. the OAuth/SSO login flow's
+    // `get_login_types()` request) panics the whole tokio worker thread
+    // instead of returning an error — observed on Android via `adb
+    // logcat` as a silent "nothing happens" from the UI's perspective
+    // (the panicked task just never sends its response back), which is
+    // what made this look like "the browser doesn't open" rather than
+    // "the app already crashed before it got that far". Desktop builds
+    // happened to not hit this in testing, but the ambiguity is real
+    // there too — this call is unconditional for all targets.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     // Runs under native Wayland — unlike the old egui/winit version, GTK's
     // own Wayland input-method integration (`gtk-im-context-wayland`)
     // registers correctly with fcitx5 here (`frontend:wayland_v2`,
@@ -277,6 +293,23 @@ pub fn run() {
                     }
                 });
             }
+            // `decorations: false` in tauri.conf.json makes the window
+            // fully frameless — deliberate on Linux (this app has no
+            // custom drag-region/titlebar built in the frontend to stand
+            // in for one, but that's fine under a tiling WM, which doesn't
+            // need one anyway) but on Windows it meant no titlebar at all:
+            // the window's title ("Matrix") was never shown, and there was
+            // no OS-provided way to move/minimize/maximize/close it.
+            // `tauri.windows.conf.json` overrides `decorations: true` back
+            // on for Windows builds specifically — merged into the base
+            // config by `tauri-build`'s build.rs based on the actual
+            // compile target (`CARGO_CFG_TARGET_OS`), so this applies even
+            // to a plain `cargo build --target x86_64-pc-windows-gnu`, not
+            // just `cargo tauri build`. A previous attempt did this at
+            // runtime instead, via `window.set_decorations(true)` right
+            // here — moved to config so the window is created with its
+            // real titlebar from the start rather than toggled on after
+            // the frameless one already rendered.
 
             Ok(())
         })

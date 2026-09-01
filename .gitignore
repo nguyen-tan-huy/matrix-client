@@ -11,6 +11,12 @@ node_modules/
 *.sqlite3
 matrix-egui-client-session.json
 
+# Android release signing key — never commit.
+*.jks
+*.keystore
+*.keystore.pass.txt
+keystore.properties
+
 # Local editor/OS cruft.
 .DS_Store
 *.swp

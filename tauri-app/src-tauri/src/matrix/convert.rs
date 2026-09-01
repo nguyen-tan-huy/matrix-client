@@ -1,6 +1,6 @@
 use matrix_sdk::Client;
 use matrix_sdk_ui::timeline::{
-    TimelineDetails, TimelineItem, TimelineItemContent, VirtualTimelineItem,
+    MsgLikeKind, TimelineDetails, TimelineItem, TimelineItemContent, VirtualTimelineItem,
 };
 use std::sync::Arc;
 
@@ -10,6 +10,19 @@ fn mxc_of(source: &matrix_sdk::ruma::events::room::MediaSource) -> Option<String
     match source {
         matrix_sdk::ruma::events::room::MediaSource::Plain(uri) => Some(uri.to_string()),
         matrix_sdk::ruma::events::room::MediaSource::Encrypted(file) => Some(file.url.to_string()),
+    }
+}
+
+/// Same idea as `mxc_of`, but for a sticker's own (differently-typed, if
+/// structurally identical) media source — `m.sticker` doesn't carry
+/// encryption info in this app (no `Encrypted` handling below, matching
+/// this app's pre-existing sticker support), so any variant other than
+/// `Plain` is treated as "no URL" rather than guessed at.
+pub fn sticker_mxc_of(source: &matrix_sdk::ruma::events::sticker::StickerMediaSource) -> Option<String> {
+    match source {
+        matrix_sdk::ruma::events::sticker::StickerMediaSource::Plain(uri) => Some(uri.to_string()),
+        #[allow(unreachable_patterns)]
+        _ => None,
     }
 }
 
@@ -135,67 +148,81 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         .map(|id| id == event.sender())
         .unwrap_or(false);
 
-    let sender_name = match event.sender_profile() {
-        TimelineDetails::Ready(profile) => profile.display_name.clone(),
-        _ => None,
-    }
-    .unwrap_or_else(|| sender.clone());
+    let (sender_name, sender_avatar_url) = match event.sender_profile() {
+        TimelineDetails::Ready(profile) => (
+            profile.display_name.clone(),
+            profile.avatar_url.as_ref().map(|u| u.to_string()),
+        ),
+        _ => (None, None),
+    };
+    let sender_name = sender_name.unwrap_or_else(|| sender.clone());
 
     let (body, msg_type, media_url, thumbnail_url, media_mime, media_encryption) = match event.content() {
-        TimelineItemContent::Message(msg) => {
-            let msgtype = msg.msgtype();
-            let fields = message_type_fields(msgtype);
-            if fields.1 == "other" {
-                let raw_msgtype = msgtype.msgtype();
-                let body = fields.0;
-                let mxc = raw_media_url(event);
-                tracing::debug!(
-                    msgtype = raw_msgtype,
-                    body,
-                    recovered_media_url = mxc.is_some(),
-                    "unrecognized MessageType"
-                );
-                match (raw_msgtype, mxc) {
-                    (t, Some(mxc)) if t == "m.image" => {
-                        (body, "image".to_string(), Some(mxc), None, None, None)
+        // 0.18 groups `Message`/`Sticker`/redactions/UTDs together under
+        // one `MsgLike` variant (previously each was its own top-level
+        // `TimelineItemContent` variant) — see `MsgLikeKind`.
+        TimelineItemContent::MsgLike(msg_like) => match &msg_like.kind {
+            MsgLikeKind::Message(msg) => {
+                let msgtype = msg.msgtype();
+                let fields = message_type_fields(msgtype);
+                if fields.1 == "other" {
+                    let raw_msgtype = msgtype.msgtype();
+                    let body = fields.0;
+                    let mxc = raw_media_url(event);
+                    tracing::debug!(
+                        msgtype = raw_msgtype,
+                        body,
+                        recovered_media_url = mxc.is_some(),
+                        "unrecognized MessageType"
+                    );
+                    match (raw_msgtype, mxc) {
+                        (t, Some(mxc)) if t == "m.image" => {
+                            (body, "image".to_string(), Some(mxc), None, None, None)
+                        }
+                        (t, Some(mxc)) if t == "m.video" => {
+                            (body, "video".to_string(), Some(mxc), None, None, None)
+                        }
+                        (_, Some(mxc)) => (body, "file".to_string(), Some(mxc), None, None, None),
+                        (_, None) => (body, "other".to_string(), None, None, None, None),
                     }
-                    (t, Some(mxc)) if t == "m.video" => {
-                        (body, "video".to_string(), Some(mxc), None, None, None)
-                    }
-                    (_, Some(mxc)) => (body, "file".to_string(), Some(mxc), None, None, None),
-                    (_, None) => (body, "other".to_string(), None, None, None, None),
+                } else {
+                    fields
                 }
-            } else {
-                fields
             }
-        }
-        TimelineItemContent::RedactedMessage => (
-            "[message removed]".to_string(),
-            "notice".to_string(),
-            None,
-            None,
-            None,
-            None,
-        ),
-        TimelineItemContent::Sticker(sticker) => {
-            let content = sticker.content();
-            (
-                content.body.clone(),
-                "image".to_string(),
-                Some(content.url.to_string()),
+            MsgLikeKind::Redacted => (
+                "[message removed]".to_string(),
+                "notice".to_string(),
                 None,
-                content.info.mimetype.clone(),
                 None,
-            )
-        }
-        TimelineItemContent::UnableToDecrypt(_) => (
-            "[unable to decrypt]".to_string(),
-            "notice".to_string(),
-            None,
-            None,
-            None,
-            None,
-        ),
+                None,
+                None,
+            ),
+            MsgLikeKind::Sticker(sticker) => {
+                let content = sticker.content();
+                (
+                    content.body.clone(),
+                    "image".to_string(),
+                    sticker_mxc_of(&content.source),
+                    None,
+                    content.info.mimetype.clone(),
+                    None,
+                )
+            }
+            MsgLikeKind::UnableToDecrypt(_) => (
+                "[unable to decrypt]".to_string(),
+                "notice".to_string(),
+                None,
+                None,
+                None,
+                None,
+            ),
+            // Polls, live locations, and custom message-like events aren't
+            // rendered by this app — same "hide, don't dump raw structs"
+            // treatment as membership/profile/other-state changes below.
+            MsgLikeKind::Poll(_) | MsgLikeKind::LiveLocation(_) | MsgLikeKind::Other(_) => {
+                return None;
+            }
+        },
         TimelineItemContent::FailedToParseMessageLike { event_type, .. } => (
             format!("[unsupported event: {event_type}]"),
             "notice".to_string(),
@@ -251,6 +278,7 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         event_id: event.event_id()?.to_string(),
         sender,
         sender_name,
+        sender_avatar_url,
         body,
         msg_type,
         media_url,
@@ -398,21 +426,24 @@ fn reply_preview(
         return (None, None);
     };
 
-    let TimelineItemContent::Message(msg) = event.content() else {
+    let TimelineItemContent::MsgLike(msg_like) = event.content() else {
         return (Some(event_id), None);
     };
-    let Some(in_reply_to) = msg.in_reply_to() else {
+    let Some(in_reply_to) = &msg_like.in_reply_to else {
         return (Some(event_id), None);
     };
     let TimelineDetails::Ready(replied) = &in_reply_to.event else {
         return (Some(event_id), None);
     };
 
-    let sender = replied.sender().to_string();
-    let snippet = match replied.content() {
-        TimelineItemContent::Message(m) => m.msgtype().body().to_string(),
-        TimelineItemContent::RedactedMessage => "[message removed]".to_string(),
-        TimelineItemContent::Sticker(s) => s.content().body.clone(),
+    let sender = replied.sender.to_string();
+    let snippet = match &replied.content {
+        TimelineItemContent::MsgLike(reply_msg_like) => match &reply_msg_like.kind {
+            MsgLikeKind::Message(m) => m.msgtype().body().to_string(),
+            MsgLikeKind::Redacted => "[message removed]".to_string(),
+            MsgLikeKind::Sticker(s) => s.content().body.clone(),
+            _ => "[attachment]".to_string(),
+        },
         _ => "[attachment]".to_string(),
     };
     (Some(event_id), Some(format!("{sender}: {snippet}")))
@@ -443,7 +474,7 @@ pub async fn convert_items<'a>(
 ) -> Vec<TimelineEvent> {
     let mut out = Vec::new();
     for item in items {
-        if matches!(item.as_virtual(), Some(VirtualTimelineItem::DayDivider(_))) {
+        if matches!(item.as_virtual(), Some(VirtualTimelineItem::DateDivider(_))) {
             continue;
         }
         if let Some(event) = convert_item(client, item).await {
