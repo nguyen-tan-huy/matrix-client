@@ -698,7 +698,9 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 4px;
-  z-index: 10;
+  /* Same #side-panel-outranking reasoning as `.actions-menu` above — see
+   * its comment. */
+  z-index: 25;
 }
 /* Floating corner icon for a bubble with no reactions yet — costs no
  * layout space (only ever shown on hover, same idea as `.msg-menu-trigger`),
@@ -762,7 +764,17 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 4px;
-  z-index: 10;
+  /* Must outrank #side-panel's z-index: 20 (the mobile full-screen
+   * overlay for threads/security) for the same reason `.dialog-backdrop`
+   * already does — opened from *inside* that panel (the thread panel's
+   * own "⋯"/react buttons), this is appended to <body>, a *sibling* of
+   * #side-panel rather than a descendant of it, so without outranking it
+   * the popup rendered behind the full-screen panel instead of over it:
+   * invisible, even though the trigger button underneath it worked fine.
+   * Still below .dialog-backdrop's 30, since a dialog opened from one of
+   * these (there isn't one currently, but nothing should assume there
+   * won't be) should still land on top of it. */
+  z-index: 25;
   min-width: 110px;
 }
 .actions-menu button {
@@ -799,8 +811,20 @@ button:disabled { color: var(--text-weak); cursor: default; }
 #pending-image-preview img, #thread-pending-image-preview img { max-height: 120px; display: block; }
 #pending-image-preview .actions, #thread-pending-image-preview .actions { margin-top: 4px; display: flex; gap: 6px; }
 
+/* A full-width row of its own, directly above `#compose-row` — not nested
+ * above just the textarea inside `.compose-editor-wrap` (the older
+ * layout). That version left the icon buttons (attach/meme/voice/poll)
+ * flex-end-aligned against a *two-row-tall* sibling (toolbar+textarea
+ * stacked), so they sat only against the textarea's row while the
+ * toolbar floated alone above them with a dead, empty gap to its
+ * left — worse the more icon buttons got added (see git history: went
+ * from clearly-annoying-but-tolerable with 2 icons to genuinely broken-
+ * looking once voice/poll made it 4). A same-width, always-one-row
+ * `#compose-row` below this fixes that regardless of how many icon
+ * buttons it ever has. */
+.compose-toolbar { display: flex; gap: 2px; padding: 4px 8px 0 8px; }
+.compose-toolbar .md-btn { font-size: 11px; padding: 1px 6px; }
 #compose-row {
-  border-top: 1px solid var(--border);
   padding: 8px;
   display: flex;
   gap: 6px;
@@ -810,17 +834,16 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * button, rather than drifting to the vertical center of a tall box. */
   align-items: flex-end;
 }
-/* Wraps the toolbar + textarea as one flex item so the attach/meme/send
- * buttons on either side of it don't have to know it's two rows, not one. */
+/* Border lives here now (was on `#compose-row` before the toolbar moved
+ * out of it) — this is the actual top edge of the whole compose area
+ * again, toolbar included, rather than a line that used to cut between
+ * the toolbar and the room's last message. */
+#compose-toolbar { border-top: 1px solid var(--border); }
 .compose-editor-wrap {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  gap: 3px;
 }
-.compose-toolbar { display: flex; gap: 2px; }
-.compose-toolbar .md-btn { font-size: 11px; padding: 1px 6px; }
 .compose-textarea {
   width: 100%;
   resize: none;
@@ -1033,7 +1056,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   button, input, textarea, select { font-size: 15px; }
   .small-btn { padding: 6px 10px; }
   .room-row { padding: 12px 8px; }
-  #compose-send, #btn-attach, #btn-meme { padding: 8px 10px; }
+  #compose-send, #btn-compose-plus { padding: 8px 10px; }
   .jump-latest-btn { width: 44px; height: 44px; font-size: 18px; }
 
   /* Desktop's 62% cap (see `.msg-col`'s own comment for why it's there —
@@ -1049,7 +1072,11 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * touchscreen at all — tied to the same tap-to-reveal `.actions-open`
    * state instead (see the bubble tap handler in app.js that adds it).
    * All three stay absolutely positioned on the bubble's own corner, so
-   * no layout change needed here, only visibility. */
+   * no layout change needed here, only visibility. (An always-visible
+   * variant was tried and reverted — this tap-to-reveal behavior itself
+   * wasn't the actual complaint; the real bug was the popup these buttons
+   * open not appearing at all in the thread panel on Android — see
+   * `openActionsMenu`/`openReactionPicker`'s z-index fix.) */
   .msg-row .msg-menu-trigger,
   .msg-row .reaction-add,
   .msg-row .reaction-trigger {
@@ -1061,3 +1088,128 @@ button:disabled { color: var(--text-weak); cursor: default; }
     visibility: visible;
   }
 }
+
+/* Light theme — applied via inline custom-property overrides on
+ * `documentElement` when the user explicitly picks "light" from the "[
+ * theme: ... ]" button (see `applyThemeOverride()`/`state.themeOverride`
+ * in app.js), same mechanism `applySystemTheme()` already uses for the
+ * Linux/GTK-driven theme. Values live there, not in a CSS block here,
+ * since inline styles are what has to win over the `:root` defaults above
+ * — a `prefers-color-scheme` media block can't (this app intentionally
+ * ignores that signal; see the empty block above). This comment is the
+ * only trace of the palette in this file; the actual hex values are
+ * `LIGHT_PALETTE` in app.js.
+ */
+
+/* "X is typing..." banner, floating over the bottom of the timeline just
+ * above the jump-to-latest button rather than pushing the message list up
+ * — same "doesn't reflow anything else" reasoning as `.jump-latest-btn`. */
+#typing-indicator {
+  position: absolute;
+  left: 12px;
+  bottom: 6px;
+  font-size: 11px;
+  color: var(--text-weak);
+  font-style: italic;
+  background: var(--bg);
+  padding: 2px 8px;
+  border-radius: 10px;
+  pointer-events: none;
+}
+
+/* Pinned-message banner, between the room header and the timeline —
+ * a fixed strip (not inside the message list) so it stays visible while
+ * scrolling, same idea as a room's topic bar in most chat clients. */
+#pinned-banner {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+#pinned-banner:hover { background: color-mix(in srgb, var(--accent) 18%, var(--bg)); }
+#pinned-banner .pinned-icon { flex-shrink: 0; }
+#pinned-banner .pinned-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-weak);
+}
+
+/* Presence dot — small colored circle next to a member's name/avatar.
+ * Color conveys state on its own (green/gray/amber) rather than needing a
+ * label everywhere it's used, same as every other chat app's online dot. */
+.presence-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-weak);
+}
+.presence-dot.online { background: #6fce8f; }
+.presence-dot.unavailable { background: var(--accent); }
+.presence-dot.offline { background: var(--text-weak); }
+
+/* Voice message playback — the fetched/decrypted bytes are handed to
+ * `<audio>` as a data: URL, same `state.imageCache` pipeline images use
+ * (see `requestImage`/`ImageBytes` in app.js). Capped to the same width as
+ * other attachments so a voice bubble doesn't stretch wider than an image
+ * or file one next to it. */
+.bubble audio { max-width: 260px; height: 32px; display: block; }
+
+/* Compose-box voice recording state — the "+" button (`#btn-compose-plus`,
+ * which opens the attach/emoji/voice/poll menu the rest of the time) gets
+ * `.recording` while `MediaRecorder` is active (see
+ * `toggleVoiceRecording()`) and doubles as the stop button — a pulsing red
+ * dot standing in for a waveform/timer without needing either built. */
+#btn-compose-plus.recording {
+  color: var(--danger);
+  border-color: var(--danger);
+  animation: recording-pulse 1.2s ease-in-out infinite;
+}
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Poll — question, one row per option (a click target the full width of
+ * the bar, so voting doesn't need a separate radio/checkbox), a filled
+ * bar behind the text showing that option's current share of the vote. */
+.poll { min-width: 220px; }
+.poll .poll-question { font-weight: bold; margin-bottom: 6px; }
+.poll .poll-option {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  overflow: hidden;
+  font-size: 12px;
+}
+.poll .poll-option:hover { border-color: var(--accent); }
+.poll .poll-option.voted { border-color: var(--accent-strong); }
+.poll .poll-option-fill {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  z-index: 0;
+  /* width set inline per-option */
+}
+.poll .poll-option-label {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.poll .poll-meta { color: var(--text-weak); font-size: 11px; margin-top: 4px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.poll.ended .poll-option { cursor: default; }
+.poll-list-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; margin-bottom: 8px; }
+.poll-list-room { color: var(--text-weak); font-size: 11px; margin-bottom: 4px; }

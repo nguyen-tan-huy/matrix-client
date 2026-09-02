@@ -214,6 +214,45 @@ const state = {
   // actually a thread reply before deciding where to look for it — see
   // `openMatrixToLink`. Cleared by the matching `SharedEventResolved`.
   pendingSharedEventResolve: null, // { roomId, eventId }
+
+  // room_id -> [user_id] currently typing (excludes ourselves — the
+  // backend already filters that out). Only ever populated for whichever
+  // one room `Command::WatchTyping` last subscribed to (see `selectRoom`).
+  typingUsers: {},
+  // room_id -> `RoomInfo` (name/topic/avatar_url + can_set_* flags) — see
+  // `Command::GetRoomInfo`. `null`/absent until the room settings dialog
+  // (or the pinned-banner/room-header code checking `can_set_*`) has asked
+  // at least once.
+  roomInfo: {},
+  // room_id -> [event_id] currently pinned, most-recently-pinned last (the
+  // server's own `m.room.pinned_events` order). Absent until
+  // `Command::GetPinnedEvents` has answered for that room at least once.
+  pinnedEvents: {},
+  // user_id -> `PresenceInfo` (see `Command::GetPresence`) — a session-wide
+  // cache, not scoped to one room, since the same person can show up in
+  // several rooms' member lists.
+  presence: {},
+  // "roomId|eventId" -> `TimelineEvent` | `null` (fetched, not found/
+  // unparseable) — see `getEventPreview`/`Command::GetEventPreview`. Absent
+  // entirely means never requested yet.
+  eventPreviews: {},
+  // poll_event_id -> `PollData` — every poll this session has seen, either
+  // from `Command::StartPoll`/`VotePoll`/`EndPoll`'s own answer, a live
+  // vote/end update, or `Command::ListPolls`.
+  polls: {},
+  // Whether the polls-list dialog is currently open for this room, so a
+  // live `Event::PollUpdated` while it's open can re-render it in place
+  // instead of only updating `state.polls` silently until it's reopened.
+  pollsDialogRoomId: null,
+  // `null` (follow the system/GTK theme, this app's original behavior) |
+  // "light" | "dark" — the "[ theme: ... ]" button in the chats menu,
+  // persisted to `localStorage` so it survives a restart. See
+  // `applyThemeOverride()`.
+  themeOverride: null,
+  // `MediaRecorder` instance + captured chunks/analyser while a voice
+  // message is being recorded — `null` when not recording. See
+  // `toggleVoiceRecording()`.
+  voiceRecording: null,
 };
 
 // ---- DOM refs ----
@@ -236,6 +275,8 @@ const el = {
   btnReloadRooms: document.getElementById("btn-reload-rooms"),
   btnGlobalThreads: document.getElementById("btn-global-threads"),
   btnUserSearch: document.getElementById("btn-user-search"),
+  btnMessageSearch: document.getElementById("btn-message-search"),
+  btnTheme: document.getElementById("btn-theme"),
   btnShortcuts: document.getElementById("btn-shortcuts"),
   btnChatsMenu: document.getElementById("btn-chats-menu"),
   chatsMenu: document.getElementById("chats-menu"),
@@ -249,9 +290,14 @@ const el = {
   btnInvite: document.getElementById("btn-invite"),
   btnLeaveRoom: document.getElementById("btn-leave-room"),
   notificationMode: document.getElementById("notification-mode"),
+  btnRoomSettings: document.getElementById("btn-room-settings"),
+  btnPins: document.getElementById("btn-pins"),
+  btnPolls: document.getElementById("btn-polls"),
   btnSummarize: document.getElementById("btn-summarize"),
+  pinnedBanner: document.getElementById("pinned-banner"),
   timeline: document.getElementById("timeline"),
   btnJumpLatest: document.getElementById("btn-jump-latest"),
+  typingIndicator: document.getElementById("typing-indicator"),
   replyIndicator: document.getElementById("reply-indicator"),
   editIndicator: document.getElementById("edit-indicator"),
   mentionSuggestions: document.getElementById("mention-suggestions"),
@@ -260,8 +306,7 @@ const el = {
   composeInput: document.getElementById("compose-input"),
   composeToolbar: document.getElementById("compose-toolbar"),
   composeSend: document.getElementById("compose-send"),
-  btnAttach: document.getElementById("btn-attach"),
-  btnMeme: document.getElementById("btn-meme"),
+  btnComposePlus: document.getElementById("btn-compose-plus"),
   memePicker: document.getElementById("meme-picker"),
   fileInput: document.getElementById("file-input"),
   importKeysFileInput: document.getElementById("import-keys-file-input"),
@@ -1086,6 +1131,7 @@ function selectRoom(roomId) {
   el.timelineTitle.textContent = room ? room.name : roomId;
   el.timelineHeaderActions.style.display = "flex";
   el.composeRow.style.display = "flex";
+  el.composeToolbar.style.display = "flex";
   // Opening a room opens its threads list by default (rather than
   // leaving `rightPanel` closed until the user hits Ctrl+T) — same
   // request/state shape as `openRoomThreadsList()`, inlined instead of
@@ -1123,6 +1169,12 @@ function selectRoom(roomId) {
   updateNotificationModeUi();
   send("GetNotificationMode", { room_id: roomId });
   updateThreadsButtonBadge();
+
+  send("WatchTyping", { room_id: roomId });
+  send("GetRoomInfo", { room_id: roomId });
+  send("GetPinnedEvents", { room_id: roomId });
+  renderTypingIndicator();
+  renderPinnedBanner();
 }
 
 function closeRoomMenu() {
@@ -1188,6 +1240,7 @@ el.btnLeaveRoom.addEventListener("click", () => {
   el.timelineTitle.textContent = "select a conversation";
   el.timelineHeaderActions.style.display = "none";
   el.composeRow.style.display = "none";
+  el.composeToolbar.style.display = "none";
   renderSidePanel();
 });
 
@@ -1196,9 +1249,66 @@ el.notificationMode.addEventListener("change", () => {
   send("SetNotificationMode", { room_id: state.selectedRoom, mode: el.notificationMode.value });
 });
 
+/** Patches every already-rendered presence dot in place (main timeline and
+ * thread panel both — see the `data-presence-user` marker `renderMessage`
+ * puts on each one) rather than a full re-render, since a presence change
+ * is exactly the kind of thing that can arrive in a steady trickle while
+ * scrolled somewhere unrelated. */
+function updateMemberListPresenceDots() {
+  document.querySelectorAll("[data-presence-user]").forEach((dot) => {
+    const info = state.presence[dot.dataset.presenceUser];
+    dot.className = "presence-dot" + (info ? ` ${info.presence}` : "");
+    dot.title = info ? info.presence : "";
+  });
+}
+
 function updateNotificationModeUi() {
   const mode = state.notificationModes[state.selectedRoom];
   if (mode) el.notificationMode.value = mode;
+}
+
+/** Renders the "X is typing..."/"X and Y are typing..." banner for
+ * whichever room is currently open — `state.typingUsers[roomId]` is only
+ * ever populated for that one room (see `Command::WatchTyping`), so no
+ * per-room filtering is needed here beyond just reading it. */
+function renderTypingIndicator() {
+  const roomId = state.selectedRoom;
+  const userIds = (roomId && state.typingUsers[roomId]) || [];
+  if (!roomId || userIds.length === 0) {
+    el.typingIndicator.style.display = "none";
+    return;
+  }
+  const members = state.roomMembers[roomId] || [];
+  const nameOf = (uid) => members.find((m) => m[0] === uid)?.[1] || uid;
+  const names = userIds.map(nameOf);
+  let text;
+  if (names.length === 1) text = `${names[0]} is typing...`;
+  else if (names.length === 2) text = `${names[0]} and ${names[1]} are typing...`;
+  else text = `${names.length} people are typing...`;
+  el.typingIndicator.textContent = text;
+  el.typingIndicator.style.display = "block";
+}
+
+/** Renders the pinned-message banner just under the room header — shows
+ * the most recently pinned message's preview text; clicking it opens the
+ * full pins list (same dialog as "[ pins ]"). Hidden entirely when the
+ * room has no pinned messages. */
+function renderPinnedBanner() {
+  const roomId = state.selectedRoom;
+  const eventIds = (roomId && state.pinnedEvents[roomId]) || [];
+  if (!roomId || eventIds.length === 0) {
+    el.pinnedBanner.style.display = "none";
+    el.pinnedBanner.innerHTML = "";
+    return;
+  }
+  const latestId = eventIds[eventIds.length - 1];
+  const ev = findEvent(roomId, latestId);
+  const preview = ev ? `${ev.sender_name}: ${truncate(ev.body || "", 80)}` : "pinned message";
+  const countSuffix = eventIds.length > 1 ? ` (+${eventIds.length - 1} more)` : "";
+  el.pinnedBanner.innerHTML = `<span class="pinned-icon">📌</span><span class="pinned-text"></span>`;
+  el.pinnedBanner.querySelector(".pinned-text").textContent = preview + countSuffix;
+  el.pinnedBanner.style.display = "flex";
+  el.pinnedBanner.onclick = () => openPinsDialog(roomId);
 }
 
 el.btnSummarize.addEventListener("click", () => {
@@ -1206,6 +1316,434 @@ el.btnSummarize.addEventListener("click", () => {
   if (!state.selectedRoom) return;
   openSummaryDialog(state.selectedRoom, null);
 });
+
+// =========================================================================
+// Room settings (name / topic / avatar)
+// =========================================================================
+el.btnRoomSettings.addEventListener("click", () => {
+  closeRoomMenu();
+  if (!state.selectedRoom) return;
+  const roomId = state.selectedRoom;
+  send("GetRoomInfo", { room_id: roomId }); // refresh — the cached copy may be stale/absent
+  openRoomSettingsDialog(roomId);
+});
+
+function openRoomSettingsDialog(roomId) {
+  const info = state.roomInfo[roomId] || {};
+  showDialog(`
+    <h3>room settings</h3>
+    <label>name</label>
+    <input type="text" id="dlg-room-settings-name" value="${escapeHtml(info.name || "")}" ${info.can_set_name ? "" : "disabled"} />
+    <label>topic</label>
+    <input type="text" id="dlg-room-settings-topic" value="${escapeHtml(info.topic || "")}" ${info.can_set_topic ? "" : "disabled"} />
+    <label>avatar</label>
+    <div class="checkbox-row">
+      ${info.avatar_url ? `<span style="color:var(--text-weak);font-size:11px;">avatar set</span>` : `<span style="color:var(--text-weak);font-size:11px;">no avatar</span>`}
+      <button id="dlg-room-settings-avatar-btn" ${info.can_set_avatar ? "" : "disabled"}>change...</button>
+      <input type="file" id="dlg-room-settings-avatar-input" accept="image/*" style="display:none;" />
+    </div>
+    ${info.can_set_name || info.can_set_topic || info.can_set_avatar ? "" : `<p style="color:var(--text-weak);font-size:11px;">you don't have permission to change this room's settings</p>`}
+    <div class="actions">
+      <button id="dlg-cancel">close</button>
+      <button id="dlg-room-settings-save">save</button>
+    </div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  document.getElementById("dlg-room-settings-avatar-btn")?.addEventListener("click", () => {
+    document.getElementById("dlg-room-settings-avatar-input").click();
+  });
+  document.getElementById("dlg-room-settings-avatar-input")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+    send("SetRoomAvatar", { room_id: roomId, bytes, mime: file.type || "image/png" });
+    showToast("uploading room avatar...");
+  });
+  document.getElementById("dlg-room-settings-save").addEventListener("click", () => {
+    if (info.can_set_name) {
+      const name = document.getElementById("dlg-room-settings-name").value.trim();
+      if (name !== (info.name || "")) send("SetRoomName", { room_id: roomId, name });
+    }
+    if (info.can_set_topic) {
+      const topic = document.getElementById("dlg-room-settings-topic").value.trim();
+      if (topic !== (info.topic || "")) send("SetRoomTopic", { room_id: roomId, topic });
+    }
+    closeDialog();
+  });
+}
+
+// =========================================================================
+// Pinned messages
+// =========================================================================
+el.btnPins.addEventListener("click", () => {
+  closeRoomMenu();
+  if (!state.selectedRoom) return;
+  openPinsDialog(state.selectedRoom);
+});
+
+/** Returns a cached preview for `eventId` (a `TimelineEvent`, `null` if the
+ * server fetch came back empty, or `undefined` if never requested yet —
+ * which also kicks off `Command::GetEventPreview` as a side effect, same
+ * "ask once, cache, re-render on the answer" pattern `requestImage` uses).
+ * For events not already in the loaded timeline (see `findEvent`) — a
+ * pinned message being the main case so far, but usable anywhere a bare
+ * event ID needs a preview. */
+function getEventPreview(roomId, eventId) {
+  const key = `${roomId}|${eventId}`;
+  if (key in state.eventPreviews) return state.eventPreviews[key];
+  state.eventPreviews[key] = undefined;
+  send("GetEventPreview", { room_id: roomId, event_id: eventId });
+  return undefined;
+}
+
+function openPinsDialog(roomId) {
+  const eventIds = state.pinnedEvents[roomId] || [];
+  const rows = eventIds
+    .slice()
+    .reverse()
+    .map((eventId) => {
+      // `findEvent` only sees whatever the timeline has actually paginated
+      // in this session — a pinned message is very often well outside
+      // that (that's the point of pinning something old). Fall back to
+      // fetching it straight from the server via `Command::GetEventPreview`
+      // rather than showing the raw `$eventId` forever.
+      const ev = findEvent(roomId, eventId) || getEventPreview(roomId, eventId);
+      let preview;
+      if (ev) {
+        preview = `${escapeHtml(ev.sender_name)}: ${escapeHtml(truncate(ev.body || "", 100))}`;
+      } else if (ev === null) {
+        preview = `<span style="color:var(--text-weak);">(message unavailable)</span>`;
+      } else {
+        preview = loadingHtml("loading...");
+      }
+      return `<div class="poll-list-item" data-event-id="${escapeHtml(eventId)}">
+        <div>${preview}</div>
+        <div class="actions" style="margin-top:6px;"><button class="small-btn dlg-unpin" data-event-id="${escapeHtml(eventId)}">unpin</button></div>
+      </div>`;
+    })
+    .join("");
+  showDialog(`
+    <h3>pinned messages</h3>
+    ${rows || `<p style="color:var(--text-weak);font-size:12px;">no pinned messages</p>`}
+    <div class="actions"><button id="dlg-cancel">close</button></div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  document.querySelectorAll(".dlg-unpin").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      send("UnpinMessage", { room_id: roomId, event_id: btn.dataset.eventId });
+      btn.closest(".poll-list-item")?.remove();
+    });
+  });
+}
+
+// =========================================================================
+// Polls
+// =========================================================================
+el.btnPolls.addEventListener("click", () => {
+  closeRoomMenu();
+  if (!state.selectedRoom) return;
+  state.pollsDialogRoomId = state.selectedRoom;
+  send("ListPolls", { room_id: state.selectedRoom });
+  openPollsDialog(state.selectedRoom, true);
+});
+
+function openPollsDialog(roomId, loading) {
+  const polls = Object.values(state.polls).filter((p) => p.room_id === roomId);
+  const body = loading && polls.length === 0
+    ? loadingHtml("loading polls...")
+    : polls.length === 0
+      ? `<p style="color:var(--text-weak);font-size:12px;">no polls in this room yet</p>`
+      : polls.map((p) => `<div class="poll-list-item">${renderPollHtml(p)}</div>`).join("");
+  showDialog(`
+    <h3>polls</h3>
+    <div id="polls-dialog-body">${body}</div>
+    <div class="actions"><button id="dlg-cancel">close</button></div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", () => {
+    state.pollsDialogRoomId = null;
+    closeDialog();
+  });
+  wirePollVoteHandlers(document.getElementById("polls-dialog-body"), roomId);
+}
+
+/** Poll question + one row per option, a filled bar behind the text
+ * showing that option's current vote share. Shared by the polls-list
+ * dialog and (via `renderMessage`-adjacent code, if a poll's start event
+ * happens to already be loaded in the visible timeline) nowhere else
+ * currently — polls aren't part of the live timeline stream, see
+ * `Command::ListPolls`'s doc comment on the Rust side for why. */
+function renderPollHtml(poll) {
+  const totalForBars = Math.max(poll.total_votes, 1);
+  const options = poll.options
+    .map((opt) => {
+      const pct = Math.round((opt.votes / totalForBars) * 100);
+      const voted = poll.my_vote_ids.includes(opt.id);
+      return `<div class="poll-option${voted ? " voted" : ""}" data-poll-id="${escapeHtml(poll.poll_event_id)}" data-answer-id="${escapeHtml(opt.id)}">
+        <div class="poll-option-fill" style="width:${pct}%;"></div>
+        <div class="poll-option-label"><span>${voted ? "✓ " : ""}${escapeHtml(opt.text)}</span><span>${opt.votes} (${pct}%)</span></div>
+      </div>`;
+    })
+    .join("");
+  const endBtn = poll.ended
+    ? ""
+    : `<button class="small-btn dlg-end-poll" data-poll-id="${escapeHtml(poll.poll_event_id)}">end poll</button>`;
+  return `<div class="poll${poll.ended ? " ended" : ""}">
+    <div class="poll-question">${escapeHtml(poll.question)}${poll.ended ? " (ended)" : ""}</div>
+    ${options}
+    <div class="poll-meta"><span>${poll.total_votes} vote${poll.total_votes === 1 ? "" : "s"}</span>${endBtn}</div>
+  </div>`;
+}
+
+function wirePollVoteHandlers(containerEl, roomId) {
+  if (!containerEl) return;
+  containerEl.querySelectorAll(".poll-option").forEach((optEl) => {
+    optEl.addEventListener("click", () => {
+      const poll = state.polls[optEl.dataset.pollId];
+      if (poll?.ended) return;
+      send("VotePoll", {
+        room_id: roomId,
+        poll_event_id: optEl.dataset.pollId,
+        answer_ids: [optEl.dataset.answerId],
+      });
+    });
+  });
+  containerEl.querySelectorAll(".dlg-end-poll").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      send("EndPoll", { room_id: roomId, poll_event_id: btn.dataset.pollId });
+    });
+  });
+}
+
+function openCreatePollDialog() {
+  if (!state.selectedRoom) return;
+  const roomId = state.selectedRoom;
+  showDialog(`
+    <h3>new poll</h3>
+    <label>question</label>
+    <input type="text" id="dlg-poll-question" />
+    <label>options (one per line, 2-20)</label>
+    <textarea id="dlg-poll-options" rows="5" style="width:100%;margin-top:2px;"></textarea>
+    <div class="checkbox-row"><input type="checkbox" id="dlg-poll-multi" /><label for="dlg-poll-multi">allow selecting more than one option</label></div>
+    <div class="actions">
+      <button id="dlg-cancel">cancel</button>
+      <button id="dlg-poll-create">create</button>
+    </div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  document.getElementById("dlg-poll-create").addEventListener("click", () => {
+    const question = document.getElementById("dlg-poll-question").value.trim();
+    const options = document.getElementById("dlg-poll-options").value
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!question || options.length < 2) {
+      showToast("a poll needs a question and at least 2 options");
+      return;
+    }
+    const maxSelections = document.getElementById("dlg-poll-multi").checked ? options.length : 1;
+    send("StartPoll", { room_id: roomId, thread_id: null, question, options, max_selections: maxSelections });
+    closeDialog();
+  });
+}
+
+// =========================================================================
+// Full-text message search (across all rooms, by content)
+// =========================================================================
+el.btnMessageSearch.addEventListener("click", () => {
+  closeChatsMenu();
+  showDialog(`
+    <h3>search messages</h3>
+    <label>text to find</label>
+    <input type="text" id="dlg-msg-search-query" />
+    <div class="actions">
+      <button id="dlg-cancel">cancel</button>
+      <button id="dlg-msg-search-go">search</button>
+    </div>
+    <div id="msg-search-results" class="user-search-list"></div>
+  `);
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  const runSearch = () => {
+    const query = document.getElementById("dlg-msg-search-query").value.trim();
+    if (!query) return;
+    document.getElementById("msg-search-results").innerHTML = loadingHtml("searching...");
+    send("SearchMessages", { query, room_id: null, from_ts: null, to_ts: null });
+  };
+  document.getElementById("dlg-msg-search-go").addEventListener("click", runSearch);
+  document.getElementById("dlg-msg-search-query").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") runSearch();
+  });
+  document.getElementById("dlg-msg-search-query").focus();
+});
+
+function renderMessageSearchResults(results, truncated) {
+  const container = document.getElementById("msg-search-results");
+  if (!container) return;
+  if (results.length === 0) {
+    container.innerHTML = `<div style="padding:8px;color:var(--text-weak);font-size:12px;">no matches</div>`;
+    return;
+  }
+  container.innerHTML = results
+    .map(
+      (hit) => `<div class="thread-row" data-room-id="${escapeHtml(hit.room_id)}" data-event-id="${escapeHtml(hit.event.event_id)}">
+        <div class="thread-room-name">${escapeHtml(hit.room_name)}</div>
+        <div class="sender">${escapeHtml(hit.event.sender_name)}</div>
+        <div class="thread-row-body">${escapeHtml(truncate(hit.event.body || "", 160))}</div>
+      </div>`
+    )
+    .join("") + (truncated ? `<div style="padding:6px;color:var(--text-weak);font-size:11px;">results truncated — narrow your search</div>` : "");
+  container.querySelectorAll(".thread-row").forEach((rowEl) => {
+    rowEl.addEventListener("click", () => {
+      closeDialog();
+      openMatrixToLink(rowEl.dataset.roomId, rowEl.dataset.eventId, null);
+    });
+  });
+}
+
+// =========================================================================
+// Voice messages
+// =========================================================================
+async function toggleVoiceRecording() {
+  if (!state.selectedRoom) return;
+  if (state.voiceRecording) {
+    state.voiceRecording.recorder.stop();
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    showToast("microphone access denied");
+    return;
+  }
+  const chunks = [];
+  const recorder = new MediaRecorder(stream);
+  const startedAt = Date.now();
+  // A coarse waveform for the MSC3245 "voice message" playback UI —
+  // sampled from the live input level once per animation frame while
+  // recording, not decoded from the final encoded audio (getting exact
+  // per-sample amplitudes back out of a compressed webm/opus blob without
+  // pulling in a decoding library isn't worth it just for a preview
+  // waveform other clients render, not this one).
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(stream);
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  source.connect(analyser);
+  const levels = [];
+  const dataArray = new Uint8Array(analyser.frequencyBinCount);
+  let sampling = true;
+  const sampleLoop = () => {
+    if (!sampling) return;
+    analyser.getByteTimeDomainData(dataArray);
+    let peak = 0;
+    for (let i = 0; i < dataArray.length; i++) peak = Math.max(peak, Math.abs(dataArray[i] - 128));
+    levels.push(peak / 128);
+    requestAnimationFrame(sampleLoop);
+  };
+  sampleLoop();
+
+  recorder.addEventListener("dataavailable", (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  });
+  recorder.addEventListener("stop", async () => {
+    sampling = false;
+    stream.getTracks().forEach((t) => t.stop());
+    audioCtx.close().catch(() => {});
+    el.btnComposePlus.classList.remove("recording");
+    const durationMs = Date.now() - startedAt;
+    state.voiceRecording = null;
+    if (durationMs < 500) return; // accidental tap, not a real recording
+    const blob = new Blob(chunks, { type: recorder.mimeType || "audio/ogg" });
+    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()));
+    // Downsample the raw per-frame levels to a fixed small count (MSC3245
+    // waveforms are meant to be compact, ~100 points regardless of clip
+    // length) via simple bucket-averaging.
+    const bucketCount = Math.min(100, Math.max(1, levels.length));
+    const waveform = [];
+    for (let i = 0; i < bucketCount; i++) {
+      const start = Math.floor((i * levels.length) / bucketCount);
+      const end = Math.max(start + 1, Math.floor(((i + 1) * levels.length) / bucketCount));
+      const slice = levels.slice(start, end);
+      waveform.push(slice.reduce((a, b) => a + b, 0) / (slice.length || 1));
+    }
+    send("SendVoiceMessage", {
+      room_id: state.selectedRoom,
+      // The voice-record button only exists on the main compose row (not
+      // the thread panel's own copy) — see its doc comment — so this
+      // always targets the main timeline, same as `sendCurrentMessage`'s
+      // own `thread_id: null` case.
+      thread_id: null,
+      bytes,
+      mime: recorder.mimeType || "audio/ogg",
+      duration_ms: durationMs,
+      waveform,
+      local_id: crypto.randomUUID(),
+    });
+  });
+
+  state.voiceRecording = { recorder, audioCtx };
+  el.btnComposePlus.classList.add("recording");
+  recorder.start();
+}
+
+// =========================================================================
+// Theme override (system / light / dark) — see style.css's comment on the
+// (deliberately empty) light `@media` block for why this lives here as
+// inline custom-property overrides instead.
+// =========================================================================
+const LIGHT_PALETTE = {
+  bg: "#f7f5f0",
+  bgAlt: "#ffffff",
+  border: "#d9d3c7",
+  text: "#2a2620",
+  textWeak: "#6e675c",
+  accent: "#b5791c",
+  accentStrong: "#8f5f12",
+};
+const THEME_VARS = ["--bg", "--bg-alt", "--border", "--text", "--text-weak", "--accent", "--accent-strong"];
+function applyThemeOverride() {
+  const root = document.documentElement.style;
+  if (state.themeOverride === "light") {
+    root.setProperty("--bg", LIGHT_PALETTE.bg);
+    root.setProperty("--bg-alt", LIGHT_PALETTE.bgAlt);
+    root.setProperty("--border", LIGHT_PALETTE.border);
+    root.setProperty("--text", LIGHT_PALETTE.text);
+    root.setProperty("--text-weak", LIGHT_PALETTE.textWeak);
+    root.setProperty("--accent", LIGHT_PALETTE.accent);
+    root.setProperty("--accent-strong", LIGHT_PALETTE.accentStrong);
+    document.documentElement.style.colorScheme = "light";
+  } else if (state.themeOverride === "dark") {
+    THEME_VARS.forEach((v) => root.removeProperty(v));
+    document.documentElement.style.colorScheme = "dark";
+  } else {
+    // "system" — drop any override and let the next `Event::SystemTheme`
+    // (Linux/GTK) or, absent that, the plain `:root` CSS defaults (every
+    // other platform) take over again.
+    THEME_VARS.forEach((v) => root.removeProperty(v));
+    document.documentElement.style.colorScheme = "dark";
+  }
+  el.btnTheme.textContent = `[ theme: ${state.themeOverride || "system"} ]`;
+}
+el.btnTheme.addEventListener("click", () => {
+  const order = [null, "light", "dark"];
+  const next = order[(order.indexOf(state.themeOverride) + 1) % order.length];
+  state.themeOverride = next;
+  try {
+    if (next) localStorage.setItem("themeOverride", next);
+    else localStorage.removeItem("themeOverride");
+  } catch (e) {
+    // Private-browsing-style storage block — the override just won't
+    // survive a restart, nothing else depends on it persisting.
+  }
+  applyThemeOverride();
+});
+try {
+  const saved = localStorage.getItem("themeOverride");
+  if (saved === "light" || saved === "dark") state.themeOverride = saved;
+} catch (e) {
+  // same as above
+}
+applyThemeOverride();
 
 /** Opens the "summarizing..." popup and kicks off `Command::Summarize`
  * for the main room timeline (`threadRootId: null`) or one open thread
@@ -1636,7 +2174,14 @@ function renderMessage(event, ctx, opts = {}) {
   if (!event.is_own && !opts.grouped) {
     const sender = document.createElement("div");
     sender.className = "sender";
-    sender.textContent = event.sender_name;
+    const presenceDot = document.createElement("span");
+    const presenceInfo = state.presence[event.sender];
+    presenceDot.className = "presence-dot" + (presenceInfo ? ` ${presenceInfo.presence}` : "");
+    presenceDot.title = presenceInfo ? presenceInfo.presence : "";
+    presenceDot.dataset.presenceUser = event.sender;
+    presenceDot.style.marginRight = "4px";
+    sender.appendChild(presenceDot);
+    sender.appendChild(document.createTextNode(event.sender_name));
     sender.style.color = senderColor(event.sender);
     bubble.appendChild(sender);
   }
@@ -1746,6 +2291,22 @@ function renderMessage(event, ctx, opts = {}) {
     attachment.appendChild(play);
     attachment.appendChild(makeDownloadButton(event));
     bubble.appendChild(attachment);
+  } else if (event.msg_type === "audio" && event.media_url) {
+    if (event.media_mime) state.imageMime[event.media_url] = event.media_mime;
+    if (event.media_encryption) state.imageEncryption[event.media_url] = event.media_encryption;
+    const cached = state.imageCache[event.media_url];
+    if (cached) {
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.src = cached;
+      bubble.appendChild(audio);
+    } else {
+      const placeholder = document.createElement("div");
+      placeholder.className = "image-placeholder";
+      placeholder.innerHTML = loadingHtml("loading voice message...");
+      bubble.appendChild(placeholder);
+      if (!state.imageRequested.has(event.media_url)) requestImage(event.media_url);
+    }
   } else if (event.msg_type === "file" && event.media_url) {
     if (event.media_encryption) state.imageEncryption[event.media_url] = event.media_encryption;
     const attachment = document.createElement("div");
@@ -1878,6 +2439,12 @@ function renderMessage(event, ctx, opts = {}) {
       label: "from user",
       title: `see every message from ${event.sender_name}, across all rooms`,
       onClick: () => openUserSearch(event.sender),
+    });
+    const isPinned = (state.pinnedEvents[ctx.roomId] || []).includes(event.event_id);
+    items.push({
+      label: isPinned ? "unpin" : "pin",
+      onClick: () =>
+        send(isPinned ? "UnpinMessage" : "PinMessage", { room_id: ctx.roomId, event_id: event.event_id }),
     });
     if (event.is_own && event.msg_type !== "image" && event.msg_type !== "deleted") {
       items.push({ label: "edit", onClick: () => startEdit(ctx.roomId, ctx.threadId, event) });
@@ -2552,6 +3119,7 @@ function wireMarkdownToolbar(toolbarEl, textarea) {
 // =========================================================================
 
 function sendCurrentMessage() {
+  stopTypingNotice();
   const body = el.composeInput.value.trim();
   if (state.pendingImage && !state.pendingImage.threadId) {
     confirmPendingImage();
@@ -2614,6 +3182,37 @@ wireComposeEditor(el.composeInput, {
   isSuggestionsOpen: () => el.mentionSuggestions.style.display !== "none",
 });
 wireMarkdownToolbar(el.composeToolbar, el.composeInput);
+
+// ---- Typing notices ----
+// `SetTyping` fires at most once per 4s while actively typing (the SDK's
+// own `typing_notice` already dedupes/times this out server-side, but
+// there's no point re-sending on every keystroke either) and once more
+// with `typing: false` after 5s of no input, so a message left half-typed
+// doesn't show as "typing..." forever.
+let typingActiveUntil = 0;
+let typingStopTimer = null;
+function notifyTyping() {
+  if (!state.selectedRoom) return;
+  const now = Date.now();
+  if (now > typingActiveUntil) {
+    send("SetTyping", { room_id: state.selectedRoom, typing: true });
+  }
+  typingActiveUntil = now + 4000;
+  clearTimeout(typingStopTimer);
+  typingStopTimer = setTimeout(() => {
+    if (state.selectedRoom) send("SetTyping", { room_id: state.selectedRoom, typing: false });
+    typingActiveUntil = 0;
+  }, 5000);
+}
+function stopTypingNotice() {
+  clearTimeout(typingStopTimer);
+  if (typingActiveUntil && state.selectedRoom) {
+    send("SetTyping", { room_id: state.selectedRoom, typing: false });
+  }
+  typingActiveUntil = 0;
+}
+el.composeInput.addEventListener("input", notifyTyping);
+el.composeInput.addEventListener("blur", stopTypingNotice);
 
 // ---- Custom emoji / meme picker (MSC2545 room image packs) ----
 // Shared between the main compose row and the thread panel's own copy
@@ -2719,17 +3318,16 @@ function closeMemePickers() {
   if (threadPicker) threadPicker.style.display = "none";
 }
 
-el.btnMeme.addEventListener("click", (e) => {
-  e.stopPropagation();
+function toggleMemePicker() {
   const show = el.memePicker.style.display === "none";
   closeMemePickers();
   if (show) {
     renderMemePicker(el.memePicker, state.selectedRoom, null);
     el.memePicker.style.display = "grid";
   }
-});
+}
 document.addEventListener("click", (e) => {
-  if (el.memePicker.style.display !== "none" && !el.memePicker.contains(e.target) && e.target !== el.btnMeme) {
+  if (el.memePicker.style.display !== "none" && !el.memePicker.contains(e.target) && e.target !== el.btnComposePlus) {
     el.memePicker.style.display = "none";
   }
   const threadPicker = document.getElementById("thread-meme-picker");
@@ -2739,8 +3337,27 @@ document.addEventListener("click", (e) => {
   }
 });
 
-// ---- Images ----
-el.btnAttach.addEventListener("click", () => el.fileInput.click());
+// The main compose row used to have 4 separate icon buttons (attach/meme/
+// voice/poll) — on a phone-width screen that left barely any room for the
+// actual text input (see git history: this is what "chỗ nhập tin nhắn ...
+// quá nhỏ" was about). One "+" button opening this dropdown (reusing
+// `openActionsMenu`, same as a message's "⋯" menu) frees that width back
+// up for the textarea; while recording, the same button becomes a "stop"
+// button instead of opening this menu (see `toggleVoiceRecording`).
+el.btnComposePlus.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (state.voiceRecording) {
+    toggleVoiceRecording();
+    return;
+  }
+  if (!state.selectedRoom) return;
+  openActionsMenu(el.btnComposePlus, [
+    { label: "📎 image", onClick: () => el.fileInput.click() },
+    { label: "🐸 emoji / meme", onClick: toggleMemePicker },
+    { label: "🎤 voice message", onClick: toggleVoiceRecording },
+    { label: "📊 poll", onClick: openCreatePollDialog },
+  ]);
+});
 el.fileInput.addEventListener("change", () => {
   const file = el.fileInput.files[0];
   if (!file) return;
@@ -3658,20 +4275,20 @@ function renderSidePanel() {
       <div id="thread-reply-indicator" style="display:none;"></div>
       <div id="thread-mention-suggestions" style="display:none;"></div>
       <div id="thread-pending-image-preview" style="display:none;padding:6px 12px;"></div>
-      <div id="thread-compose-row" style="border-top:1px solid var(--border);padding:8px;display:flex;gap:6px;">
+      <div id="thread-compose-toolbar" class="compose-toolbar" style="padding:4px 8px 0 8px;border-top:1px solid var(--border);">
+        <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
+        <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
+        <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
+        <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
+        <button type="button" class="md-btn" data-md="link" title="link">link</button>
+      </div>
+      <div id="thread-compose-row" style="padding:8px;display:flex;gap:6px;align-items:flex-end;">
         <button id="thread-btn-attach" class="small-btn">📎</button>
         <div id="thread-meme-picker-wrap">
           <button id="thread-btn-meme" class="small-btn" title="send a custom emoji/meme">🐸</button>
           <div id="thread-meme-picker" style="display:none;"></div>
         </div>
         <div class="compose-editor-wrap">
-          <div class="compose-toolbar" id="thread-compose-toolbar">
-            <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
-            <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
-            <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
-            <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
-            <button type="button" class="md-btn" data-md="link" title="link">link</button>
-          </div>
           <textarea id="thread-compose-input" class="compose-textarea" rows="1" placeholder="reply... (@ to mention, **bold**, *italic*, \`code\`)"></textarea>
         </div>
         <button id="thread-compose-send">send</button>
@@ -4123,7 +4740,10 @@ function handleBackendEvent(evt) {
   const { type, data } = evt;
   switch (type) {
     case "SystemTheme":
-      applySystemTheme(data);
+      // An explicit user choice (see `applyThemeOverride`) always wins
+      // over the GTK-driven system theme — otherwise every live theme
+      // switch on the Linux desktop build would silently undo it.
+      if (!state.themeOverride) applySystemTheme(data);
       break;
     case "SessionChecked":
       if (data) {
@@ -4384,6 +5004,12 @@ function handleBackendEvent(evt) {
     }
     case "Members":
       state.roomMembers[data.room_id] = data.members;
+      // Presence isn't part of `Event::Members` itself (it's a separate,
+      // account-wide sync stream — see `Command::GetPresence`'s doc
+      // comment) — asked for right after so a room's messages get their
+      // presence dots filled in shortly after opening, without querying
+      // presence for every user this session has ever seen a message from.
+      send("GetPresence", { user_ids: data.members.map((m) => m[0]) });
       break;
     case "Summary": {
       const req = state.summaryRequest;
@@ -4505,6 +5131,70 @@ function handleBackendEvent(evt) {
         };
         openThread(data.room_id, root);
       }
+      break;
+    case "TypingUsers":
+      state.typingUsers[data.room_id] = data.user_ids;
+      if (data.room_id === state.selectedRoom) renderTypingIndicator();
+      break;
+    case "RoomInfo": {
+      const info = data;
+      state.roomInfo[info.room_id] = info;
+      if (info.room_id === state.selectedRoom && info.name) {
+        el.timelineTitle.textContent = info.name;
+      }
+      // Re-render an already-open room settings dialog in place, if any —
+      // otherwise a `SetRoomName`/`SetRoomTopic` success would leave the
+      // dialog's fields showing what the user just typed rather than what
+      // the server actually confirmed (harmless when they match, but a
+      // rejected write would otherwise look like it silently succeeded).
+      if (document.getElementById("dlg-room-settings-name")) {
+        closeDialog();
+        openRoomSettingsDialog(info.room_id);
+      }
+      break;
+    }
+    case "PinnedEvents":
+      state.pinnedEvents[data.room_id] = data.event_ids;
+      if (data.room_id === state.selectedRoom) renderPinnedBanner();
+      if (document.querySelector(".dialog-box h3")?.textContent === "pinned messages") {
+        closeDialog();
+        openPinsDialog(data.room_id);
+      }
+      break;
+    case "EventPreview": {
+      const key = `${data.room_id}|${data.event_id}`;
+      state.eventPreviews[key] = data.event || null;
+      // Re-render an open pins dialog in place so a preview that was
+      // still "loading..." fills in without needing to close/reopen it.
+      if (document.querySelector(".dialog-box h3")?.textContent === "pinned messages") {
+        closeDialog();
+        openPinsDialog(data.room_id);
+      }
+      break;
+    }
+    case "MessageSearchResult":
+      renderMessageSearchResults(data.results, data.truncated);
+      break;
+    case "PollUpdated": {
+      const poll = data;
+      state.polls[poll.poll_event_id] = poll;
+      if (state.pollsDialogRoomId === poll.room_id) {
+        const body = document.getElementById("polls-dialog-body");
+        if (body) {
+          openPollsDialog(poll.room_id, false);
+        }
+      }
+      break;
+    }
+    case "PollsList":
+      for (const poll of data.polls) state.polls[poll.poll_event_id] = poll;
+      if (state.pollsDialogRoomId === data.room_id) {
+        openPollsDialog(data.room_id, false);
+      }
+      break;
+    case "PresenceUpdated":
+      state.presence[data.user_id] = data;
+      updateMemberListPresenceDots();
       break;
     case "Reactions": {
       const ev = findEvent(data.room_id, data.event_id);

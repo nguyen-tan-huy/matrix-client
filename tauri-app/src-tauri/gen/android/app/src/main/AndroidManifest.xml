@@ -7,6 +7,18 @@
          alongside the base permission since API 34. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Lets MainActivity prompt the user to exempt this app from Android's
+         standard battery-optimization killing (Doze/App Standby). Needed on
+         top of the foreground service above — without this exemption, stock
+         Android can still freeze the sync worker's network access in Doze.
+         MIUI/HyperOS and other OEM skins layer their own separate,
+         non-standard kill switches on top that this permission does NOT
+         cover (see ForegroundSyncService's doc comment). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Voice messages (Command::SendVoiceMessage) — the compose box
+         records via getUserMedia() in the WebView, which on Android is
+         backed by this native permission rather than a JS-level prompt. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!-- AndroidTV support -->
     <uses-feature android:name="android.software.leanback" android:required="false" />

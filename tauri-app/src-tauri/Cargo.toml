@@ -17,6 +17,11 @@ serde_json = "1"
 anyhow = "1"
 
 tokio = { version = "1", features = ["full"] }
+# Named directly so `lib.rs` can spell `url::Url` itself — the version
+# tauri-plugin-deep-link's own `get_current()`/`on_open_url()` already use
+# transitively, promoted to a direct dependency to name the type on the
+# receiving end without re-deriving it from that plugin's API.
+url = "2"
 
 # Bumped straight to latest (0.18, from the original 0.7) — the homeserver
 # in use here only speaks "Simplified Sliding Sync" (MSC4186), which 0.7

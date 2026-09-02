@@ -401,4 +401,154 @@ pub enum Command {
         bytes: Vec<u8>,
         mime: String,
     },
+    /// Sends (or stops) a typing notice for the room — `typing` mirrors
+    /// what Element does: fire on every compose-box keystroke (debounced),
+    /// clear immediately on send/blur. Fire-and-forget; `room.typing_notice`
+    /// itself already dedupes/times this out server-side, so there's
+    /// nothing to answer back with.
+    SetTyping {
+        room_id: String,
+        typing: bool,
+    },
+    /// Subscribes to live typing notifications for this room — sent once
+    /// when a room (or its thread panel) is opened. Replaces whatever
+    /// room's subscription was previously active (typing is inherently
+    /// "whichever room/thread the user is currently looking at", not
+    /// something worth tracking for every room at once). Answered with
+    /// `Event::TypingUsers` on every change, including an immediate empty
+    /// one to clear out whatever the previously-open room last showed.
+    WatchTyping {
+        room_id: String,
+    },
+    /// Reads a room's name/topic/avatar plus whether the logged-in user can
+    /// actually change each (`RoomMember::can_send_state`) — the room
+    /// settings panel asks this when it opens. Answered with
+    /// `Event::RoomInfo`.
+    GetRoomInfo {
+        room_id: String,
+    },
+    /// Sets the room's `m.room.name` state event. The server rejects this
+    /// (surfaced as `Event::Error`) if the user lacks power to send it —
+    /// `Event::RoomInfo`'s `can_set_name` is only ever a UI hint, not
+    /// something this itself checks first.
+    SetRoomName {
+        room_id: String,
+        name: String,
+    },
+    /// Sets the room's `m.room.topic` state event.
+    SetRoomTopic {
+        room_id: String,
+        topic: String,
+    },
+    /// Uploads an image and sets it as the room's `m.room.avatar` — same
+    /// upload path as `Command::SendImage`/`SetAvatar`, just targeting the
+    /// room's avatar instead of a message or the user's own profile.
+    SetRoomAvatar {
+        room_id: String,
+        bytes: Vec<u8>,
+        mime: String,
+    },
+    /// Reads the room's current `m.room.pinned_events` — the pinned-message
+    /// banner asks this when a room opens. Answered with
+    /// `Event::PinnedEvents`.
+    GetPinnedEvents {
+        room_id: String,
+    },
+    /// Adds `event_id` to the room's pinned events (server rejects if the
+    /// user lacks power to send `m.room.pinned_events`, surfaced as
+    /// `Event::Error`). Answered with a fresh `Event::PinnedEvents`.
+    PinMessage {
+        room_id: String,
+        event_id: String,
+    },
+    /// Removes `event_id` from the room's pinned events.
+    UnpinMessage {
+        room_id: String,
+        event_id: String,
+    },
+    /// Full-text search of message *bodies* — same "scan every joined
+    /// room's whole history in one call" approach as
+    /// `Command::SearchUserMessages` (see that variant's doc comment for
+    /// why, and `truncated`'s meaning), just matched by `query` (plain
+    /// case-insensitive substring, not a sender) instead. `room_id`
+    /// narrows the scan to one room; `None` searches every joined room.
+    /// Answered with `Event::MessageSearchResult`.
+    SearchMessages {
+        query: String,
+        room_id: Option<String>,
+        from_ts: Option<i64>,
+        to_ts: Option<i64>,
+    },
+    /// Uploads a recorded voice clip and sends it as an `m.audio` message
+    /// with the MSC3245 `org.matrix.msc3245.voice` marker (so Element and
+    /// other clients render it with a waveform/playback UI, not a plain
+    /// file attachment). `waveform` is 0..1-normalized amplitude samples,
+    /// same as the compose box's own live recording preview draws — the
+    /// SDK downsamples/rescales it into the spec's fixed sample count.
+    SendVoiceMessage {
+        room_id: String,
+        thread_id: Option<String>,
+        bytes: Vec<u8>,
+        mime: String,
+        duration_ms: u64,
+        waveform: Vec<f32>,
+        local_id: String,
+    },
+    /// Lists this room's polls from the most recent up to
+    /// `MAX_POLL_SCAN_PAGES` pages of history (see `worker.rs`'s
+    /// `list_polls`) — deliberately not the *entire* room history the way
+    /// `SearchMessages` scans, since (unlike a search the user explicitly
+    /// asked for) this runs every time the polls panel opens. Answered
+    /// with `Event::PollsList`.
+    ListPolls {
+        room_id: String,
+    },
+    /// Starts a poll (MSC3381 `org.matrix.msc3381.poll.start`, the unstable
+    /// prefix — no stable room version supports the extensible-events
+    /// form yet, see `ruma_events::poll`'s doc comment). Answered with
+    /// `Event::PollUpdated` (zero votes, `ended: false`).
+    StartPoll {
+        room_id: String,
+        thread_id: Option<String>,
+        question: String,
+        options: Vec<String>,
+        max_selections: u64,
+    },
+    /// Casts (or replaces — a later response from the same user always
+    /// supersedes their earlier one, per MSC3381) this user's vote(s) on an
+    /// open poll. `answer_ids` are `PollOptionResult::id`s from the poll's
+    /// last `Event::PollUpdated`. Answered with a fresh `Event::PollUpdated`.
+    VotePoll {
+        room_id: String,
+        poll_event_id: String,
+        answer_ids: Vec<String>,
+    },
+    /// Ends a poll (`org.matrix.msc3381.poll.end`) — locks in the final
+    /// tally as of now; any response after this is ignored per MSC3381.
+    /// Only the poll's own sender or someone with redaction power can
+    /// meaningfully expect other clients to respect this (the spec doesn't
+    /// enforce it server-side), same trust model as Element's own poll UI.
+    EndPoll {
+        room_id: String,
+        poll_event_id: String,
+    },
+    /// Looks up current presence (`m.presence`: online/offline/unavailable
+    /// + last-active) for a batch of users — the member list asks this for
+    /// everyone it's about to show. One `Event::PresenceUpdated` per user
+    /// found; a user with no known presence (never online since this
+    /// account started watching, or the homeserver doesn't track it)
+    /// simply gets no event back rather than an explicit "unknown" one.
+    GetPresence {
+        user_ids: Vec<String>,
+    },
+    /// Fetches one message's content by event ID, straight from the
+    /// server (`room.event()`, same technique `fetch_poll_data` uses for
+    /// a poll's start event) — not something already-loaded local state
+    /// can always answer, since a pinned message (or any other event
+    /// referenced only by ID) may be far outside whatever the timeline
+    /// has paginated in so far. Answered with `Event::EventPreview`.
+    GetEventPreview {
+        room_id: String,
+        event_id: String,
+    },
 }

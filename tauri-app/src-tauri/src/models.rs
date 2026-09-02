@@ -151,6 +151,80 @@ pub struct OwnProfile {
     pub avatar_url: Option<String>,
 }
 
+/// A room's editable metadata plus whether the logged-in user is actually
+/// allowed to change each field (`RoomMember::can_send_state`) — response to
+/// `Command::GetRoomInfo`, and re-sent after `SetRoomName`/`SetRoomTopic`/
+/// `SetRoomAvatar` succeed, same "always re-read the real state back" idea
+/// as `OwnProfile`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoomInfo {
+    pub room_id: String,
+    pub name: Option<String>,
+    pub topic: Option<String>,
+    pub avatar_url: Option<String>,
+    pub can_set_name: bool,
+    pub can_set_topic: bool,
+    pub can_set_avatar: bool,
+}
+
+/// One answer option of a poll, with its current vote tally — part of
+/// `PollData`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PollOptionResult {
+    pub id: String,
+    pub text: String,
+    pub votes: u64,
+}
+
+/// A poll's full current state — the question, its options with tallied
+/// votes, and whether it's ended. Sent as `Event::PollUpdated` both as the
+/// direct response to `Command::StartPoll`/`VotePoll`/`EndPoll` and pushed
+/// live whenever anyone else's vote/end arrives via sync (see
+/// `register_poll_response_handler`/`register_poll_end_handler` in
+/// `worker.rs`). Always a full recompute from every response event on the
+/// poll (via `ruma::events::poll::compile_unstable_poll_results`), same
+/// "re-fetch rather than incrementally patch" approach `Reactions` uses, so
+/// there's no risk of drift from a missed/duplicate event.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PollData {
+    pub room_id: String,
+    /// The thread this poll was started in, if any — so the frontend knows
+    /// whether to update the main timeline or a thread panel.
+    pub thread_id: Option<String>,
+    pub poll_event_id: String,
+    pub question: String,
+    pub options: Vec<PollOptionResult>,
+    pub total_votes: u64,
+    /// Answer ID(s) the logged-in user has themselves selected, if any —
+    /// drives which option(s) show as "your vote" in the UI.
+    pub my_vote_ids: Vec<String>,
+    pub ended: bool,
+    pub max_selections: u64,
+}
+
+/// One message found by `Command::SearchMessages` — same shape as
+/// `UserSearchHit`, kept as its own type since it's matched by message
+/// *content* rather than sender, and the two searches may grow different
+/// fields later.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub room_id: String,
+    pub room_name: String,
+    pub event: TimelineEvent,
+}
+
+/// One room member's live presence — response to `Command::GetPresence`,
+/// and pushed again whenever a fresh `m.presence` arrives for that user via
+/// sync (see `register_presence_handler`). `presence` is `"online"` |
+/// `"offline"` | `"unavailable"`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PresenceInfo {
+    pub user_id: String,
+    pub presence: String,
+    pub currently_active: Option<bool>,
+    pub last_active_ago_ms: Option<u64>,
+}
+
 /// One image in a room's custom emoji/sticker pack (`im.ponies.room_emotes`
 /// state event, MSC2545 — the same format Element reads/writes, so a pack
 /// set up there, or in any other MSC2545 client, shows up here too).

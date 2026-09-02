@@ -286,5 +286,54 @@ pub enum Event {
     /// itself succeeding.
     OwnProfile(OwnProfile),
 
+    /// Live typing state for whichever room `Command::WatchTyping` last
+    /// subscribed to — `user_ids` never includes the logged-in user's own
+    /// id (the SDK already filters that out). Empty means nobody else is
+    /// typing right now, including the "just switched rooms" reset
+    /// `WatchTyping` sends immediately on subscribe.
+    TypingUsers {
+        room_id: String,
+        user_ids: Vec<String>,
+    },
+    /// Response to `Command::GetRoomInfo`, and again after
+    /// `SetRoomName`/`SetRoomTopic`/`SetRoomAvatar` succeed.
+    RoomInfo(crate::models::RoomInfo),
+    /// A room's pinned message IDs — response to `Command::GetPinnedEvents`,
+    /// and again after `PinMessage`/`UnpinMessage` succeed or a live
+    /// `m.room.pinned_events` update arrives via sync.
+    PinnedEvents {
+        room_id: String,
+        event_ids: Vec<String>,
+    },
+    /// Full results for `Command::SearchMessages` — same `truncated`
+    /// meaning as `UserMessagesSearchResult`.
+    MessageSearchResult {
+        query: String,
+        results: Vec<crate::models::SearchHit>,
+        truncated: bool,
+    },
+    /// A poll's current full state — response to `Command::StartPoll`/
+    /// `VotePoll`/`EndPoll`, and pushed live whenever anyone's vote/end
+    /// arrives via sync.
+    PollUpdated(crate::models::PollData),
+    /// Response to `Command::ListPolls` — every poll found, most recent
+    /// first.
+    PollsList {
+        room_id: String,
+        polls: Vec<crate::models::PollData>,
+    },
+    /// Response to `Command::GetPresence`, and again whenever a fresh
+    /// `m.presence` update for that user arrives via sync.
+    PresenceUpdated(crate::models::PresenceInfo),
+
+    /// Response to `Command::GetEventPreview` — `event: None` means it
+    /// couldn't be fetched/parsed (deleted, no permission, or not a
+    /// message-shaped event), not just "still loading".
+    EventPreview {
+        room_id: String,
+        event_id: String,
+        event: Option<TimelineEvent>,
+    },
+
     Error(String),
 }

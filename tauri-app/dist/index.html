@@ -38,6 +38,8 @@
             <button id="btn-profile" class="small-btn" title="your profile — avatar, display name">[ profile ]</button>
             <button id="btn-security" class="small-btn" title="security">[ security ]</button>
             <button id="btn-user-search" class="small-btn" title="find every message from one user, across all rooms">[ user msgs ]</button>
+            <button id="btn-message-search" class="small-btn" title="search message text, across all rooms">[ search ]</button>
+            <button id="btn-theme" class="small-btn" title="theme: follows system">[ theme: system ]</button>
             <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ shortcuts ]</button>
           </div>
         </div>
@@ -68,35 +70,39 @@
               <option value="mentions">🔔 mentions</option>
               <option value="mute">🔇 mute</option>
             </select>
+            <button id="btn-room-settings" class="small-btn">[ room settings ]</button>
+            <button id="btn-pins" class="small-btn">[ pins ]</button>
+            <button id="btn-polls" class="small-btn">[ polls ]</button>
             <button id="btn-summarize" class="small-btn">[ summarize ]</button>
           </div>
         </div>
       </div>
     </div>
+    <div id="pinned-banner" style="display:none;"></div>
     <div id="timeline-wrap">
       <div id="timeline" tabindex="-1">
         <div id="timeline-placeholder">select a conversation</div>
       </div>
       <button id="btn-jump-latest" class="jump-latest-btn" style="display:none;" title="jump to latest message">↓</button>
+      <div id="typing-indicator" style="display:none;"></div>
     </div>
     <div id="reply-indicator" style="display:none;"></div>
     <div id="edit-indicator" style="display:none;"></div>
     <div id="mention-suggestions" style="display:none;"></div>
     <div id="pending-image-preview" style="display:none;"></div>
+    <div id="compose-toolbar" class="compose-toolbar" style="display:none;">
+      <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
+      <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
+      <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
+      <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
+      <button type="button" class="md-btn" data-md="link" title="link">link</button>
+    </div>
     <div id="compose-row" style="display:none;">
-      <button id="btn-attach" class="small-btn" title="send an image">📎</button>
       <div id="meme-picker-wrap">
-        <button id="btn-meme" class="small-btn" title="send a custom emoji/meme">🐸</button>
+        <button id="btn-compose-plus" class="small-btn" title="attach image / emoji / voice message / poll">+</button>
         <div id="meme-picker" style="display:none;"></div>
       </div>
       <div class="compose-editor-wrap">
-        <div class="compose-toolbar" id="compose-toolbar">
-          <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
-          <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
-          <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
-          <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
-          <button type="button" class="md-btn" data-md="link" title="link">link</button>
-        </div>
         <textarea id="compose-input" class="compose-textarea" rows="1" placeholder="message... (@ to mention, **bold**, *italic*, `code` — shift+enter for a new line)"></textarea>
       </div>
       <button id="compose-send">send</button>

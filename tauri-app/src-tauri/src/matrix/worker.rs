@@ -401,6 +401,16 @@ struct WorkerState {
     /// `filters::new_filter_joined()` listener task, which is what creates
     /// this controller in the first place.
     room_list_controller: Option<matrix_sdk_ui::room_list_service::RoomListDynamicEntriesController>,
+    /// Whichever room `Command::WatchTyping` last subscribed to, plus the
+    /// drop guard keeping that subscription's internal event handler (and,
+    /// transitively, the broadcast channel `Command::WatchTyping`'s spawned
+    /// task reads from) alive. Overwriting this on the next `WatchTyping`
+    /// drops the previous guard, which both deregisters that old handler
+    /// and — since nothing else holds the sending half of its broadcast
+    /// channel — closes the channel, which is what lets the old task's
+    /// `recv().await` loop end on its own instead of leaking one task per
+    /// room ever opened this session.
+    typing_guard: Option<(String, matrix_sdk::event_handler::EventHandlerDropGuard)>,
 }
 
 /// Dedicated runtime for `FetchImage`/`PlayVideo`. A room with many images
@@ -457,6 +467,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         confirmed_read: load_read_state(),
         sync_service: None,
         room_list_controller: None,
+        typing_guard: None,
     }));
 
     // Normally the frontend asks for this itself (`send("CheckSession")`
@@ -503,7 +514,9 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
             | Command::LoadMoreThreadReplies { .. }
             | Command::ListThreads { .. }
             | Command::SearchUserMessages { .. }
+            | Command::SearchMessages { .. }
             | Command::ListAllUsers
+            | Command::ListPolls { .. }
             | Command::ResolveSharedEvent { .. } => {
                 let cmd_for_task = cmd;
                 timeline_runtime().spawn(async move {
@@ -735,7 +748,35 @@ async fn handle(
             register_redaction_handler(&client, tx.clone());
             register_reaction_handler(&client, tx.clone());
             register_sticker_handler(&client, tx.clone());
+            register_pinned_events_handler(&client, tx.clone());
+            register_poll_handlers(&client, tx.clone());
+            register_presence_handler(&client, tx.clone());
             crate::matrix::verification::register_verification_handler(&client, tx.clone());
+
+            // Marks the account online as soon as sync starts. Fire-and-
+            // forget on its own task — a slow/failed presence write
+            // shouldn't hold up the rest of `StartSync`, and there's
+            // nothing useful to answer back to the UI with either way
+            // (presence isn't something this app's login flow surfaces at
+            // all). `SyncSettings::set_presence` (the "normal" way to set
+            // this) only takes effect on the *next* `/sync` request, which
+            // under `SyncService`/`RoomListService` this app no longer
+            // calls directly — going through the raw `set_presence`
+            // endpoint instead makes it happen immediately regardless.
+            {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let Some(user_id) = client.user_id().map(|id| id.to_owned()) else {
+                        return;
+                    };
+                    use matrix_sdk::ruma::api::client::presence::set_presence;
+                    use matrix_sdk::ruma::presence::PresenceState;
+                    let request = set_presence::v3::Request::new(user_id, PresenceState::Online);
+                    if let Err(e) = client.send(request).await {
+                        tracing::warn!(error = %e, "failed to set presence online");
+                    }
+                });
+            }
 
             tracing::info!("starting sync (RoomListService / sliding sync, MSC4186)");
 
@@ -2342,9 +2383,449 @@ async fn handle(
                 }
             }
         }
+
+        Command::SetTyping { room_id, typing } => {
+            let client = get_client(&state).await?;
+            if let Some(room) = client.get_room(RoomId::parse(&room_id)?.as_ref()) {
+                if let Err(e) = room.typing_notice(typing).await {
+                    tracing::warn!(error = %e, room_id, "typing_notice failed");
+                }
+            }
+        }
+
+        Command::WatchTyping { room_id } => {
+            let client = get_client(&state).await?;
+            let Some(room) = client.get_room(RoomId::parse(&room_id)?.as_ref()) else {
+                return Ok(());
+            };
+            let (guard, mut rx_typing) = room.subscribe_to_typing_notifications();
+            state.lock().await.typing_guard = Some((room_id.clone(), guard));
+            // Clear out whatever the previously-open room last showed —
+            // otherwise switching rooms would leave a stale "X is
+            // typing..." banner up until the new room's next actual
+            // typing change.
+            tx.send(Event::TypingUsers {
+                room_id: room_id.clone(),
+                user_ids: Vec::new(),
+            })
+            .ok();
+            tokio::spawn(async move {
+                while let Ok(user_ids) = rx_typing.recv().await {
+                    let user_ids = user_ids.into_iter().map(|id| id.to_string()).collect();
+                    if tx
+                        .send(Event::TypingUsers {
+                            room_id: room_id.clone(),
+                            user_ids,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
+        Command::GetRoomInfo { room_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            tx.send(Event::RoomInfo(compute_room_info(&client, &room).await))
+                .ok();
+        }
+
+        Command::SetRoomName { room_id, name } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            match room.set_name(name).await {
+                Ok(_) => {
+                    tx.send(Event::RoomInfo(compute_room_info(&client, &room).await))
+                        .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("failed to set room name: {e}")))
+                        .ok();
+                }
+            }
+        }
+
+        Command::SetRoomTopic { room_id, topic } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            match room.set_room_topic(&topic).await {
+                Ok(_) => {
+                    tx.send(Event::RoomInfo(compute_room_info(&client, &room).await))
+                        .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("failed to set room topic: {e}")))
+                        .ok();
+                }
+            }
+        }
+
+        Command::SetRoomAvatar { room_id, bytes, mime } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let content_type: mime::Mime = mime.parse().unwrap_or(mime::IMAGE_PNG);
+            match room.upload_avatar(&content_type, bytes, None).await {
+                Ok(_) => {
+                    tx.send(Event::RoomInfo(compute_room_info(&client, &room).await))
+                        .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("failed to set room avatar: {e}")))
+                        .ok();
+                }
+            }
+        }
+
+        Command::GetPinnedEvents { room_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let event_ids = room
+                .load_pinned_events()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            tx.send(Event::PinnedEvents { room_id, event_ids }).ok();
+        }
+
+        Command::PinMessage { room_id, event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_event_id = OwnedEventId::try_from(event_id.as_str())?;
+            if let Err(e) = room.pin_event(&parsed_event_id).await {
+                tx.send(Event::Error(format!("failed to pin message: {e}"))).ok();
+                return Ok(());
+            }
+            let event_ids = room
+                .load_pinned_events()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            tx.send(Event::PinnedEvents { room_id, event_ids }).ok();
+        }
+
+        Command::UnpinMessage { room_id, event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_event_id = OwnedEventId::try_from(event_id.as_str())?;
+            if let Err(e) = room.unpin_event(&parsed_event_id).await {
+                tx.send(Event::Error(format!("failed to unpin message: {e}"))).ok();
+                return Ok(());
+            }
+            let event_ids = room
+                .load_pinned_events()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect();
+            tx.send(Event::PinnedEvents { room_id, event_ids }).ok();
+        }
+
+        Command::SearchMessages { query, room_id, from_ts, to_ts } => {
+            let client = get_client(&state).await?;
+            let (results, truncated) =
+                search_messages_by_content(&client, &query, room_id.as_deref(), from_ts, to_ts).await;
+            tx.send(Event::MessageSearchResult { query, results, truncated }).ok();
+        }
+
+        Command::SendVoiceMessage {
+            room_id,
+            thread_id,
+            bytes,
+            mime,
+            duration_ms,
+            waveform,
+            local_id,
+        } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let content_type: mime::Mime =
+                mime.parse().unwrap_or_else(|_| "audio/ogg".parse().unwrap());
+            let bytes_len = bytes.len() as u64;
+
+            let upload = match client.media().upload(&content_type, bytes, None).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tx.send(Event::MessageSendFailed {
+                        thread_id,
+                        local_id,
+                        error: e.to_string(),
+                    })
+                    .ok();
+                    return Ok(());
+                }
+            };
+
+            use matrix_sdk::ruma::events::room::message::{
+                AudioInfo, AudioMessageEventContent, MessageType, RoomMessageEventContent,
+                UnstableAmplitude, UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock,
+            };
+
+            let mut audio_content =
+                AudioMessageEventContent::plain("voice-message.ogg".to_string(), upload.content_uri);
+            let mut info = AudioInfo::new();
+            info.duration = Some(std::time::Duration::from_millis(duration_ms));
+            info.mimetype = Some(mime);
+            info.size = matrix_sdk::ruma::UInt::try_from(bytes_len).ok();
+            audio_content.info = Some(Box::new(info));
+            audio_content.voice = Some(UnstableVoiceContentBlock::new());
+            audio_content.audio = Some(UnstableAudioDetailsContentBlock::new(
+                std::time::Duration::from_millis(duration_ms),
+                waveform
+                    .iter()
+                    .map(|v| UnstableAmplitude::new((v.clamp(0.0, 1.0) * 1024.0) as u16))
+                    .collect(),
+            ));
+
+            let mut content = RoomMessageEventContent::new(MessageType::Audio(audio_content));
+            if let Some(thread_id) = &thread_id {
+                let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
+                content.relates_to =
+                    Some(matrix_sdk::ruma::events::room::message::Relation::Thread(
+                        matrix_sdk::ruma::events::relation::Thread::without_fallback(root_event_id),
+                    ));
+            }
+
+            match room.send(content).await {
+                Ok(_) => {
+                    tx.send(Event::MessageSent { thread_id, local_id }).ok();
+                }
+                Err(e) => {
+                    tx.send(Event::MessageSendFailed {
+                        thread_id,
+                        local_id,
+                        error: e.to_string(),
+                    })
+                    .ok();
+                }
+            }
+        }
+
+        Command::ListPolls { room_id } => {
+            let client = get_client(&state).await?;
+            let polls = list_polls(&client, &room_id).await;
+            tx.send(Event::PollsList { room_id, polls }).ok();
+        }
+
+        Command::StartPoll {
+            room_id,
+            thread_id,
+            question,
+            options,
+            max_selections,
+        } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+
+            use matrix_sdk::ruma::events::poll::unstable_start::{
+                NewUnstablePollStartEventContent, UnstablePollAnswer, UnstablePollAnswers,
+                UnstablePollStartContentBlock, UnstablePollStartEventContent,
+            };
+            use matrix_sdk::ruma::events::room::message::RelationWithoutReplacement;
+            use matrix_sdk::ruma::events::relation::Thread;
+            use matrix_sdk::ruma::UInt;
+
+            let answers: Vec<UnstablePollAnswer> = options
+                .iter()
+                .enumerate()
+                .map(|(i, text)| UnstablePollAnswer::new(format!("option-{i}"), text.clone()))
+                .collect();
+            let answers = match UnstablePollAnswers::try_from(answers) {
+                Ok(a) => a,
+                Err(e) => {
+                    tx.send(Event::Error(format!("invalid poll options: {e}"))).ok();
+                    return Ok(());
+                }
+            };
+            let mut block = UnstablePollStartContentBlock::new(question.clone(), answers);
+            block.max_selections = UInt::try_from(max_selections.max(1)).unwrap_or(UInt::from(1u32));
+
+            let mut new_content = NewUnstablePollStartEventContent::plain_text(question.clone(), block);
+            if let Some(thread_id) = &thread_id {
+                let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
+                new_content.relates_to =
+                    Some(RelationWithoutReplacement::Thread(Thread::without_fallback(root_event_id)));
+            }
+            let content = UnstablePollStartEventContent::New(new_content);
+
+            match room.send(content).await {
+                Ok(resp) => {
+                    let poll_event_id = resp.response.event_id.to_string();
+                    tx.send(Event::PollUpdated(crate::models::PollData {
+                        room_id,
+                        thread_id,
+                        poll_event_id,
+                        question,
+                        options: options
+                            .iter()
+                            .enumerate()
+                            .map(|(i, text)| crate::models::PollOptionResult {
+                                id: format!("option-{i}"),
+                                text: text.clone(),
+                                votes: 0,
+                            })
+                            .collect(),
+                        total_votes: 0,
+                        my_vote_ids: Vec::new(),
+                        ended: false,
+                        max_selections,
+                    }))
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("failed to start poll: {e}"))).ok();
+                }
+            }
+        }
+
+        Command::VotePoll { room_id, poll_event_id, answer_ids } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_poll_id = OwnedEventId::try_from(poll_event_id.as_str())?;
+
+            use matrix_sdk::ruma::events::poll::unstable_response::UnstablePollResponseEventContent;
+            let content = UnstablePollResponseEventContent::new(answer_ids, parsed_poll_id.clone());
+            if let Err(e) = room.send(content).await {
+                tx.send(Event::Error(format!("failed to vote: {e}"))).ok();
+                return Ok(());
+            }
+            if let Some(poll) = fetch_poll_data(&client, &room, &parsed_poll_id, &room_id).await {
+                tx.send(Event::PollUpdated(poll)).ok();
+            }
+        }
+
+        Command::EndPoll { room_id, poll_event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_poll_id = OwnedEventId::try_from(poll_event_id.as_str())?;
+
+            use matrix_sdk::ruma::events::poll::unstable_end::UnstablePollEndEventContent;
+            let content = UnstablePollEndEventContent::new("Poll ended", parsed_poll_id.clone());
+            if let Err(e) = room.send(content).await {
+                tx.send(Event::Error(format!("failed to end poll: {e}"))).ok();
+                return Ok(());
+            }
+            if let Some(poll) = fetch_poll_data(&client, &room, &parsed_poll_id, &room_id).await {
+                tx.send(Event::PollUpdated(poll)).ok();
+            }
+        }
+
+        Command::GetPresence { user_ids } => {
+            let client = get_client(&state).await?;
+            let mut tasks = Vec::new();
+            for uid in user_ids {
+                let Ok(parsed) = matrix_sdk::ruma::OwnedUserId::try_from(uid.as_str()) else {
+                    continue;
+                };
+                let client = client.clone();
+                let tx = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    use matrix_sdk::ruma::api::client::presence::get_presence;
+                    let request = get_presence::v3::Request::new(parsed.clone());
+                    if let Ok(resp) = client.send(request).await {
+                        tx.send(Event::PresenceUpdated(crate::models::PresenceInfo {
+                            user_id: parsed.to_string(),
+                            presence: resp.presence.to_string(),
+                            currently_active: resp.currently_active,
+                            last_active_ago_ms: resp.last_active_ago.map(|d| d.as_millis() as u64),
+                        }))
+                        .ok();
+                    }
+                }));
+            }
+            for t in tasks {
+                let _ = t.await;
+            }
+        }
+
+        Command::GetEventPreview { room_id, event_id } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let parsed_event_id = OwnedEventId::try_from(event_id.as_str())?;
+
+            let event = 'fetch: {
+                let Ok(raw) = room.event(&parsed_event_id, None).await else {
+                    break 'fetch None;
+                };
+                let Ok(value) = raw.raw().deserialize_as::<serde_json::Value>() else {
+                    break 'fetch None;
+                };
+                let value = decrypt_if_needed(&room, raw.raw().cast_ref_unchecked(), value).await;
+                parse_raw_message_event(&client, &room_id, &value).await
+            };
+            tx.send(Event::EventPreview { room_id, event_id, event }).ok();
+        }
     }
 
     Ok(())
+}
+
+/// Reads a room's `m.room.name`/`m.room.topic`/`m.room.avatar` plus whether
+/// the logged-in user can actually change each — shared by
+/// `Command::GetRoomInfo` and every `SetRoom*` command's success path (so
+/// the settings panel always reflects what the server actually has, same
+/// "re-read rather than assume the write went through" idea as
+/// `OwnProfile`).
+async fn compute_room_info(client: &Client, room: &matrix_sdk::Room) -> crate::models::RoomInfo {
+    use matrix_sdk::ruma::events::StateEventType;
+
+    let (can_set_name, can_set_topic, can_set_avatar) = match client.user_id() {
+        Some(uid) => match room.get_member(uid).await {
+            Ok(Some(member)) => (
+                member.can_send_state(StateEventType::RoomName),
+                member.can_send_state(StateEventType::RoomTopic),
+                member.can_send_state(StateEventType::RoomAvatar),
+            ),
+            _ => (false, false, false),
+        },
+        None => (false, false, false),
+    };
+
+    crate::models::RoomInfo {
+        room_id: room.room_id().to_string(),
+        name: room.name(),
+        topic: room.topic(),
+        avatar_url: room.avatar_url().map(|u| u.to_string()),
+        can_set_name,
+        can_set_topic,
+        can_set_avatar,
+    }
 }
 
 /// Reads the logged-in user's own display name + avatar straight from the
@@ -2964,6 +3445,307 @@ async fn search_user_messages(
     (results, truncated)
 }
 
+/// `Command::SearchMessages`. Same "scan every room's full history, one
+/// call, bounded only by `from_ts`/`to_ts`/`MAX_PAGES_PER_ROOM`" approach as
+/// `search_user_messages` above (see its doc comment) — just matched by a
+/// plain case-insensitive substring of the message body instead of a
+/// sender, and (unlike that function) actually decrypts each page first,
+/// since without that an encrypted room's messages never have a plaintext
+/// `content.body` to match against at all.
+async fn search_messages_by_content(
+    client: &Client,
+    query: &str,
+    room_id_filter: Option<&str>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+) -> (Vec<crate::models::SearchHit>, bool) {
+    use matrix_sdk::room::MessagesOptions;
+    use matrix_sdk::ruma::UInt;
+
+    const PAGE_SIZE: u32 = 100;
+    const MAX_PAGES_PER_ROOM: usize = 40;
+
+    let query_lower = query.trim().to_lowercase();
+    if query_lower.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    let rooms: Vec<matrix_sdk::Room> = match room_id_filter {
+        Some(id) => RoomId::parse(id)
+            .ok()
+            .and_then(|id| client.get_room(&id))
+            .into_iter()
+            .collect(),
+        None => client.rooms(),
+    };
+
+    let mut results = Vec::new();
+    let mut truncated = false;
+
+    for room in rooms {
+        if room.state() != matrix_sdk::RoomState::Joined || room.is_space() {
+            continue;
+        }
+        let room_id = room.room_id().to_string();
+        let mut room_name: Option<String> = None;
+        let mut from = None;
+
+        'paging: for page_idx in 0..MAX_PAGES_PER_ROOM {
+            let mut options = MessagesOptions::backward();
+            options.limit = UInt::from(PAGE_SIZE);
+            options.from = from.clone();
+
+            let response = match room.messages(options).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, room_id, "SearchMessages: /messages failed");
+                    break;
+                }
+            };
+
+            for raw in &response.chunk {
+                let Ok(value) = raw.raw().deserialize_as::<serde_json::Value>() else {
+                    continue;
+                };
+                let value = decrypt_if_needed(&room, raw.raw().cast_ref_unchecked(), value).await;
+
+                let ts = value.get("origin_server_ts").and_then(|v| v.as_i64());
+                if let (Some(from_ts), Some(ts)) = (from_ts, ts) {
+                    if ts < from_ts {
+                        break 'paging;
+                    }
+                }
+                if value.get("type").and_then(|v| v.as_str()) != Some("m.room.message") {
+                    continue;
+                }
+                if let (Some(to_ts), Some(ts)) = (to_ts, ts) {
+                    if ts > to_ts {
+                        continue;
+                    }
+                }
+                let body_matches = value
+                    .pointer("/content/body")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|b| b.to_lowercase().contains(&query_lower));
+                if !body_matches {
+                    continue;
+                }
+                if let Some(event) = parse_raw_message_event(client, &room_id, &value).await {
+                    if room_name.is_none() {
+                        room_name = Some(
+                            room.display_name()
+                                .await
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|_| room_id.clone()),
+                        );
+                    }
+                    results.push(crate::models::SearchHit {
+                        room_id: room_id.clone(),
+                        room_name: room_name.clone().unwrap(),
+                        event,
+                    });
+                }
+            }
+
+            from = response.end;
+            if from.is_none() {
+                break;
+            }
+            if page_idx + 1 == MAX_PAGES_PER_ROOM {
+                truncated = true;
+            }
+        }
+    }
+
+    results.sort_by(|a, b| b.event.timestamp.cmp(&a.event.timestamp));
+    (results, truncated)
+}
+
+/// Scans a room's most recent history (bounded — see `Command::ListPolls`'s
+/// doc comment) for `m.poll.start` events and compiles each one's current
+/// tally via `fetch_poll_data`.
+async fn list_polls(client: &Client, room_id: &str) -> Vec<crate::models::PollData> {
+    use matrix_sdk::room::MessagesOptions;
+    use matrix_sdk::ruma::UInt;
+
+    const MAX_PAGES: usize = 10;
+    const PAGE_SIZE: u32 = 50;
+
+    let Some(room) = RoomId::parse(room_id).ok().and_then(|id| client.get_room(&id)) else {
+        return Vec::new();
+    };
+
+    let mut poll_event_ids = Vec::new();
+    let mut from = None;
+    for _ in 0..MAX_PAGES {
+        let mut options = MessagesOptions::backward();
+        options.limit = UInt::from(PAGE_SIZE);
+        options.from = from.clone();
+        let response = match room.messages(options).await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        for raw in &response.chunk {
+            let Ok(value) = raw.raw().deserialize_as::<serde_json::Value>() else {
+                continue;
+            };
+            if value.get("type").and_then(|v| v.as_str()) == Some("org.matrix.msc3381.poll.start") {
+                if let Some(event_id) = value.get("event_id").and_then(|v| v.as_str()) {
+                    if let Ok(id) = OwnedEventId::try_from(event_id) {
+                        poll_event_ids.push(id);
+                    }
+                }
+            }
+        }
+        from = response.end;
+        if from.is_none() {
+            break;
+        }
+    }
+
+    let mut polls = Vec::new();
+    for id in poll_event_ids {
+        if let Some(poll) = fetch_poll_data(client, &room, &id, room_id).await {
+            polls.push(poll);
+        }
+    }
+    polls
+}
+
+/// Fetches a poll's start event plus every `m.reference` relation on it
+/// (responses and, if present, the end event) and compiles the current
+/// tally via ruma's own `compile_unstable_poll_results` — same "always
+/// re-derive from every event on the poll, never incrementally patch"
+/// approach `fetch_reaction_events`/`Event::Reactions` uses, so a missed or
+/// duplicate live vote can never leave the tally wrong. Returns `None` if
+/// the start event itself can't be found/parsed (deleted, or not actually
+/// a poll).
+async fn fetch_poll_data(
+    client: &Client,
+    room: &matrix_sdk::Room,
+    poll_event_id: &matrix_sdk::ruma::EventId,
+    room_id: &str,
+) -> Option<crate::models::PollData> {
+    use matrix_sdk::ruma::api::client::relations::get_relating_events_with_rel_type;
+    use matrix_sdk::ruma::events::poll::{
+        compile_unstable_poll_results, unstable_start::UnstablePollStartEventContent,
+        PollResponseData,
+    };
+    use matrix_sdk::ruma::events::relation::RelationType;
+    use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UInt};
+
+    let raw_root = room.event(poll_event_id, None).await.ok()?;
+    let start_value: serde_json::Value = raw_root.raw().deserialize_as().ok()?;
+    let start_value =
+        decrypt_if_needed(room, raw_root.raw().cast_ref_unchecked(), start_value).await;
+
+    let start_content: UnstablePollStartEventContent =
+        serde_json::from_value(start_value.get("content")?.clone()).ok()?;
+    let poll_block = start_content.poll_start().clone();
+
+    // A poll started inside a thread carries the same `m.relates_to:
+    // {rel_type: "m.thread", event_id: ...}` shape `SendMessage`/
+    // `Command::StartPoll` produce for any other threaded message.
+    let thread_id = start_value
+        .pointer("/content/m.relates_to")
+        .filter(|r| r.get("rel_type").and_then(|v| v.as_str()) == Some("m.thread"))
+        .and_then(|r| r.get("event_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let mut request = get_relating_events_with_rel_type::v1::Request::new(
+        room.room_id().to_owned(),
+        poll_event_id.to_owned(),
+        RelationType::Reference,
+    );
+    request.limit = Some(UInt::from(500u32));
+    let response = client.send(request).await.ok()?;
+
+    let mut owned_responses: Vec<(OwnedUserId, MilliSecondsSinceUnixEpoch, Vec<String>)> = Vec::new();
+    let mut end_ts: Option<MilliSecondsSinceUnixEpoch> = None;
+
+    for raw in &response.chunk {
+        let Ok(value) = raw.deserialize_as::<serde_json::Value>() else {
+            continue;
+        };
+        let value = decrypt_if_needed(room, raw, value).await;
+        let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        let Some(sender) = value
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .and_then(|s| OwnedUserId::try_from(s).ok())
+        else {
+            continue;
+        };
+        let ts = value.get("origin_server_ts").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+        let ts = MilliSecondsSinceUnixEpoch(UInt::try_from(ts).unwrap_or_default());
+
+        match event_type {
+            "org.matrix.msc3381.poll.response" => {
+                let answers = value
+                    .pointer("/content/org.matrix.msc3381.poll.response/answers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                owned_responses.push((sender, ts, answers));
+            }
+            "org.matrix.msc3381.poll.end" => {
+                end_ts = Some(match end_ts {
+                    Some(existing) if existing >= ts => existing,
+                    _ => ts,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let ended = end_ts.is_some();
+    let response_data: Vec<PollResponseData> = owned_responses
+        .iter()
+        .map(|(uid, ts, answers)| PollResponseData {
+            sender: uid,
+            origin_server_ts: *ts,
+            selections: answers.as_slice(),
+        })
+        .collect();
+    let results = compile_unstable_poll_results(&poll_block, response_data, end_ts);
+
+    let my_user_id = client.user_id();
+    let mut total_voters: std::collections::BTreeSet<&matrix_sdk::ruma::UserId> =
+        std::collections::BTreeSet::new();
+    let mut options = Vec::new();
+    let mut my_vote_ids = Vec::new();
+    for answer in poll_block.answers.iter() {
+        let voters = results.get(answer.id.as_str());
+        let count = voters.map(|s| s.len()).unwrap_or(0) as u64;
+        if let Some(voters) = voters {
+            total_voters.extend(voters.iter());
+            if let Some(uid) = my_user_id {
+                if voters.contains(uid) {
+                    my_vote_ids.push(answer.id.clone());
+                }
+            }
+        }
+        options.push(crate::models::PollOptionResult {
+            id: answer.id.clone(),
+            text: answer.text.clone(),
+            votes: count,
+        });
+    }
+
+    Some(crate::models::PollData {
+        room_id: room_id.to_string(),
+        thread_id,
+        poll_event_id: poll_event_id.to_string(),
+        question: poll_block.question.text.clone(),
+        options,
+        total_votes: total_voters.len() as u64,
+        my_vote_ids,
+        ended,
+        max_selections: u64::from(poll_block.max_selections),
+    })
+}
+
 async fn parse_thread_root(
     client: &Client,
     room: Option<&matrix_sdk::Room>,
@@ -3263,6 +4045,7 @@ async fn parse_raw_message_event(
         (Some("m.notice"), _) => "notice".to_string(),
         (Some("m.image"), Some(_)) => "image".to_string(),
         (Some("m.video"), Some(_)) => "video".to_string(),
+        (Some("m.audio"), Some(_)) => "audio".to_string(),
         (None, Some(_)) if is_sticker => "image".to_string(),
         (_, Some(_)) => "file".to_string(),
         (Some(t), None) if t == "m.image" || t == "m.video" || t == "m.file" => {
@@ -3831,6 +4614,97 @@ fn register_reaction_handler(client: &Client, tx: UnboundedSender<Event>) {
                     event_id: target.to_string(),
                     reactions: summarize_reactions(&reactions, my_id.as_deref()),
                 })
+                .ok();
+            }
+        },
+    );
+}
+
+/// Pushes an updated `Event::PinnedEvents` whenever anyone (including this
+/// account, from another session) changes a room's `m.room.pinned_events`
+/// live via sync — same "just re-read the full current state" idea as
+/// every other live handler in this file, and it's already a full replace
+/// (not a diff) straight from the spec, so there's nothing to reconcile.
+fn register_pinned_events_handler(client: &Client, tx: UnboundedSender<Event>) {
+    client.add_event_handler(
+        move |ev: matrix_sdk::ruma::events::room::pinned_events::OriginalSyncRoomPinnedEventsEvent,
+              room: matrix_sdk::room::Room| {
+            let tx = tx.clone();
+            async move {
+                let event_ids = ev.content.pinned.into_iter().map(|id| id.to_string()).collect();
+                tx.send(Event::PinnedEvents {
+                    room_id: room.room_id().to_string(),
+                    event_ids,
+                })
+                .ok();
+            }
+        },
+    );
+}
+
+/// Pushes a freshly-recompiled `Event::PollUpdated` whenever a vote
+/// (`org.matrix.msc3381.poll.response`) or an end
+/// (`org.matrix.msc3381.poll.end`) for a poll arrives live via sync — a
+/// poll's *start* needs no live handler of its own, since starting one
+/// always originates from this app's own `Command::StartPoll`, which
+/// already answers with the initial `Event::PollUpdated` itself; a poll
+/// someone else starts only becomes visible once the polls panel is opened
+/// (`Command::ListPolls`), same "not part of the live timeline stream" way
+/// this app treats polls generally (see `Command::ListPolls`'s doc
+/// comment).
+fn register_poll_handlers(client: &Client, tx: UnboundedSender<Event>) {
+    {
+        let tx = tx.clone();
+        client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::poll::unstable_response::OriginalSyncUnstablePollResponseEvent,
+                  room: matrix_sdk::room::Room| {
+                let tx = tx.clone();
+                async move {
+                    let client = room.client();
+                    let poll_event_id = ev.content.relates_to.event_id.clone();
+                    let room_id = room.room_id().to_string();
+                    if let Some(poll) = fetch_poll_data(&client, &room, &poll_event_id, &room_id).await {
+                        tx.send(Event::PollUpdated(poll)).ok();
+                    }
+                }
+            },
+        );
+    }
+    {
+        let tx = tx.clone();
+        client.add_event_handler(
+            move |ev: matrix_sdk::ruma::events::poll::unstable_end::OriginalSyncUnstablePollEndEvent,
+                  room: matrix_sdk::room::Room| {
+                let tx = tx.clone();
+                async move {
+                    let client = room.client();
+                    let poll_event_id = ev.content.relates_to.event_id.clone();
+                    let room_id = room.room_id().to_string();
+                    if let Some(poll) = fetch_poll_data(&client, &room, &poll_event_id, &room_id).await {
+                        tx.send(Event::PollUpdated(poll)).ok();
+                    }
+                }
+            },
+        );
+    }
+}
+
+/// Pushes `Event::PresenceUpdated` for every `m.presence` event this
+/// account's sync stream sees — global (not scoped to any one room, since
+/// presence itself isn't), so this only ever needs registering once (see
+/// `Command::StartSync`), not per-room the way `Command::WatchTyping` needs
+/// to be.
+fn register_presence_handler(client: &Client, tx: UnboundedSender<Event>) {
+    client.add_event_handler(
+        move |ev: matrix_sdk::ruma::events::presence::PresenceEvent| {
+            let tx = tx.clone();
+            async move {
+                tx.send(Event::PresenceUpdated(crate::models::PresenceInfo {
+                    user_id: ev.sender.to_string(),
+                    presence: ev.content.presence.to_string(),
+                    currently_active: ev.content.currently_active,
+                    last_active_ago_ms: ev.content.last_active_ago.map(u64::from),
+                }))
                 .ok();
             }
         },

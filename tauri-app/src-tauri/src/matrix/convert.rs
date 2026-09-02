@@ -85,6 +85,11 @@ pub(crate) fn message_type_fields(
             let mime = f.info.as_ref().and_then(|info| info.mimetype.clone());
             (f.body.clone(), "file".to_string(), mxc, None, mime, encryption)
         }
+        MessageType::Audio(a) => {
+            let (mxc, encryption) = media_source_fields(&a.source);
+            let mime = a.info.as_ref().and_then(|info| info.mimetype.clone());
+            (a.body.clone(), "audio".to_string(), mxc, None, mime, encryption)
+        }
         MessageType::Notice(n) => (n.body.clone(), "notice".to_string(), None, None, None, None),
         other => (other.body().to_string(), "other".to_string(), None, None, None, None),
     }

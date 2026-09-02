@@ -228,27 +228,54 @@ pub fn run() {
             {
                 use tauri::Manager;
                 let cmd_tx_for_links = app.state::<mpsc::UnboundedSender<Command>>().inner().clone();
-                match app.try_state::<tauri_plugin_deep_link::DeepLink<tauri::Wry>>() {
-                    Some(deep_link) => {
-                        deep_link.on_open_url(move |event| {
-                            for url in event.urls() {
-                                match url.host_str() {
-                                    Some("notification") => {
-                                        let mut pairs = url.query_pairs();
-                                        let room_id =
-                                            pairs.find(|(k, _)| k == "room_id").map(|(_, v)| v.into_owned());
-                                        let thread_id = url
-                                            .query_pairs()
-                                            .find(|(k, _)| k == "thread_id")
-                                            .map(|(_, v)| v.into_owned());
-                                        if let Some(room_id) = room_id {
-                                            let _ = cmd_tx_for_links
-                                                .send(Command::HandleNotificationClick { room_id, thread_id });
-                                        }
-                                    }
-                                    _ => matrix::oidc_callback::handle_redirect_url(url.as_str()),
+
+                // Shared by both paths below: `on_open_url` only fires for
+                // links received *after* it's registered — it does NOT
+                // replay the URL that cold-started the app in the first
+                // place (confirmed against a real device: tapping a
+                // notification while the app was fully killed launched it,
+                // but never routed to the room — silently landing on
+                // whatever screen was last open instead). The plugin's own
+                // docs call this out: "Use `get_current` on app load to
+                // check whether your app was started via a deep link."
+                fn handle_urls(urls: Vec<url::Url>, cmd_tx: &mpsc::UnboundedSender<Command>) {
+                    for url in urls {
+                        match url.host_str() {
+                            Some("notification") => {
+                                let mut pairs = url.query_pairs();
+                                let room_id =
+                                    pairs.find(|(k, _)| k == "room_id").map(|(_, v)| v.into_owned());
+                                let thread_id = url
+                                    .query_pairs()
+                                    .find(|(k, _)| k == "thread_id")
+                                    .map(|(_, v)| v.into_owned());
+                                if let Some(room_id) = room_id {
+                                    let _ =
+                                        cmd_tx.send(Command::HandleNotificationClick { room_id, thread_id });
                                 }
                             }
+                            _ => matrix::oidc_callback::handle_redirect_url(url.as_str()),
+                        }
+                    }
+                }
+
+                match app.try_state::<tauri_plugin_deep_link::DeepLink<tauri::Wry>>() {
+                    Some(deep_link) => {
+                        // Cold-start case: whatever URL launched this process,
+                        // if any (a warm-start relaunch, e.g. tapping the
+                        // notification while the app was merely backgrounded,
+                        // goes through `on_open_url` below instead — this call
+                        // returns `None` for that case since nothing "new" was
+                        // ever queued for it).
+                        match deep_link.get_current() {
+                            Ok(Some(urls)) => handle_urls(urls, &cmd_tx_for_links),
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!("deep-link get_current failed: {e}"),
+                        }
+
+                        let cmd_tx_for_open_url = cmd_tx_for_links.clone();
+                        deep_link.on_open_url(move |event| {
+                            handle_urls(event.urls(), &cmd_tx_for_open_url);
                         });
                     }
                     None => {
