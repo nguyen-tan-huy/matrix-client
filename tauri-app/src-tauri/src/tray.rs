@@ -11,6 +11,29 @@
 //! - Android/iOS: no tray at all (see `lib.rs`'s `setup`, which simply
 //!   doesn't call into this module there).
 
+/// Relaunches the app as a fresh process, then exits this one — the
+/// tray's "Restart" menu item. Exists because closing the window only
+/// hides it (see `lib.rs`'s `CloseRequested` handler) — the process, and
+/// whatever it's accumulated over a long uptime (the matrix-sdk sync
+/// loop, WebKitGTK's own renderer/GPU-compositor state), otherwise
+/// survives indefinitely, including across the host machine suspending
+/// and resuming. A real restart gets a fresh WebKitGTK view/compositor
+/// context instead of one that just sat through a suspend — which is the
+/// same fix reaching for "quit from the tray, then reopen by hand" already
+/// gets, just one click instead of two separate ones (and without having
+/// to remember the tray only *hides* on a plain window close, not quits).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn restart_app() -> ! {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Err(err) = std::process::Command::new(exe).spawn() {
+            tracing::error!(error = %err, "restart: failed to relaunch, quitting anyway");
+        }
+    } else {
+        tracing::error!("restart: current_exe() failed, quitting anyway");
+    }
+    std::process::exit(0);
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use ksni::menu::StandardItem;
@@ -115,6 +138,12 @@ mod linux {
                 .into(),
                 MenuItem::Separator,
                 StandardItem {
+                    label: "Restart (fix sluggishness after sleep)".into(),
+                    activate: Box::new(|_this: &mut Self| super::restart_app()),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
                     label: "Quit".into(),
                     activate: Box::new(|_this: &mut Self| std::process::exit(0)),
                     ..Default::default()
@@ -167,10 +196,13 @@ mod desktop {
     /// unlike the Linux/ksni path.
     pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         let show_hide = MenuItemBuilder::with_id("show_hide", "Show/hide window").build(app)?;
+        let restart =
+            MenuItemBuilder::with_id("restart", "Restart (fix sluggishness after sleep)").build(app)?;
         let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
         let menu = MenuBuilder::new(app)
             .item(&show_hide)
             .item(&PredefinedMenuItem::separator(app)?)
+            .item(&restart)
             .item(&quit)
             .build()?;
 
@@ -185,6 +217,7 @@ mod desktop {
             .tooltip("Matrix")
             .on_menu_event(|app, event| match event.id.as_ref() {
                 "show_hide" => toggle(app),
+                "restart" => super::restart_app(),
                 "quit" => std::process::exit(0),
                 _ => {}
             })

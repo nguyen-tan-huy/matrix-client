@@ -83,6 +83,10 @@ rust {
 }
 
 dependencies {
+    // Push notifications that survive the app being fully killed — see
+    // `UnifiedPushServiceImpl.kt`'s doc comment for why the previous
+    // foreground-service-only approach couldn't do that.
+    implementation("org.unifiedpush.android:connector:3.0.0")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")

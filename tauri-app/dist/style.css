@@ -12,6 +12,12 @@
   --accent-strong: #eab659;
   --danger: #e6919c;
   --radius: 8px;
+  /* Overridable via the "[ font ]" settings dialog (see `applyFontSettings()`
+   * in app.js, same `root.style.setProperty` pattern as the theme override
+   * above) — kept as vars rather than hardcoded on `html, body` below so a
+   * user override doesn't need its own separate CSS rule to win. */
+  --font-family: "Inter", "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-size: 15px;
 }
 
 @media (prefers-color-scheme: light) {
@@ -23,13 +29,50 @@
 
 * { box-sizing: border-box; }
 
+/* Block elements `renderMarkdown()` (app.js) can produce — headings and
+ * lists, on top of the `<p>`/`<pre>` it already made before. Nothing else
+ * in this app uses these tags (everything else is div/span/button-based),
+ * so a plain global reset here is simpler than repeating the same rules
+ * against every container class/id markdown output can land in (a
+ * message bubble's `.body`, the summarize dialog, the pinned-messages/
+ * search-results previews, ...) — the default browser margins on these
+ * (especially `<ul>`/`<ol>`'s left padding and every heading's oversized
+ * default spacing) look fine in a full document but cramped/bloated
+ * packed into a chat bubble or a compact list row. */
+h1, h2, h3, h4, h5, h6 { margin: 10px 0 4px; line-height: 1.3; font-weight: 700; }
+h1 { font-size: 1.3em; }
+h2 { font-size: 1.15em; }
+h3, h4, h5, h6 { font-size: 1.05em; }
+ul, ol { margin: 4px 0; padding-left: 1.4em; }
+li { margin: 2px 0; }
+
 html, body {
   margin: 0;
-  height: 100%;
+  /* `100%` here means "the layout viewport", which on Android's WebView
+   * does NOT shrink when the on-screen keyboard opens (no
+   * `windowSoftInputMode="adjustResize"` support inside an edge-to-edge
+   * WebView — the keyboard just overlays on top instead). Every
+   * bottom-anchored control (the compose toolbar, its send/attach
+   * buttons) lives inside this same 100%-tall flex column, so with a
+   * fixed height that never shrinks, the keyboard simply covers the
+   * bottom of it — those buttons are still *there*, just physically
+   * underneath the keyboard.
+   *
+   * `--app-height` (set from `window.visualViewport` in app.js, which
+   * *does* report the shrunk visible area once the keyboard is up, keyed
+   * off the `resize` event it fires) overrides this the instant the
+   * keyboard opens/closes, so the whole flex column actually shrinks and
+   * everything anchored to its bottom moves up into view instead of
+   * disappearing under the keyboard. Falls back to plain `100%` (this
+   * rule's old behavior) wherever that JS hasn't run yet, and is a
+   * complete no-op on desktop, which has no on-screen keyboard to react
+   * to in the first place.
+   */
+  height: var(--app-height, 100%);
   background: var(--bg);
   color: var(--text);
-  font-family: "DejaVu Sans Mono", "Noto Sans Mono", monospace;
-  font-size: 14px;
+  font-family: var(--font-family);
+  font-size: var(--font-size);
 }
 
 button, input, textarea {
@@ -39,7 +82,7 @@ button, input, textarea {
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 4px 8px;
+  padding: 6px 10px;
 }
 
 button {
@@ -57,11 +100,11 @@ button:disabled { color: var(--text-weak); cursor: default; }
 
 .login-box { width: 320px; max-width: 90vw; }
 .login-box h2 { text-align: center; font-weight: normal; }
-.login-box label { display: block; margin-top: 10px; color: var(--text-weak); font-size: 12px; }
+.login-box label { display: block; margin-top: 10px; color: var(--text-weak); font-size: calc(var(--font-size) - 3px); }
 .login-box input { width: 100%; margin-top: 2px; }
 .login-box button { width: 100%; margin-top: 14px; }
-.login-error { color: var(--danger); margin-top: 10px; font-size: 12px; }
-.login-sep { text-align: center; color: var(--text-weak); margin: 14px 0; font-size: 12px; }
+.login-error { color: var(--danger); margin-top: 10px; font-size: calc(var(--font-size) - 3px); }
+.login-sep { text-align: center; color: var(--text-weak); margin: 14px 0; font-size: calc(var(--font-size) - 3px); }
 
 #chat-screen {
   display: none;
@@ -106,14 +149,20 @@ button:disabled { color: var(--text-weak); cursor: default; }
 #room-list-header {
   padding: 8px;
   color: var(--text-weak);
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 2px);
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  row-gap: 4px;
 }
-#room-list-header-actions { display: flex; gap: 4px; align-items: center; }
-.small-btn { font-size: 11px; padding: 2px 6px; }
+/* Same reasoning as `#timeline-header-actions`/`#side-panel-header > div`
+ * — `#room-list` can be manually narrowed down to its 160px `min-width`
+ * via the resizer, at which point "[+]" / "[ reload ]" / "[ threads ]" /
+ * "[ ... ]" no longer fit CHATS' own header on one line. */
+#room-list-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; align-items: center; }
+.small-btn { font-size: calc(var(--font-size) - 3px); padding: 4px 8px; }
 #chats-menu-wrap { position: relative; }
 #chats-menu {
   position: absolute;
@@ -139,7 +188,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border-bottom: 1px solid var(--border);
 }
 #space-picker:empty { display: none; border: none; padding: 0; }
-#space-picker button { font-size: 11px; padding: 2px 6px; white-space: nowrap; }
+#space-picker button { font-size: calc(var(--font-size) - 3px); padding: 4px 8px; white-space: nowrap; }
 #space-picker button.selected {
   border-color: var(--accent-strong);
   color: var(--accent-strong);
@@ -148,10 +197,10 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 #room-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
 #room-filter { flex: 1; margin: 0; }
-#btn-unread-only, #threads-unread-only { flex-shrink: 0; }
-/* Shared with the threads-list panel's own "[ unread ]" toggle — same
- * idea, same look. */
-#btn-unread-only.selected, #threads-unread-only.selected {
+#btn-unread-only, #btn-mentions-only, #threads-unread-only, #threads-mentions-only { flex-shrink: 0; }
+/* Shared with the threads-list panel's own "[ unread ]"/"[ @mentions ]"
+ * toggles — same idea, same look. */
+#btn-unread-only.selected, #btn-mentions-only.selected, #threads-unread-only.selected, #threads-mentions-only.selected {
   border-color: var(--accent-strong);
   color: var(--accent-strong);
   background: color-mix(in srgb, var(--accent) 18%, var(--bg));
@@ -166,15 +215,17 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * container, rather than whatever ancestor would otherwise pick up the
    * containing-block role. */
   position: relative;
+  /* Same WebKitGTK scroll-compositing hint as `#timeline` — see its own
+   * comment. */
+  will-change: scroll-position;
 }
 .room-row {
   padding: 8px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
   display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
   /* Same reasoning as `.msg-row` (see its comment) — an account with
    * thousands of rooms means thousands of these, and without this,
    * WebKitGTK re-does style/layout/paint for every one of them on every
@@ -199,45 +250,77 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * solid left border so the two don't get visually confused when they
  * land on different rows at once. */
 .room-row.kbd-active, .thread-row.kbd-active { outline: 1px solid var(--accent-strong); outline-offset: -1px; }
-.room-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-row .avatar { flex-shrink: 0; }
+.room-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-name.unread { font-weight: bold; }
-.room-preview { color: var(--text-weak); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-preview { color: var(--text-weak); font-size: calc(var(--font-size) - 3px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .room-badge {
-  background: var(--danger);
-  color: #6b3540;
+  background: var(--border);
+  color: var(--text-weak);
   border-radius: 8px;
   padding: 0 6px;
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
   flex-shrink: 0;
+}
+/* A room mentioned/highlighted you specifically (`mention_count > 0`) —
+ * red, distinct from the plain grey "just unread" badge above, matching
+ * Element's own convention. */
+.room-badge.mention {
+  background: var(--danger);
+  color: #6b3540;
 }
 .invite-row {
   padding: 8px;
   border-bottom: 1px solid var(--border);
 }
 .invite-row .actions { margin-top: 6px; display: flex; gap: 6px; }
-.invite-row button { font-size: 12px; padding: 2px 6px; }
+.invite-row button { font-size: calc(var(--font-size) - 2px); padding: 4px 8px; }
 
 #main-panel {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
+  /* Safety net for the resizable 3-pane desktop layout: `#room-list` and
+   * `#side-panel` both hold their own width (the room list via the
+   * resizer's inline `width`, the side panel via a fixed `width` — see
+   * their own rules), so this flex:1 pane is the one that actually
+   * absorbs any leftover squeeze, down to 0px if the other two panes'
+   * combined width already exceeds the window. Without clipping here,
+   * `#timeline-header`'s buttons (which don't shrink — see
+   * `#timeline-header-actions` below) rendered at their natural size
+   * regardless, visibly bleeding out past this collapsed pane's own
+   * right edge and overlapping `#side-panel`'s content next to it,
+   * rather than just being usably wrapped or (worst case) invisible.
+   */
+  overflow: hidden;
 }
 #timeline-header {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   font-weight: bold;
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 8px;
+  row-gap: 4px;
 }
 #timeline-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Only meaningful in the narrow/stacked layout below — desktop never
  * shows it (there's no "back", both panes are always visible there). */
 #btn-back-to-rooms { display: none; flex-shrink: 0; }
-#timeline-header-actions { display: flex; gap: 6px; align-items: center; font-weight: normal; }
-#notification-mode { font-size: 11px; padding: 2px 4px; }
+/* `flex-wrap` here (not just on `#timeline-header` above) is what
+ * actually saves this from overflowing at a squeezed `#main-panel`
+ * width: with only the parent wrapping, this whole button group is
+ * still one flex item that doesn't itself shrink, so it would still
+ * overflow as a block. Wrapping it internally lets "[ mark read ]" /
+ * "[ threads ]" / "[ ... ]" drop onto a second row instead, staying
+ * fully visible (and tappable) rather than clipped or spilling over
+ * `#side-panel`. `justify-content: flex-end` keeps them right-aligned on
+ * either row, matching this row's normal (unwrapped) alignment. */
+#timeline-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; align-items: center; font-weight: normal; }
+#notification-mode { font-size: calc(var(--font-size) - 4px); padding: 2px 4px; }
 #room-menu-wrap { position: relative; }
 #room-menu {
   position: absolute;
@@ -300,7 +383,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border-radius: 50%;
   background: var(--bg);
   color: var(--danger);
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
   cursor: pointer;
 }
 .meme-cell-wrap:hover .meme-cell-remove { visibility: visible; }
@@ -312,10 +395,10 @@ button:disabled { color: var(--text-weak); cursor: default; }
   width: 200px;
   padding: 8px;
   color: var(--text-weak);
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
   text-align: center;
 }
-.meme-add-cell { color: var(--text-weak); font-size: 16px; font-weight: bold; }
+.meme-add-cell { color: var(--text-weak); font-size: calc(var(--font-size) + 1px); font-weight: bold; }
 .meme-add-cell:hover { color: var(--accent); }
 .meme-add-form {
   grid-column: 1 / -1;
@@ -323,7 +406,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   flex-direction: column;
   gap: 6px;
   width: 200px;
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
 }
 .meme-add-form input[type="text"] { width: 100%; }
 .meme-add-form label { display: flex; align-items: center; gap: 4px; color: var(--text-weak); }
@@ -342,7 +425,22 @@ button:disabled { color: var(--text-weak); cursor: default; }
 #timeline {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 12px;
+  padding: 8px 12px 48px;
+  /* WebKitGTK (this app's desktop webview — not Chromium) doesn't
+   * pre-promote a scrollable element to its own compositor layer the way
+   * Chrome does; without this hint it instead does synchronous main-
+   * thread repaint work on every scroll tick, which is the actual "not as
+   * smooth as Chrome" gap — a real engine difference, not something this
+   * app's own CSS caused, but `will-change: scroll-position` is the
+   * standard way to ask WebKit to build that layer ahead of time instead
+   * of reactively. Doesn't fully close the gap (WebKitGTK's compositor is
+   * just less optimized for this than Chromium's, full stop), but it's
+   * the single change that measurably helps. */
+  will-change: scroll-position;
+  /* Scroll anchoring is done by hand in app.js (`createScrollAnchor`),
+   * since WebKitGTK has none — the browser's own (Chromium/Android) would
+   * just adjust a second time on top of it. */
+  overflow-anchor: none;
 }
 .jump-latest-btn {
   position: absolute;
@@ -359,7 +457,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border: none;
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-  font-size: 16px;
+  font-size: calc(var(--font-size) + 1px);
   line-height: 1;
   z-index: 5;
 }
@@ -390,73 +488,39 @@ button:disabled { color: var(--text-weak); cursor: default; }
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-3px); }
 }
-#load-more-row { text-align: center; color: var(--text-weak); font-size: 12px; padding: 4px; }
-#load-more-row button { font-size: 11px; }
+#load-more-row { text-align: center; color: var(--text-weak); font-size: calc(var(--font-size) - 3px); padding: 4px; }
+#load-more-row button { font-size: calc(var(--font-size) - 3px); }
 /* Message content leads, sender is secondary, own messages sit on the
  * right — a chat-bubble layout rather than a flat sender-first list. */
+/* One `.msg-row` per *group* of consecutive same-sender messages now
+ * (see `renderMessageGroup`/`groupIntoRuns` in app.js) — one avatar, one
+ * sender header, with each individual message as its own `.msg-item`
+ * (see below) stacked tightly inside a shared `.bubble`. */
 .msg-row {
   display: flex;
-  /* `.reactions`/`.reaction-trigger` deliberately poke ~9px below the
-   * bubble's own bottom edge (see their `bottom: -9px`) to float over the
-   * corner without reserving layout space. `content-visibility: auto`
-   * right below implies paint containment, which clips any descendant
-   * that overflows *this element's own border-box* — margin is outside
-   * that box and does nothing to prevent the clip, only padding
-   * (part of the box) actually gives that overflow somewhere to go
-   * without being cut off right at the row boundary. 10px covers the 9px
-   * of intentional overflow with a little to spare; the visible gap
-   * between messages is `margin-bottom` below, kept separate so grouped
-   * vs. non-grouped spacing can still differ.
-   */
-  padding-bottom: 10px;
-  margin-bottom: 0;
-  /* Nothing here virtualizes the timeline — every loaded message stays in
-   * the DOM forever, and a room you've paginated back through a lot (or
-   * one with a long-running session) can end up with hundreds of rows.
-   * WebKitGTK's compositor recalculates style/layout/paint for all of them
-   * on every scroll tick without this, which is what "khựng khựng" scroll
-   * actually is. `content-visibility: auto` skips that work entirely for
-   * rows currently off-screen — `contain-intrinsic-size` is just the
-   * placeholder height used for scrollbar math before a row's real size is
-   * known. */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 56px;
-  /* Every row shares the same (auto) stacking order otherwise, so
-   * whichever row is being hovered/tapped needs to paint above its
-   * neighbors for its floating reaction badge/actions gutter to ever be
-   * fully clickable rather than partly covered by an adjacent bubble. */
+  margin-top: 18px;
   position: relative;
   z-index: 0;
 }
-/* `content-visibility: auto` above always implies paint+layout
- * containment (even while the row isn't being skipped) — which, per
- * spec, makes the row a containing block for any `position: fixed`
- * descendant too, the same way `transform`/`filter` would, silently
- * clipping it to the row's own (tiny) box instead of letting it escape
- * to the viewport like `position: fixed` normally does. Nothing inside a
- * `.msg-row` currently uses `position: fixed` (the "⋯" menu and reaction
- * picker are both portaled straight to `document.body` instead, see
- * `openActionsMenu`/`openReactionPicker` in app.js, specifically to sidestep
- * this) — this override just removes the containment for whichever one
- * row is hovered/tapped anyway, as cheap insurance against the same trap
- * for anything added here later. */
-.msg-row:hover, .msg-row.actions-open { z-index: 1; content-visibility: visible; }
-.msg-row:not(.grouped) { margin-bottom: 6px; }
-.msg-row.own { justify-content: flex-end; }
-.msg-row.other { justify-content: flex-start; align-items: flex-end; gap: 8px; }
+/* Every row shares the same (auto) stacking order otherwise, so whichever
+ * row is being hovered/tapped needs to paint above its neighbors for its
+ * floating reaction badge/actions gutter to ever be fully clickable
+ * rather than partly covered by an adjacent row. */
+.msg-row:hover { z-index: 1; }
+/* Flat, sender-first layout (Element's own default) — every message
+ * lines up under its avatar the same way regardless of who sent it,
+ * rather than the old "own messages float right in a colored box"
+ * chat-bubble convention. */
+.msg-row.own, .msg-row.other { justify-content: flex-start; align-items: flex-start; gap: 28px; }
 
-/* Sender avatar to the left of another person's bubble (see
- * `renderMessage`/`renderAvatar` in app.js) — a circle either showing
- * their real `mxc://` image once fetched, or a colored initial in the
- * meantime/if they have none set. `.avatar-spacer` is the same width with
- * nothing in it, keeping every bubble in a grouped run aligned under the
- * first one instead of sliding left once the avatar's only shown once. */
-.avatar, .avatar-spacer {
-  flex-shrink: 0;
-}
+/* Sender avatar to the left of a group (see `renderMessageGroup`/
+ * `renderAvatar` in app.js) — a circle either showing their real
+ * `mxc://` image once fetched, or a colored initial in the meantime/if
+ * they have none set. */
 .avatar {
+  flex-shrink: 0;
+  position: relative; /* anchors `.avatar-presence-dot` */
   border-radius: 50%;
-  overflow: hidden;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -464,7 +528,13 @@ button:disabled { color: var(--text-weak); cursor: default; }
   font-weight: 600;
   user-select: none;
 }
+/* The circular crop moved from `.avatar`'s own `overflow: hidden` onto
+ * the `<img>` itself — the presence badge (`.avatar-presence-dot`) sits
+ * right at/past the avatar's own edge on purpose (the classic Slack/
+ * Discord "notch" look), which `overflow: hidden` on its parent would
+ * have clipped away. */
 .avatar img {
+  border-radius: 50%;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -476,53 +546,99 @@ button:disabled { color: var(--text-weak); cursor: default; }
   /* A percentage max-width on `.bubble` itself wouldn't resolve here —
    * `.msg-col` has no definite width of its own to be a percentage of
    * (it shrinks to fit its content, which is circular). `.msg-row` does
-   * have one (it fills the timeline), so the cap lives here instead. */
-  max-width: 62%;
+   * have one (it fills the timeline), so the cap lives here instead.
+   * 62% (a leftover from the old right-aligned chat-bubble look, where a
+   * narrower cap kept "your" bubbles from stretching all the way across)
+   * left a wide, empty-looking gutter on the flat, avatar-led layout this
+   * app moved to since — text now wraps into a narrow column with a lot
+   * of visibly unused width beside it. */
+  max-width: 88%;
   min-width: 0;
 }
-.msg-row.own .msg-col { align-items: flex-end; }
-.msg-row.other .msg-col { align-items: flex-start; }
+.msg-row.own .msg-col, .msg-row.other .msg-col { align-items: flex-start; }
 
+/* Flat — no box fill, border, shadow, or rounded corners. The avatar +
+ * colored sender name (see `.sender` below) already say "who sent this
+ * and where does their content start"; a colored panel around every
+ * message on top of that was mostly just visual weight, not information —
+ * this reads closer to Element's own default (sender-first flat list)
+ * and to plain chat UIs generally. */
 .bubble {
   max-width: 100%;
-  padding: 8px 12px;
-  border: none;
-  /* Rounder than `var(--radius)` (shared with squarer chrome — buttons,
-   * dialogs, room rows) — a chat bubble reads as a bubble mainly through
-   * this shape, so it gets its own, more generous radius instead. */
-  border-radius: 14px;
-  /* Genuine depth (a shadow, not just a fill-color difference) is what
-   * keeps a bubble legible against *any* page background a GTK theme
-   * could resolve to, including ones where the two fills below end up
-   * close in luminance to `--bg` — the shadow alone still reads. */
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-  position: relative; /* anchors `.reaction-trigger` / `.reaction-picker` */
+  padding: 1px 0;
 }
-.bubble.own { background: color-mix(in srgb, var(--accent) 32%, var(--bg)); }
-/* Mixed straight from `--text`/`--bg` rather than reused from `--bg-alt`
- * (which is *also* derived from the system theme — see `gtk_theme.rs` —
- * and, for a theme whose own "alt surface" color happens to sit close to
- * its window background, made every non-own message bubble nearly
- * invisible). This guarantees a fixed, always-visible amount of contrast
- * against the page background no matter what the running theme's own
- * surface color resolves to. */
-.bubble.other { background: color-mix(in srgb, var(--text) 10%, var(--bg)); }
-.bubble.mentioned {
-  background: rgba(230, 190, 110, 0.28);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), inset 0 0 0 1px #d9a94a;
+/* One `.msg-item` per message inside the shared `.bubble` — see
+ * `renderMessageItem`/`renderMessageGroup` in app.js. `.msg-actions`
+ * (react/reply/thread/more, see below) is `position: absolute`, not a
+ * real flex sibling of `.msg-content` — a real sibling that's only
+ * sometimes shown/hidden pushes everything around it on every toggle (a
+ * visible "UI jumping" reflow every time a message is hovered); absolute
+ * positioning removes it from layout entirely, so showing/hiding it
+ * can't move anything else no matter how often it toggles.
+ * `position: relative` here is what anchors it, and `width: fit-content`
+ * (instead of the plain block default of stretching to fill `.bubble`'s
+ * full width) is what keeps `.msg-actions`'s `left: 100%` landing at
+ * *this* message's own text edge specifically — without it, every
+ * `.msg-item` in a group stretches to match whichever sibling has the
+ * widest content, and a short message's actions would float off to the
+ * right of a much longer sibling instead of sitting next to the text
+ * they actually belong to. */
+.msg-item {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+}
+/* Tight, paragraph-like stacking between messages in the same group —
+ * `.reactions` sits in normal flow now (not floating), so a reacted
+ * message's own pill row already pushes the next message down on its
+ * own; nothing extra needed here for that case. */
+.msg-item:not(:last-child) {
+  margin-bottom: 0;
+}
+/* A mention still needs to stand out from the messages around it —
+ * without a background fill to tint, a left accent bar plus a faint wash
+ * behind just this one message (not its whole group) carries the same
+ * "this one's for you" signal. */
+.msg-item.mentioned {
+  background: rgba(230, 190, 110, 0.14);
   border-left: 3px solid #d9a94a;
+  padding-left: 8px;
+  margin-left: -11px;
 }
 
-/* Group chats mix messages from many people — the sender name needs to
- * stand out (bold, its own color) rather than blend in as secondary
- * metadata, and the message content sits indented under it so a whole
- * run of consecutive messages from one person visibly "belongs" to the
- * name above rather than reading as a flat, ownerless list. */
-.bubble.other { padding-left: calc(10px + 1cm); }
-.bubble .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-1cm); }
+.sender {
+  font-size: calc(var(--font-size) + 1px);
+  font-weight: 600;
+  margin: 0 0 3px 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.sender time {
+  font-size: calc(var(--font-size) - 4px);
+  font-weight: normal;
+  color: var(--text-weak);
+}
 .bubble .body {
-  white-space: pre-wrap;
+  /* NOT `white-space: pre-wrap` — `.body`'s content is always HTML from
+   * `renderMarkdown` (real `<p>`/`<ul>`/`<img>` structure), never raw text
+   * needing its own newlines preserved. `pre-wrap` doesn't know that: it
+   * also makes the plain formatting newlines `marked.parse()` inserts
+   * *between* those tags (purely for readable HTML source, otherwise
+   * invisible under the default `white-space: normal`) significant —
+   * rendering as a genuine extra blank line between every block. That's
+   * what made a single message with, say, a link + a mention + a bullet
+   * list + an image + a few short paragraphs read as several separate-
+   * looking chunks with a blank line stacked between each one, instead of
+   * one flowing paragraph. `word-wrap: break-word` alone still handles an
+   * unbreakable long token (a URL, ...) without it. */
   word-wrap: break-word;
+  /* Explicit, rather than the browser's own default (which runs more
+   * generous the larger the font gets) — at a big user-chosen message
+   * font-size, that default's extra leading is exactly what read as
+   * "messages from the same person are too far apart" even with every
+   * margin/padding between them already at 0. */
+  line-height: 1.35;
   /* A GTK theme's own text color isn't guaranteed to be a crisp white —
    * some resolve to a fairly muted gray, which reads fine for UI chrome
    * but leaves the actual message content (the one thing in a bubble that
@@ -533,7 +649,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   color: color-mix(in srgb, var(--text) 88%, white);
   font-weight: 500;
 }
-.bubble .body p { margin: 0 0 4px 0; }
+.bubble .body p { margin: 0; }
 .bubble .body p:last-child { margin-bottom: 0; }
 .bubble .body code { background: var(--bg); padding: 0 3px; }
 .bubble .body pre { background: var(--bg); padding: 6px; overflow-x: auto; }
@@ -563,7 +679,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   width: 200px;
   padding: 24px 12px;
   text-align: center;
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
   color: var(--text-weak);
   border: 1px dashed var(--border);
   border-radius: var(--radius);
@@ -607,14 +723,69 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .bubble .body.deleted { color: var(--text-weak); font-style: italic; }
 .bubble .reply-preview {
   color: var(--text-weak);
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
   border-left: 2px solid var(--border);
   padding-left: 6px;
   margin-bottom: 4px;
   cursor: pointer;
 }
 .bubble .reply-preview:hover { border-left-color: var(--accent-strong); color: var(--text); }
-.bubble .meta { color: var(--text-weak); font-size: 10px; text-align: right; margin-top: 3px; }
+/* A shared matrix.to link (see `decorateSharedLinks` in app.js), rendered
+ * as a small preview card instead of the raw URL `renderMarkdown` would
+ * otherwise leave wrapping across the bubble — same "bordered box with a
+ * sender:snippet line" shape as `.reply-preview`, distinct enough (icon,
+ * background fill) to read as "jump to this" rather than "quoting this". */
+.shared-link-preview {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: 6px 8px;
+  margin: 4px 0;
+  color: var(--text);
+  text-decoration: none;
+  font-size: calc(var(--font-size) - 3px);
+  cursor: pointer;
+}
+.shared-link-preview:hover { border-color: var(--accent-strong); }
+.shared-link-preview .shared-link-icon { flex-shrink: 0; }
+.shared-link-preview .shared-link-body { min-width: 0; overflow-wrap: break-word; }
+.shared-link-preview .shared-link-room { display: block; color: var(--text-weak); font-size: calc(var(--font-size) - 4px); }
+/* Sits in the avatar's own gutter (28px avatar + 28px `.msg-row` gap to
+ * its left — see `left`/`width` below), right-aligned same as the avatar
+ * itself sits above it — `position: absolute` so it costs no layout
+ * space and doesn't reflow anything on hover, same idea the old
+ * `.avatar-spacer time` used. Hidden until this specific `.msg-item` is
+ * hovered — see its own comment in `renderMessageItem` (app.js) for why:
+ * the group's header already shows the first message's time, so a
+ * permanent copy under every message in the run would just be the old
+ * "too much space between messages from one person" gap again. */
+.bubble .meta {
+  position: absolute;
+  left: -56px;
+  width: 28px;
+  bottom: 3px;
+  text-align: right;
+  color: var(--text-weak);
+  font-size: calc(var(--font-size) - 5px);
+  white-space: nowrap;
+  visibility: hidden;
+}
+.msg-item:hover .bubble .meta { visibility: visible; }
+
+/* A message's send state — "sending…" for the optimistic bubble shown the
+ * instant Send is pressed, "failed to send" once `Event::MessageSendFailed`
+ * comes back. Always visible (unlike `.meta`'s hover-only timestamp above):
+ * this is the one piece of status a message needs to communicate right
+ * away, not just on hover. */
+.send-status {
+  font-size: calc(var(--font-size) - 3px);
+  color: var(--text-weak);
+  margin-top: 2px;
+}
+.send-status.failed { color: var(--danger, #d94f4f); }
 
 /* Highlight when jumping to a message (reply-preview or a shared matrix.to
  * link) — solid red, held for 30s and then cleared (see `scrollToMessage`'s
@@ -622,7 +793,14 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * jump within that window moves the class to the new target right away
  * instead of waiting out the first one's timer, so exactly one message
  * stays marked at a time. */
-.jump-highlight .bubble {
+/* Applied straight to the `.msg-item` (see `scrollToMessage` in app.js) —
+ * not a `.bubble` descendant selector, since one `.bubble` now holds
+ * every message in a group and only the one specific `.msg-item` that
+ * was actually jumped to should highlight, not its whole group. */
+.msg-item.jump-highlight {
+  padding: 4px 8px;
+  margin: -4px -8px;
+  border-radius: var(--radius);
   box-shadow: 0 0 0 3px #ff4d4d, 0 0 16px 5px rgba(255, 77, 77, 0.65);
   background-color: color-mix(in srgb, #ff4d4d 40%, var(--bg-alt));
 }
@@ -631,27 +809,47 @@ button:disabled { color: var(--text-weak); cursor: default; }
   padding: 3px 8px;
   border: 1px solid var(--accent-strong);
   color: var(--accent-strong);
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
   cursor: pointer;
   display: inline-block;
 }
 .thread-badge:hover { background: color-mix(in srgb, var(--accent) 25%, var(--bg)); }
 
-/* A small badge overlapping the bubble's bottom-right corner, not a row
- * inside it — same floating spot `.reaction-trigger` uses for a bubble
- * with no reactions yet, so reacting to a message never shifts anything
- * else in the bubble around or adds a chunk of dead space around a
- * single pill. */
+/* A normal row right under the message's own text (NOT absolutely
+ * floating over it — that only worked back when every message sat
+ * inside its own padded/boxed bubble with room to spare; now that
+ * `.msg-item` is a plain flat line of text, floating over its
+ * bottom-right corner meant the pill sat right on top of the message's
+ * own last line whenever it wrapped close to the column's full width).
+ * `flex-wrap: wrap` since a message can have several reactions on a
+ * narrow column. */
 .reactions {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 3px;
-  position: absolute;
-  bottom: -9px;
-  right: 8px;
+  margin-top: 4px;
 }
+/* "Seen by" avatar stack (Element's read-receipt indicator) — right-
+ * aligned under the message, each avatar overlapping the previous one
+ * (negative margin) like a stacked-cards deck rather than a spread-out
+ * row, since this can otherwise get wide fast in an active room. A thin
+ * border in the bubble's own background color is what actually sells the
+ * "stacked" look — without it two same-color avatars next to each other
+ * just blur into one shape. */
+.read-receipts {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.read-receipts .avatar {
+  margin-left: -6px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+}
+.read-receipts .avatar:first-child { margin-left: 0; }
 .reaction-pill {
-  font-size: 10px;
+  font-size: calc(var(--font-size) - 5px);
   line-height: 1;
   padding: 2px 6px;
   border: 1px solid var(--border);
@@ -667,20 +865,18 @@ button:disabled { color: var(--text-weak); cursor: default; }
   background: var(--bg);
   color: var(--accent-strong);
 }
-/* Hidden until hover, same as `.reaction-trigger` — only the pills
- * themselves (the actual reaction data) stay always visible. */
+/* Always visible, same as `.reaction-trigger`/`.msg-menu-trigger` now —
+ * see their own comment for why. */
 .reaction-add {
-  visibility: hidden;
-  font-size: 10px;
+  font-size: calc(var(--font-size) - 3px);
   line-height: 1;
-  padding: 2px 5px;
+  padding: 2px 6px;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg);
   color: var(--text-weak);
   cursor: pointer;
 }
-.msg-row:hover .reaction-add { visibility: visible; }
 .reaction-add:hover { border-color: var(--accent); color: var(--accent); }
 /* Position (`fixed` + computed `top`/`left`) is set inline by
  * `openReactionPicker` in app.js, not here — it's appended to
@@ -702,28 +898,102 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * its comment. */
   z-index: 25;
 }
-/* Floating corner icon for a bubble with no reactions yet — costs no
- * layout space (only ever shown on hover, same idea as `.msg-menu-trigger`),
- * instead of `renderReactions`'s old always-there empty pill row. */
-.reaction-trigger {
-  visibility: hidden;
-  position: absolute;
-  bottom: -9px;
-  right: 8px;
-  font-size: 10px;
-  line-height: 1;
-  padding: 2px 5px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
+/* The compose box's own emoji picker (`openEmojiPicker`, app.js) —
+ * `EMOJI_PICKER_SET` is ~250 entries, so a grid that scrolls beats
+ * `.reaction-picker`'s single flex row (fine for its own fixed 6). */
+.emoji-picker {
+  display: grid;
+  grid-template-columns: repeat(10, 1fr);
+  gap: 2px;
   background: var(--bg);
-  color: var(--text-weak);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px;
+  width: 320px;
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 25;
+}
+.emoji-picker button {
+  border: none;
+  background: none;
+  font-size: calc(var(--font-size) + 3px);
+  line-height: 1;
+  padding: 5px;
+  border-radius: 4px;
   cursor: pointer;
 }
-.msg-row:hover .reaction-trigger { visibility: visible; }
-.reaction-trigger:hover { border-color: var(--accent); color: var(--accent); }
+.emoji-picker button:hover { background: var(--bg-alt); }
+/* React/reply/thread/more, floating over a message on hover —
+ * `position: fixed`, positioned and shown/hidden entirely from JS
+ * (`wireMsgActionsHover` in app.js), not plain CSS `:hover`/`left: 100%`.
+ * A pure-CSS "float just past the message's own right edge" broke down
+ * for a *wide* message (text already reaching close to the column's own
+ * max-width): there was no room left of the visible timeline for it to
+ * land in, pushing the buttons — the "⋯" trigger specifically — off the
+ * edge entirely, inaccessible. `wireMsgActionsHover` measures the real
+ * on-screen position and clamps it against the scrollable timeline
+ * instead, so it always lands somewhere reachable. The `.visible` class
+ * it toggles is the only thing controlling whether this shows — no
+ * `:hover` selector needed here since JS already listens for hovering
+ * either the message or these buttons themselves. */
+.msg-actions {
+  position: fixed;
+  display: none;
+  align-items: center;
+  gap: 6px;
+  /* Well below `.reaction-picker`/`.actions-menu` (both 25) — those pop
+   * up *from* one of these buttons and need to render on top of it, not
+   * behind it. Just enough to sit above ordinary message content. */
+  z-index: 2;
+}
+.msg-actions.visible { display: flex; }
+/* Deliberately a *fixed* size, not tied to `var(--font-size)` — these are
+ * small circular icon buttons with a fixed 32px box, not message
+ * content; scaling their glyph with the user's own (often much larger)
+ * chosen message font-size is exactly what made a glyph stop fitting the
+ * circle and visibly spill past its border once that setting was turned
+ * up. A UI control's own size should track the user's font-size
+ * preference in principle (see the base stylesheet's own font-size
+ * variables), but a fixed-diameter circle has no room to grow into —
+ * fixed here is the correct exception, not an oversight. */
+.reaction-trigger,
+.reply-trigger,
+.thread-trigger,
+.msg-menu-trigger {
+  font-size: 15px;
+  line-height: 1;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-alt);
+  color: var(--text-weak);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+/* Emoji glyphs render with extra descent baked into their own metrics —
+ * centering the button via flex (`align-items`/`justify-content: center`
+ * above) centers that whole metrics box, which visibly sits the actual
+ * glyph a couple pixels high of true-center. Plain text (`.msg-menu-trigger`'s
+ * "⋯", `.reply-trigger`'s "↩") doesn't have this problem, so only the
+ * two emoji ones need the nudge. */
+.reaction-trigger, .thread-trigger { padding-top: 3px; }
+.reaction-trigger:hover,
+.reply-trigger:hover,
+.thread-trigger:hover,
+.msg-menu-trigger:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 
 .reaction-picker button {
-  font-size: 15px;
+  font-size: var(--font-size);
   padding: 2px 5px;
   border: none;
   background: transparent;
@@ -731,29 +1001,6 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border-radius: 4px;
 }
 .reaction-picker button:hover { background: var(--bg-alt); }
-
-/* The "⋯" trigger that opens `openActionsMenu`'s dropdown — sits inside
- * the bubble's own top-right corner rather than poking outside its box
- * (unlike `.reaction-trigger` below), since it's just one small button
- * with nowhere better to go that wouldn't need the same
- * `content-visibility` containment workaround `openActionsMenu` itself
- * already sidesteps by portaling the actual dropdown to `document.body`. */
-.msg-menu-trigger {
-  visibility: hidden;
-  position: absolute;
-  top: 3px;
-  right: 4px;
-  font-size: 10px;
-  line-height: 1;
-  padding: 1px 5px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--bg);
-  color: var(--text-weak);
-  cursor: pointer;
-}
-.msg-row:hover .msg-menu-trigger { visibility: visible; }
-.msg-menu-trigger:hover { border-color: var(--accent); color: var(--accent); }
 
 /* `openActionsMenu`'s dropdown itself — position (`fixed` + `top`/`left`)
  * set inline in app.js, computed from the trigger's real on-screen rect. */
@@ -779,7 +1026,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
 }
 .actions-menu button {
   text-align: left;
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
   padding: 5px 8px;
   border: none;
   background: transparent;
@@ -791,7 +1038,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
 
 #reply-indicator, #edit-indicator {
   padding: 4px 12px;
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
   color: var(--text-weak);
   display: flex;
   justify-content: space-between;
@@ -804,12 +1051,25 @@ button:disabled { color: var(--text-weak); cursor: default; }
   max-height: 140px;
   overflow-y: auto;
 }
-.mention-item { padding: 4px 8px; cursor: pointer; font-size: 12px; }
-.mention-item:hover, .mention-item.active { background: var(--bg-alt); }
+.mention-item { padding: 4px 8px; cursor: pointer; font-size: calc(var(--font-size) - 3px); }
+/* Was `background: var(--bg-alt)` — visible enough in the (only) dark
+ * palette this app originally had, but in the light palette `--bg-alt`
+ * (near-white, for elevated surfaces like bubbles/dialogs) sits almost
+ * exactly on top of `--bg` (the dropdown's own background, also
+ * near-white) — a barely-there few percent luminance difference, easy to
+ * miss which row is actually selected. Same accent-tinted highlight
+ * `.room-row.selected`/`.space-picker button.selected` already use
+ * instead — visibly distinct in both themes since it's mixed from the
+ * theme's own accent color, not just swapped to a same-luminance neutral. */
+.mention-item:hover, .mention-item.active {
+  background: color-mix(in srgb, var(--accent) 18%, var(--bg));
+}
 
 #pending-image-preview { padding: 6px 12px; }
 #pending-image-preview img, #thread-pending-image-preview img { max-height: 120px; display: block; }
 #pending-image-preview .actions, #thread-pending-image-preview .actions { margin-top: 4px; display: flex; gap: 6px; }
+#pending-file-preview { padding: 6px 12px; }
+#pending-file-preview .actions, #thread-pending-file-preview .actions { display: flex; gap: 6px; }
 
 /* A full-width row of its own, directly above `#compose-row` — not nested
  * above just the textarea inside `.compose-editor-wrap` (the older
@@ -823,7 +1083,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * `#compose-row` below this fixes that regardless of how many icon
  * buttons it ever has. */
 .compose-toolbar { display: flex; gap: 2px; padding: 4px 8px 0 8px; }
-.compose-toolbar .md-btn { font-size: 11px; padding: 1px 6px; }
+.compose-toolbar .md-btn { font-size: calc(var(--font-size) - 3px); padding: 3px 8px; }
 #compose-row {
   padding: 8px;
   display: flex;
@@ -871,40 +1131,84 @@ button:disabled { color: var(--text-weak); cursor: default; }
   padding: 8px;
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  gap: 4px;
   font-weight: bold;
 }
-#side-panel-body { overflow-y: auto; flex: 1; padding: 8px; }
-/* Same look as a message bubble in the timeline — bold, per-sender
- * colored name up top, content indented under it — instead of reading as
- * a plain flat list unrelated to the chat UI it's previewing. */
+/* The title span itself — every `renderSidePanel` branch writes this
+ * markup inline (`<span>thread</span>`, `<span>threads</span>`, a
+ * profile name, ...), so this targets it structurally rather than
+ * needing a class on each one. Same shrink-then-ellipsize treatment as
+ * `#timeline-title`, for the same reason: `#side-panel` can be manually
+ * narrowed down to its 220px `min-width` via the resizer, and a longer
+ * title (a user-search panel's "messages from @somebody:server", say)
+ * would otherwise push the button group next to it into overflow. */
+#side-panel-header > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Same reasoning as `#timeline-header-actions`: every `renderSidePanel`
+ * branch's button group is a plain `<div style="display:flex;gap:6px;">`
+ * (inline styles, not a class, so this has to target it structurally) —
+ * without its own wrap, "[ mark all read ]" / "[ mark read ]" /
+ * "[ summarize ]" / "[x]" don't shrink and would overflow a narrowed
+ * side panel instead of just dropping to a second row. */
+#side-panel-header > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+/* Same WebKitGTK scroll-compositing hint as `#timeline` — see its own
+ * comment. */
+#side-panel-body { overflow-y: auto; flex: 1; padding: 8px; will-change: scroll-position; overflow-anchor: none; }
+/* Same breathing room below the last reply as `#timeline`'s own
+ * bottom padding gives the main compose box — the thread panel has its
+ * own separate compose row right below `#side-panel-body`, so it needs
+ * the same gap repeated here rather than inheriting it. */
+#thread-messages { padding-bottom: 48px; }
+/* Flat row, divider-separated — same list convention as `.room-row`
+ * (border-bottom instead of a bordered/filled card per thread), rather
+ * than each thread reading as its own separate boxed panel. */
+/* Avatar-left, content-right — same flat message-row layout the timeline
+ * itself uses (`renderMessage`/`.msg-row`), so a thread preview reads as
+ * "a message with a thread on it" instead of a differently-shaped plain
+ * text list. */
 .thread-row {
-  border: 1px solid var(--border);
-  background: var(--bg-alt);
-  padding: 6px 10px 6px calc(10px + 0.5cm);
-  margin-bottom: 6px;
-  font-size: 12px;
+  display: flex;
+  gap: 14px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: calc(var(--font-size) - 3px);
   cursor: pointer;
-  border-radius: var(--radius);
+  /* Same reasoning as `.room-row`/`.msg-row` (see their own comments) —
+   * a room with many active threads means many of these, and without
+   * this the browser redoes style/layout/paint for every one of them on
+   * every re-render (a new reply arriving, marking one read, ...) even
+   * though only a screenful is ever visible. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 110px;
 }
-.thread-row:hover { border-color: var(--accent); }
-.thread-row .sender { font-size: 12px; font-weight: bold; margin: 0 0 3px calc(-0.5cm); }
+.thread-row:hover { background: var(--bg-alt); }
+.thread-row .avatar { flex-shrink: 0; }
+.thread-row-content { min-width: 0; flex: 1; }
+.thread-row .sender { font-size: calc(var(--font-size) - 3px); font-weight: bold; margin: 0 0 3px 0; }
 .thread-row .unread-dot { color: #7bc99a; }
-.thread-row-body { white-space: pre-wrap; word-wrap: break-word; }
+.thread-row .mention-dot { color: var(--danger); }
+/* Not `white-space: pre-wrap` — same reasoning as `.bubble .body`'s own
+ * comment: this is HTML from `renderMarkdownPreview`, not raw text. */
+.thread-row-body { word-wrap: break-word; font-size: var(--font-size); }
+.thread-row-body p, .thread-row-last p { margin: 0 0 4px 0; }
+.thread-row-body p:last-child, .thread-row-last p:last-child { margin-bottom: 0; }
+.thread-row-thumb { max-width: 160px; max-height: 120px; display: block; border-radius: 6px; object-fit: cover; }
 /* The thread's latest reply, right under its first message — a border-top
  * (not just spacing) reads as "here's what happened since", distinct
  * enough from `.thread-row-body` above it not to blur into one paragraph. */
 .thread-row-last {
-  white-space: pre-wrap;
   word-wrap: break-word;
   margin-top: 4px;
   padding-top: 4px;
   border-top: 1px dashed var(--border);
   color: var(--text-weak);
+  font-size: var(--font-size);
 }
-.thread-row-meta { color: var(--text-weak); margin-top: 3px; }
-.thread-room-name { color: var(--text-weak); font-size: 11px; margin: 8px 0 2px; }
+.thread-row-meta { color: var(--text-weak); margin-top: 3px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.thread-mark-read-btn { font-size: calc(var(--font-size) - 3px); padding: 3px 8px; flex-shrink: 0; }
+.thread-room-name { color: var(--text-weak); font-size: calc(var(--font-size) - 4px); margin: 8px 0 2px; }
 #threads-filter-row { display: flex; gap: 4px; margin: 6px 8px; }
 #threads-filter { flex: 1; margin: 0; }
 
@@ -928,7 +1232,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border-radius: var(--radius);
 }
 .dialog-box h3 { margin-top: 0; font-weight: normal; }
-.dialog-box label { display: block; margin-top: 10px; font-size: 12px; color: var(--text-weak); }
+.dialog-box label { display: block; margin-top: 10px; font-size: calc(var(--font-size) - 3px); color: var(--text-weak); }
 .dialog-box input[type=text], .dialog-box input:not([type]) { width: 100%; margin-top: 2px; }
 .dialog-box .checkbox-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
 .dialog-box .checkbox-row input { width: auto; }
@@ -958,6 +1262,14 @@ button:disabled { color: var(--text-weak); cursor: default; }
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+  /* `transform` (scale/pan — see `openLightbox`'s `zoom` state in
+   * app.js) is applied directly to this element; `touch-action: none`
+   * stops the browser's own native pinch-zoom/pan from fighting the
+   * custom touch handlers driving it, which is what those handlers'
+   * `preventDefault()` calls alone don't reliably suppress on every
+   * platform this ships on (this same build also runs on Android). */
+  touch-action: none;
+  user-select: none;
 }
 .lightbox-close {
   position: absolute;
@@ -968,7 +1280,22 @@ button:disabled { color: var(--text-weak); cursor: default; }
   border-color: rgba(255, 255, 255, 0.4);
 }
 .lightbox-close:hover { border-color: #fff; }
-.shortcut-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.lightbox-zoom-controls {
+  position: absolute;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+}
+.lightbox-zoom-controls button {
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.4);
+  min-width: 44px;
+}
+.lightbox-zoom-controls button:hover { border-color: #fff; }
+.shortcut-table { width: 100%; border-collapse: collapse; font-size: calc(var(--font-size) - 3px); margin-top: 8px; }
 .shortcut-table td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .shortcut-table .shortcut-keys {
   white-space: nowrap;
@@ -993,8 +1320,27 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * the thread/security side-panel into three slivers of a screen that's
  * only ~390dp tall. A phone's shorter dimension stays roughly constant
  * across rotation, so checking height instead catches landscape phones
- * that the width check alone misses. */
-@media (max-width: 720px), (max-height: 500px) {
+ * that the width check alone misses.
+ *
+ * The third clause, `(hover: none) and (pointer: coarse)`, is what
+ * actually makes this phone-*shaped* rather than just phone-*sized*:
+ * confirmed on a real Android device reporting a CSS viewport width
+ * inside the "medium" breakpoint's 721–1100px range below (not every
+ * phone's CSS width maps to the ~360–430px a desktop browser's DevTools
+ * device emulator trains you to expect) — width/height alone would land
+ * a plain touchscreen phone in the desktop-shaped "medium" tablet layout
+ * instead, room-list and an open thread both visible but each squeezed
+ * into an uncomfortably narrow column, rather than the one-pane-at-a-time
+ * navigation an actual phone needs regardless of its exact reported CSS
+ * size. `pointer`/`hover` describe the *input*, not the screen, so this
+ * matches reliably no matter what a given device's viewport happens to
+ * report: `coarse`/`none` is a touchscreen with no mouse — true for
+ * essentially every phone (and most tablets) — while a real desktop
+ * window, however narrow someone resizes or tiles it, still has a mouse
+ * or trackpad (`fine`/`hover`) and so never matches this clause. The
+ * "medium" breakpoint right below requires the opposite of this pairing
+ * for exactly this reason, so the two can never both match at once. */
+@media (max-width: 720px), (max-height: 500px), (hover: none) and (pointer: coarse) {
   #room-list {
     width: 100%;
     min-width: 0;
@@ -1034,9 +1380,23 @@ button:disabled { color: var(--text-weak); cursor: default; }
    * always-visible pane, since there's no third slot to give it here. */
   #side-panel {
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    right: 0;
     width: 100%;
     min-width: 0;
+    /* Not part of `inset: 0` (which this used to be shorthand for) —
+     * `position: fixed`'s containing block is the actual viewport, sized
+     * independently of `html`/`body`'s own `height`, so the `--app-height`
+     * fix on those (see that variable's doc comment in this file) never
+     * reached a `fixed` element sized via `inset`/`bottom` in the first
+     * place. Thread replies live in *this* panel, not the main timeline,
+     * on mobile (where it's a full-screen overlay rather than a
+     * side-by-side pane — see this block's own media query), so its
+     * compose box was still getting covered by the on-screen keyboard
+     * exactly the way the main timeline's used to. Sizing by `height`
+     * instead of `bottom: 0` lets it pick up the same shrink. */
+    height: var(--app-height, 100%);
     z-index: 20;
     background: var(--bg);
     /* `position: fixed` escapes `#chat-screen`'s own safe-area padding
@@ -1053,39 +1413,86 @@ button:disabled { color: var(--text-weak); cursor: default; }
   /* Larger tap targets throughout — the desktop sizing (11-14px,
    * 2-8px padding) is comfortable for a mouse pointer but too small to
    * reliably hit with a finger. */
-  button, input, textarea, select { font-size: 15px; }
+  button, input, textarea, select { font-size: var(--font-size); }
   .small-btn { padding: 6px 10px; }
   .room-row { padding: 12px 8px; }
   #compose-send, #btn-compose-plus { padding: 8px 10px; }
-  .jump-latest-btn { width: 44px; height: 44px; font-size: 18px; }
+  .jump-latest-btn { width: 44px; height: 44px; font-size: calc(var(--font-size) + 3px); }
 
-  /* Desktop's 62% cap (see `.msg-col`'s own comment for why it's there —
-   * keeping a wide window from stretching bubbles absurdly wide) is the
-   * wrong tradeoff on a phone: the viewport itself is already narrow, so
-   * capping bubbles to 62% of *that* wastes most of the screen on empty
-   * gutter instead of message text, forcing far more line-wrapping than
-   * the width available would otherwise need. */
-  .msg-col { max-width: 88%; }
+}
 
-  /* The "⋯" menu trigger and `.reaction-add`/`.reaction-trigger` are all
-   * hover-only on desktop, so none of them was ever reachable on a
-   * touchscreen at all — tied to the same tap-to-reveal `.actions-open`
-   * state instead (see the bubble tap handler in app.js that adds it).
-   * All three stay absolutely positioned on the bubble's own corner, so
-   * no layout change needed here, only visibility. (An always-visible
-   * variant was tried and reverted — this tap-to-reveal behavior itself
-   * wasn't the actual complaint; the real bug was the popup these buttons
-   * open not appearing at all in the thread panel on Android — see
-   * `openActionsMenu`/`openReactionPicker`'s z-index fix.) */
-  .msg-row .msg-menu-trigger,
-  .msg-row .reaction-add,
-  .msg-row .reaction-trigger {
-    visibility: hidden;
-  }
-  .msg-row.actions-open .msg-menu-trigger,
-  .msg-row.actions-open .reaction-add,
-  .msg-row.actions-open .reaction-trigger {
-    visibility: visible;
+/* Medium ("tablet") width — wider than a phone (there's real room for
+ * `#room-list` and `#main-panel` side by side, so unlike the phone
+ * breakpoint above there's no reason to hide either one), but not wide
+ * enough to also fit a third, always-visible `#side-panel` pane without
+ * squeezing the timeline down to an uncomfortable sliver (or worse, back
+ * into the overflow/bleed layout bug a `#main-panel { overflow: hidden }`
+ * now merely hides rather than actually fixes at that width). Instead of
+ * a third pane, `#side-panel` becomes an overlay here — same idea as the
+ * phone breakpoint's full-screen one, just covering only the right-hand
+ * portion of the screen (where `#main-panel`, the open conversation,
+ * lives) rather than the whole screen. Anchored from the *right* edge
+ * specifically so `#room-list` — the actual point of keeping it around at
+ * this width instead of hiding it like the phone breakpoint does — stays
+ * fully visible and untouched on the left the entire time a thread/
+ * threads-list/etc. panel is open, instead of getting covered itself.
+ * `#main-panel`'s own content is still there underneath the instant this
+ * closes, same as it always was — nothing about it actually changes,
+ * only what's drawn on top of it meanwhile.
+ *
+ * Deliberately excludes anything the phone breakpoint already claims —
+ * `and (min-width: 721px)` skips the width side of that; the `#side-panel`
+ * rule below still loses to phone *landscape*'s `(max-height: 500px)`
+ * clause because that one lives in a later (so higher-priority, all else
+ * equal) media block, but a real tablet at this width is never that
+ * short, so the two don't actually collide in practice.
+ *
+ * `and (hover: hover) and (pointer: fine)` — the other half of what makes
+ * this desktop-*shaped* rather than just desktop-*sized*: a touchscreen
+ * phone can genuinely report a CSS width in this exact range (see the
+ * phone breakpoint's own comment on its matching `(hover: none) and
+ * (pointer: coarse)` clause), and without this, a device like that would
+ * land here instead — room-list and an open thread both squeezed into
+ * uncomfortably narrow columns side by side, rather than the one-pane
+ * phone navigation it actually needs. A real desktop/laptop window,
+ * however narrow it's resized or tiled, keeps a mouse or trackpad
+ * (`fine`/`hover`) and so is unaffected by this addition either way. */
+@media (min-width: 721px) and (max-width: 1100px) and (hover: hover) and (pointer: fine) {
+  /* Establishes the containing block `#side-panel`'s `position: absolute`
+   * below sizes/positions against — without this, it would anchor to the
+   * nearest positioned ancestor further up (the viewport, if there is
+   * none), landing in the wrong place or at the wrong size entirely. */
+  #chat-screen { position: relative; }
+
+  #resizer-right { display: none; }
+
+  #side-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    /* Same width `#room-list` defaults to (see its own rule) — not tied
+     * to it on purpose: the point is "cover a usable chunk of the
+     * conversation", not "match `#room-list`'s current hand-resized width
+     * to the pixel", and a fixed width here is far simpler than reading
+     * that live (possibly user-resized) width on every open. */
+    width: 360px;
+    max-width: 90%;
+    min-width: 0;
+    z-index: 15;
+    /* Missing on the first pass of this rule — without an opaque
+     * background, whatever was underneath showed straight through this
+     * panel's own text, both fighting for the same pixels rather than
+     * one actually covering the other. The plain (non-media) `#side-panel`
+     * rule never needed this itself (it's an ordinary flex sibling there,
+     * occupying its own separate space, nothing under it to hide), but an
+     * absolutely-positioned overlay always does — same reason the phone
+     * breakpoint's full-screen version right above sets it too. */
+    background: var(--bg);
+    /* Shadow falls toward the left — the direction of whatever's still
+     * visible underneath (`#main-panel`) — matching this panel now being
+     * anchored from the right instead of the left. */
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.5);
   }
 }
 
@@ -1108,7 +1515,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   position: absolute;
   left: 12px;
   bottom: 6px;
-  font-size: 11px;
+  font-size: calc(var(--font-size) - 4px);
   color: var(--text-weak);
   font-style: italic;
   background: var(--bg);
@@ -1122,7 +1529,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * scrolling, same idea as a room's topic bar in most chat clients. */
 #pinned-banner {
   padding: 6px 12px;
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg));
   display: flex;
@@ -1155,6 +1562,26 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .presence-dot.online { background: #6fce8f; }
 .presence-dot.unavailable { background: var(--accent); }
 .presence-dot.offline { background: var(--text-weak); }
+
+/* Presence overlaid on the message-group avatar itself (Slack/Discord-
+ * style corner badge — see `renderMessageGroup` in app.js) rather than
+ * as a separate dot next to the sender's name. The `border` — matched to
+ * the page background, not a real border color — is what makes it read
+ * as a "notch" cut out of the avatar instead of a dot merely sitting on
+ * top of it. */
+.avatar-presence-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid var(--bg);
+  background: var(--text-weak);
+}
+.avatar-presence-dot.online { background: #6fce8f; }
+.avatar-presence-dot.unavailable { background: var(--accent); }
+.avatar-presence-dot.offline { background: var(--text-weak); }
 
 /* Voice message playback — the fetched/decrypted bytes are handed to
  * `<audio>` as a data: URL, same `state.imageCache` pipeline images use
@@ -1191,7 +1618,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   margin-bottom: 4px;
   cursor: pointer;
   overflow: hidden;
-  font-size: 12px;
+  font-size: calc(var(--font-size) - 3px);
 }
 .poll .poll-option:hover { border-color: var(--accent); }
 .poll .poll-option.voted { border-color: var(--accent-strong); }
@@ -1209,7 +1636,7 @@ button:disabled { color: var(--text-weak); cursor: default; }
   justify-content: space-between;
   gap: 8px;
 }
-.poll .poll-meta { color: var(--text-weak); font-size: 11px; margin-top: 4px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.poll .poll-meta { color: var(--text-weak); font-size: calc(var(--font-size) - 4px); margin-top: 4px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .poll.ended .poll-option { cursor: default; }
 .poll-list-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; margin-bottom: 8px; }
-.poll-list-room { color: var(--text-weak); font-size: 11px; margin-bottom: 4px; }
+.poll-list-room { color: var(--text-weak); font-size: calc(var(--font-size) - 4px); margin-bottom: 4px; }

@@ -4,5 +4,5 @@
   "description": "Extra permissions needed only on Android/iOS (opener + notification plugins that replace the desktop-only `open`/`notify-rust` crates, deep-link for the OAuth redirect)",
   "platforms": ["android", "iOS"],
   "windows": ["main"],
-  "permissions": ["opener:default", "notification:default", "deep-link:default"]
+  "permissions": ["core:event:default", "opener:default", "notification:default", "deep-link:default"]
 }

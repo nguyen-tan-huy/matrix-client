@@ -1,10 +1,14 @@
 mod command;
+#[cfg(target_os = "linux")]
+mod desktop_notify;
 mod event;
 #[cfg(target_os = "linux")]
 mod gtk_theme;
 mod matrix;
 mod models;
 mod platform;
+#[cfg(target_os = "linux")]
+mod suspend_watch;
 mod tray;
 
 use command::Command;
@@ -25,14 +29,48 @@ fn send_command(
 }
 
 /// Pull side of the worker -> frontend bridge. `dist/app.js` polls this
-/// every ~150ms instead of using Tauri's push-based `event.listen` — that
-/// API turned out not to be wired up correctly in this setup (its global
-/// init script came out empty at build time, and no `Event` this app ever
-/// sent — not `LoggedIn`, not `LoginError`, nothing — reached the
-/// frontend, while `invoke("send_command", ...)` worked reliably the
-/// whole time). Draining a channel through a plain command sidesteps
-/// whatever was wrong there entirely, at the cost of up to ~150ms latency
-/// on backend-originated updates, which is unnoticeable for a chat UI.
+/// every ~150ms instead of using Tauri's push-based `event.listen`/`emit`.
+/// Tried switching to that push-based version once already (confirmed via
+/// this comment's own git history) — it stayed broken for two *different*
+/// reasons stacked on top of each other, worth recording so a third
+/// attempt doesn't have to rediscover both from scratch:
+///   1. `capabilities/default.json` granted zero permissions at all, not
+///      even `core:event:default` — silently blocked `listen()` on its
+///      own. Fixed (that permission is still granted in both capability
+///      files) and confirmed *not* sufficient by itself.
+///   2. Even with that fixed, a real device test showed the app hanging
+///      completely at boot (no `Event` ever visibly reaching the
+///      frontend — confirmed via logcat: `worker: run()` and session
+///      restore logged fine, but `StartSync` — which only ever fires from
+///      `dist/app.js`'s own `SessionChecked` handler — never did). Root
+///      cause: a genuine race, not a permissions problem. The worker
+///      thread's unprompted `Command::CheckSession` (see `matrix/worker.rs`'s
+///      `run()`) fires within milliseconds of the process starting: often
+///      *before* the WebView has finished loading `app.js` far enough to
+///      call `listen()`, whose own registration is itself an async
+///      round-trip to the Rust side. `emit()` doesn't buffer/replay for a
+///      listener that subscribes late — it's fire-to-whoever's-currently-
+///      subscribed, full stop — so that first, one-time, unprompted
+///      `SessionChecked`/`LoggedIn` pair (nothing else ever re-sends it)
+///      was lost every time, and nothing after it could ever run.
+/// Polling sidesteps this architecturally, not by accident: each call
+/// atomically drains whatever's queued *regardless of when this page's own
+/// boot code happened to run* — which is exactly the property this app
+/// needs anyway for the *other* known Android quirk already documented at
+/// the bottom of this file's frontend counterpart (the native host process
+/// restarting doesn't reliably mean the WebView's page reloaded with it,
+/// so nothing can assume a fresh `listen()` call ever happens at a
+/// predictable time relative to the backend's own boot sequence either).
+/// A genuinely race-proof push-based version is possible (e.g. buffering
+/// early events until a frontend-ready signal, or having the frontend
+/// pull once right after `listen()` resolves to catch up on anything
+/// already missed) but is real design work, not a one-line fix, so
+/// polling stays for now — at the cost of up to ~150ms latency on
+/// backend-originated updates, unnoticeable for a chat UI. See `app.js`'s
+/// own boot-time comment for how far that interval can safely be
+/// stretched (the JS side goes further: slowing it down while the page
+/// isn't visible, since a mobile device backgrounded around the clock for
+/// notifications is where 150ms-forever actually costs real battery).
 #[tauri::command]
 async fn poll_events(state: tauri::State<'_, Mutex<mpsc::UnboundedReceiver<Event>>>) -> Result<Vec<Event>, String> {
     let mut rx = state.lock().await;
@@ -42,6 +80,9 @@ async fn poll_events(state: tauri::State<'_, Mutex<mpsc::UnboundedReceiver<Event
     }
     Ok(events)
 }
+// produced; they now reach `dist/app.js` via `app.emit("backend-event",
+// ...)` in the drain task spawned there, with `window.__TAURI__.event.listen`
+// on the JS side (see the "Boot" section of app.js) replacing `poll_events`.
 
 /// Reads an image off the OS clipboard and returns it PNG-encoded.
 /// WebKitGTK's own `navigator.clipboard.read()` refuses with a permission
@@ -229,6 +270,36 @@ pub fn run() {
                 use tauri::Manager;
                 let cmd_tx_for_links = app.state::<mpsc::UnboundedSender<Command>>().inner().clone();
 
+                // UnifiedPush endpoint handoff (Android only — see
+                // `UnifiedPushServiceImpl.kt`'s doc comment for the whole
+                // flow this is one half of). Deliberately *not* a deep
+                // link the way OAuth/notification-tap routing above is:
+                // `UnifiedPushServiceImpl` is a plain background `Service`
+                // that can run with no `MainActivity`/WebView alive at
+                // all, so it has no safe way to fire a *second*
+                // `startActivity()` here — the comment on
+                // `rewriteNotificationLaunchIntent` in `MainActivity.kt`
+                // already found that races the deep-link plugin's own
+                // async setup on a cold start and silently drops. Instead
+                // Kotlin just writes the endpoint to a plain file in the
+                // app's data dir, and this reads it back unconditionally
+                // on every launch — cold or warm, no timing to get wrong.
+                // Re-registering the same pushkey every launch (rather
+                // than only when it changed) is what makes this
+                // self-healing if a previous attempt failed with no
+                // session/network yet, with no success/failure bookkeeping
+                // needed on either side.
+                #[cfg(target_os = "android")]
+                {
+                    let pending_path = crate::platform::data_dir().join("unifiedpush_endpoint.txt");
+                    if let Ok(endpoint) = std::fs::read_to_string(&pending_path) {
+                        let endpoint = endpoint.trim().to_string();
+                        if !endpoint.is_empty() {
+                            let _ = cmd_tx_for_links.send(Command::SetPushEndpoint { endpoint });
+                        }
+                    }
+                }
+
                 // Shared by both paths below: `on_open_url` only fires for
                 // links received *after* it's registered — it does NOT
                 // replay the URL that cold-started the app in the first
@@ -303,6 +374,14 @@ pub fn run() {
             // of the static built-in palette — see `gtk_theme.rs`.
             #[cfg(target_os = "linux")]
             gtk_theme::watch(app.handle().clone(), theme_event_tx);
+
+            // Auto-restarts the process on resume from suspend, before the
+            // known post-sleep freeze (sync loop stuck on a dead pooled
+            // connection, or WebKitGTK's compositor left broken by the GPU
+            // driver reset) ever gets a chance to show up — see
+            // `suspend_watch.rs`.
+            #[cfg(target_os = "linux")]
+            tauri::async_runtime::spawn(suspend_watch::watch());
 
             // Closing the window (the X button) hides it instead of
             // quitting on desktop — the sync loop and tray keep running in

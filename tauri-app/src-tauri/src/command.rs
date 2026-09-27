@@ -13,6 +13,11 @@ pub enum Command {
     LoginOAuth {
         homeserver: String,
     },
+    /// Signs out of the current session — invalidates this device's access
+    /// token server-side (best-effort; the local session/store is wiped
+    /// either way, see `Event::LoggedOut`) and stops the background sync
+    /// service, then drops the frontend back to the login screen.
+    Logout,
     StartSync,
     /// Under `RoomListService` (sliding sync) there's no "rescan everything"
     /// primitive anymore — the room list is always live. This now just
@@ -136,6 +141,18 @@ pub enum Command {
         /// Same idea as `SendMessage`'s `local_id`.
         local_id: String,
     },
+    /// Uploads an arbitrary file (picked from disk, any type — a PDF, a
+    /// zip, an APK, ...) and sends it as an `m.file` message. Same upload
+    /// path and event shape as `Command::SendImage`, just a different
+    /// `MessageType` and no image-specific handling (thumbnail, dimensions).
+    SendFile {
+        room_id: String,
+        thread_id: Option<String>,
+        filename: String,
+        bytes: Vec<u8>,
+        mime: String,
+        local_id: String,
+    },
     StartSelfVerification,
     ConfirmVerification,
     CancelVerification,
@@ -204,6 +221,15 @@ pub enum Command {
         filename: String,
         media_encryption: Option<String>,
     },
+    /// Opens an ordinary `http(s)://` link found in a message body in the
+    /// system's default browser — the frontend intercepts every such
+    /// click and routes it here instead of letting the webview navigate
+    /// itself (which would replace the whole app with the target page).
+    /// Reuses `platform::open_url`, the same helper the OAuth/SSO login
+    /// step already calls to hand a URL off to the OS.
+    OpenUrl {
+        url: String,
+    },
     /// Downloads an attachment (image/video/file) via `client.media()` and
     /// saves it into the user's Downloads folder (falling back to home if
     /// the OS has no such directory configured), rather than the temp file
@@ -267,6 +293,16 @@ pub enum Command {
         room_id: String,
         mode: String,
     },
+    /// Sets or clears the room's `m.favourite` tag (same mechanism/server
+    /// endpoint Element's own "Favourites" uses) — the room list sorts
+    /// favorited rooms to the top. Answered with `Event::RoomFavoriteSet`
+    /// once the server confirms, rather than waiting on the *next* sync
+    /// to notice the account-data echo (which, unlike a timeline event,
+    /// isn't guaranteed to show up as a room-list diff at all).
+    SetRoomFavorite {
+        room_id: String,
+        favorite: bool,
+    },
     /// Shows a desktop notification for a new message. Handled with
     /// `notify-rust` directly rather than `tauri-plugin-notification` —
     /// that plugin's Linux `show()` call panics ("Cannot start a runtime
@@ -305,6 +341,24 @@ pub enum Command {
         room_id: String,
         event_id: String,
         emoji: String,
+    },
+    /// Android only — registers (or refreshes) a Matrix `http` pusher
+    /// pointed at a UnifiedPush endpoint, so the homeserver can wake this
+    /// app up via push even when its process has been fully killed, the
+    /// same way Element uses FCM for this. `endpoint` is the full URL a
+    /// UnifiedPush distributor (e.g. the ntfy app) handed back after
+    /// `UnifiedPushServiceImpl.kt`'s `onNewEndpoint` registered with it —
+    /// see `lib.rs`'s `matrixtauriclient://push-endpoint?...` deep-link
+    /// case for how it gets from Kotlin to here, and this command's own
+    /// handler in `worker.rs` for how the endpoint URL turns into the
+    /// pusher's `pushkey`/gateway `url` fields. Sent unconditionally on
+    /// every cold start (not just when the endpoint actually changed) —
+    /// re-registering the same pushkey is a harmless no-op server-side,
+    /// and that's what makes this self-healing if a previous attempt
+    /// failed (no session yet, no network, ...) without needing any
+    /// success/failure bookkeeping of its own.
+    SetPushEndpoint {
+        endpoint: String,
     },
     /// Reads the room's custom emoji/sticker pack(s) — `im.ponies.room_emotes`
     /// state events (MSC2545, any state key) — plus the user's own
@@ -366,6 +420,17 @@ pub enum Command {
     /// require already knowing/typing their exact `@name:server` id.
     /// Answered with `Event::AllUsers`.
     ListAllUsers,
+    /// Searches the homeserver's user directory (`/user_directory/search`)
+    /// for `query` — backs "invite to room" so the user can find someone
+    /// by display name instead of having to already know/type their exact
+    /// `@name:server` id. Unlike `Command::ListAllUsers` this isn't limited
+    /// to people already sharing a room, but (per the spec) only returns
+    /// users the homeserver is willing to disclose — typically anyone on
+    /// the same homeserver, plus anyone else already sharing a room.
+    /// Answered with `Event::DirectoryUsers`.
+    SearchDirectoryUsers {
+        query: String,
+    },
     /// Looks up a single event by ID and reports back (via
     /// `Event::SharedEventResolved`) whether it exists and, if so, whether
     /// it's a thread reply — and if it is, that thread's root event ID.

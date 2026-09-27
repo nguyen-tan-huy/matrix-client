@@ -101,8 +101,11 @@ class ForegroundSyncService : Service() {
     // not the Rust sync worker (which only ever starts from
     // `MainActivity`) — a real fix needs either the user disabling
     // MIUI's restrictions for this app (Settings → Battery & performance
-    // → App battery saver → Matrix → No restrictions), or push
-    // notifications (FCM), which — unlike this — really does survive a
-    // full kill, at the cost of needing a push gateway configured on the
-    // homeserver side.
+    // → App battery saver → Matrix → No restrictions), or real push
+    // notifications, which — unlike this — really do survive a full kill.
+    // See `UnifiedPushServiceImpl` for that: this service and that one are
+    // complementary now, not an either/or — this keeps the live sync loop
+    // (and therefore full-content notifications) running for as long as
+    // Android/the OEM skin tolerates it, and UnifiedPush is what catches
+    // the case where they didn't.
 }

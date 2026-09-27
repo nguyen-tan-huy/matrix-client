@@ -37,6 +37,11 @@ class MainActivity : TauriActivity() {
     // while the app isn't in the foreground.
     ContextCompat.startForegroundService(this, Intent(this, ForegroundSyncService::class.java))
     requestBatteryOptimizationExemption()
+    // See `UnifiedPushServiceImpl`'s doc comment — real push, on top of
+    // (not instead of) the foreground service above, so notifications
+    // still arrive after the process has been fully killed. Cheap/no-op
+    // to call on every launch once already registered.
+    UnifiedPushServiceImpl.register(this)
     handleNotificationTap(intent)
   }
 

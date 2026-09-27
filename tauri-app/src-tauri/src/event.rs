@@ -127,11 +127,31 @@ pub enum Event {
         threads: Vec<TimelineEvent>,
         reached_end: bool,
     },
-    /// A room's joined members, for the @mention autocomplete. `members` is
-    /// `(user_id, display_name)` pairs.
+    /// A room's joined members, for the @mention autocomplete and (via
+    /// the third tuple element, added for this) the read-receipt avatar
+    /// stack — `app.js` already reads this array positionally
+    /// (`[user_id, display_name]`) everywhere else, so adding a trailing
+    /// `avatar_url` here doesn't disturb any of those existing call
+    /// sites. `members` is `(user_id, display_name, avatar_url)` triples.
     Members {
         room_id: String,
-        members: Vec<(String, String)>,
+        members: Vec<(String, String, Option<String>)>,
+    },
+    /// Pushed whenever an `m.receipt` ephemeral event arrives for a room
+    /// this account is in — see `register_receipt_handler` in
+    /// `worker.rs`. Exists so a read receipt sent from a *different*
+    /// device/session (marking read on desktop, say) actually clears this
+    /// room's unread badge here too, live, without needing this app to be
+    /// restarted first. `unread_count`/`mention_count` are freshly
+    /// recomputed at the moment the receipt arrived — same
+    /// `num_unread_notifications()`/`num_unread_mentions()` derivation
+    /// `RoomSummary` itself uses, just without the rest of a full summary
+    /// (name/avatar/preview/...), none of which a receipt could have
+    /// changed anyway.
+    UnreadCountChanged {
+        room_id: String,
+        unread_count: u64,
+        mention_count: u64,
     },
     /// Response to `Command::Summarize` — echoes `thread_root_id` back
     /// (as opposed to just carrying `room_id` alone) so the UI knows
@@ -228,6 +248,14 @@ pub enum Event {
         room_id: String,
         mode: String,
     },
+    /// Response to `Command::SetRoomFavorite` once the server's confirmed
+    /// it — the frontend updates that one room's `is_favorite` and
+    /// re-sorts the list on this rather than waiting for a room-list diff
+    /// that account-data changes aren't guaranteed to produce.
+    RoomFavoriteSet {
+        room_id: String,
+        favorite: bool,
+    },
     /// The user clicked a notification shown for `Command::ShowNotification`
     /// (desktop) or tapped one on Android (routed back in via
     /// `Command::HandleNotificationClick`).
@@ -263,6 +291,13 @@ pub enum Event {
     /// pairs, one per distinct joined member across every joined room.
     AllUsers {
         users: Vec<(String, String)>,
+    },
+    /// Response to `Command::SearchDirectoryUsers`. `query` is echoed back
+    /// so the UI can drop a stale response that lands after the input has
+    /// since changed (the classic type-ahead race).
+    DirectoryUsers {
+        query: String,
+        users: Vec<crate::models::DirectoryUser>,
     },
 
     /// Response to `Command::ResolveSharedEvent`. `found: false` means the
@@ -334,6 +369,21 @@ pub enum Event {
         event_id: String,
         event: Option<TimelineEvent>,
     },
+
+    /// The server has stopped honoring this device's access token (401
+    /// `M_UNKNOWN_TOKEN`/`M_MISSING_TOKEN` — logged out from another
+    /// client, the device removed, or the server invalidated it some other
+    /// way). The stored local session/store has already been wiped by the
+    /// time this is sent (see `report_command_error` in `matrix/worker.rs`)
+    /// — there's nothing left to reuse, so the frontend should drop back
+    /// to the login screen rather than leave the user stuck looking at a
+    /// chat view that can never load anything again.
+    SessionExpired,
+    /// Response to `Command::Logout` — the user signed out deliberately
+    /// (as opposed to `SessionExpired`, which is the server yanking the
+    /// session out from under them). Same "drop back to login" handling on
+    /// the frontend, just without the "your session expired" framing.
+    LoggedOut,
 
     Error(String),
 }

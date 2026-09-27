@@ -304,6 +304,32 @@ fn clear_stale_store() {
     let _ = std::fs::remove_file(session_file());
 }
 
+/// Shared error-reporting tail for every spawned command handler in
+/// `run()`'s dispatch loop — always forwards `err` to the frontend as
+/// `Event::Error` (same as before), but first checks whether it's the
+/// server flatly rejecting this device's access token (a 401
+/// `M_UNKNOWN_TOKEN`/`M_MISSING_TOKEN` — the session was revoked
+/// server-side: logged out from another client, the device removed, or
+/// the server invalidated it some other way). `CheckSession`'s
+/// `restore_session()` is purely local — it never asks the server whether
+/// the stored token still works — so a revoked token wasn't previously
+/// caught until *some* real request happened to fail with it, and even
+/// then the frontend just showed the raw error and sat there stuck: the
+/// chat view stayed up, but every action failed the same way, with no
+/// path back to the login screen short of manually clearing app data.
+/// Once this fires, that stale session/store can't be reused for
+/// anything, so it's wiped here and `Event::SessionExpired` sent
+/// alongside so the frontend can drop back to login itself.
+async fn report_command_error(err: anyhow::Error, state: &Arc<Mutex<WorkerState>>, tx: &UnboundedSender<Event>) {
+    let msg = err.to_string();
+    if msg.contains("M_UNKNOWN_TOKEN") || msg.contains("M_MISSING_TOKEN") {
+        state.lock().await.client = None;
+        clear_stale_store();
+        tx.send(Event::SessionExpired).ok();
+    }
+    tx.send(Event::Error(msg)).ok();
+}
+
 async fn build_client(homeserver: &str) -> anyhow::Result<Client> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
@@ -325,6 +351,14 @@ async fn build_client(homeserver: &str) -> anyhow::Result<Client> {
                 .retry_limit(2),
         )
         .sqlite_store(dir.join("store"), None)
+        // Without this, an expired access token just fails outright even
+        // when the session has a perfectly good refresh token sitting
+        // right next to it — the SDK won't use it unless told to. See
+        // `spawn_session_change_watcher` for the other half of this (the
+        // refreshed tokens still need to be re-persisted to disk, and an
+        // outright rejection with no refresh token to fall back on still
+        // needs to be reported).
+        .handle_refresh_tokens()
         .build()
         .await?;
     Ok(client)
@@ -351,6 +385,54 @@ fn persist_session(client: &Client, homeserver: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(session_file(), json)?;
     Ok(())
+}
+
+/// Watches `client`'s token lifecycle for as long as this session lasts,
+/// so it doesn't rot silently. Two things `handle_refresh_tokens()` alone
+/// doesn't cover:
+///
+/// - `SessionChange::TokensRefreshed`: the SDK swapped in a new access
+///   (and, usually, refresh) token on its own — but the on-disk copy
+///   `persist_session` wrote at login is now stale. Refresh tokens are
+///   typically one-time-use, so restoring from that stale copy after a
+///   restart would hand the server an already-spent token and fail
+///   outright, throwing away a session that was actually still fine right
+///   up until the restart. Re-persisting here keeps the file current.
+/// - `SessionChange::UnknownToken`: the server flatly rejected the
+///   token — expired with no usable refresh token, revoked, the device
+///   removed, etc. Previously the *only* way this surfaced was
+///   `report_command_error` noticing "M_UNKNOWN_TOKEN" in some later
+///   command's error text — which meant nothing happened until the user's
+///   next explicit action, and a request that fails inside a background
+///   task (the sliding-sync loop, in particular) never goes through
+///   `report_command_error` at all, so the app could sit there fully
+///   broken with no explanation until something else finally surfaced it.
+///   This reacts to the SDK's own signal immediately instead.
+fn spawn_session_change_watcher(
+    client: Client,
+    homeserver: String,
+    state: Arc<Mutex<WorkerState>>,
+    tx: UnboundedSender<Event>,
+) {
+    let mut changes = client.subscribe_to_session_changes();
+    tokio::spawn(async move {
+        while let Ok(change) = changes.recv().await {
+            match change {
+                matrix_sdk::SessionChange::TokensRefreshed => {
+                    if let Err(e) = persist_session(&client, &homeserver) {
+                        tracing::warn!(error = %e, "failed to persist refreshed session tokens");
+                    }
+                }
+                matrix_sdk::SessionChange::UnknownToken(_) => {
+                    tracing::warn!("session token rejected by homeserver");
+                    state.lock().await.client = None;
+                    clear_stale_store();
+                    tx.send(Event::SessionExpired).ok();
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// Everything the worker needs to keep around between commands. Lives only
@@ -502,9 +584,10 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
         match &cmd {
             Command::FetchImage { .. } | Command::PlayVideo { .. } => {
                 let cmd_for_task = cmd;
+                let state_for_error = state.clone();
                 image_runtime().spawn(async move {
                     if let Err(err) = handle(cmd_for_task, state, tx.clone()).await {
-                        let _ = tx.send(Event::Error(err.to_string()));
+                        report_command_error(err, &state_for_error, &tx).await;
                     }
                 });
             }
@@ -516,20 +599,23 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, tx: UnboundedSender<Event>)
             | Command::SearchUserMessages { .. }
             | Command::SearchMessages { .. }
             | Command::ListAllUsers
+            | Command::SearchDirectoryUsers { .. }
             | Command::ListPolls { .. }
             | Command::ResolveSharedEvent { .. } => {
                 let cmd_for_task = cmd;
+                let state_for_error = state.clone();
                 timeline_runtime().spawn(async move {
                     if let Err(err) = handle(cmd_for_task, state, tx.clone()).await {
-                        let _ = tx.send(Event::Error(err.to_string()));
+                        report_command_error(err, &state_for_error, &tx).await;
                     }
                 });
             }
             _ => {
+                let state_for_error = state.clone();
                 tokio::spawn(async move {
                     if let Err(err) = handle(cmd, state, tx.clone()).await {
                         tracing::error!(error = %err, "command failed");
-                        let _ = tx.send(Event::Error(err.to_string()));
+                        report_command_error(err, &state_for_error, &tx).await;
                     }
                 });
             }
@@ -582,9 +668,45 @@ async fn handle(
                 }
             };
             client.restore_session(stored.session).await?;
+            spawn_session_change_watcher(client.clone(), stored.homeserver.clone(), state.clone(), tx.clone());
             state.lock().await.client = Some(client);
             tracing::info!("check_session: restored successfully");
             tx.send(Event::SessionChecked(true)).ok();
+        }
+
+        Command::Logout => {
+            let (client, sync_service) = {
+                let mut guard = state.lock().await;
+                (guard.client.take(), guard.sync_service.take())
+            };
+            // Stop the background sync loop first — it holds its own clone
+            // of the client and would otherwise keep hitting the server
+            // with a token that's about to be (or already is) invalid.
+            if let Some(sync_service) = sync_service {
+                sync_service.stop().await;
+            }
+            if let Some(client) = client {
+                // Best-effort: even if the server-side logout call fails
+                // (already-invalid token, network down, ...) the local
+                // session is wiped regardless right below — there's
+                // nothing else useful to retry it against, and the user
+                // asked to sign out either way.
+                if let Err(err) = client.logout().await {
+                    tracing::warn!(error = %err, "logout: server-side logout call failed, clearing local session anyway");
+                }
+            }
+            clear_stale_store();
+            {
+                let mut guard = state.lock().await;
+                guard.room_timelines.clear();
+                guard.thread_timelines.clear();
+                guard.thread_reply_cursors.clear();
+                guard.thread_list_cursors.clear();
+                guard.confirmed_read.clear();
+                guard.room_list_controller = None;
+                guard.typing_guard = None;
+            }
+            tx.send(Event::LoggedOut).ok();
         }
 
         Command::LoginPassword {
@@ -600,12 +722,14 @@ async fn handle(
                             .matrix_auth()
                             .login_username(&username, &password)
                             .initial_device_display_name("Matrix egui Client")
+                            .request_refresh_token()
                             .send(),
                     )
                     .await
                     {
                         Ok(_) => {
                             let _ = persist_session(&client, &homeserver);
+                            spawn_session_change_watcher(client.clone(), homeserver.clone(), state.clone(), tx.clone());
                             state.lock().await.client = Some(client);
                             tx.send(Event::LoggedIn).ok();
                         }
@@ -689,6 +813,7 @@ async fn handle(
                                                         .initial_device_display_name(
                                                             "Matrix egui Client",
                                                         )
+                                                        .request_refresh_token()
                                                         .send(),
                                                 )
                                                 .await;
@@ -711,6 +836,7 @@ async fn handle(
                                                         "oauth: token exchange succeeded"
                                                     );
                                                     let _ = persist_session(&client, &homeserver);
+                                                    spawn_session_change_watcher(client.clone(), homeserver.clone(), state.clone(), tx.clone());
                                                     state.lock().await.client = Some(client);
                                                     tx.send(Event::LoggedIn).ok();
                                                 }
@@ -743,11 +869,35 @@ async fn handle(
         }
 
         Command::StartSync => {
+            // Guards against ever running this handler's body twice in one
+            // process lifetime. It's only ever meant to run once (on
+            // `SessionChecked`/`LoggedIn`, right after login/restore — see
+            // `app.js`), but nothing previously enforced that: every
+            // `register_*_handler` call below is a bare `client.add_event_handler`
+            // (matrix-sdk stacks handlers, it doesn't replace by type), and
+            // the `SyncService` built further down replaces
+            // `state.sync_service` outright with no `.stop()` on whatever
+            // was there before — `SyncService` has no `Drop` impl, so its
+            // background sync task doesn't get cancelled just because the
+            // `Arc` referencing it was overwritten; it keeps running,
+            // detached, forever. A second `StartSync` firing for any
+            // reason (a future bug, a frontend double-send, ...) would
+            // therefore have silently doubled every live event and every
+            // sync loop running in the process from then on — worse with
+            // each further occurrence — which reads exactly like "gets
+            // laggier over time, only a full restart fixes it." Cheap
+            // enough to guard against outright even without a confirmed
+            // trigger for it today.
+            if state.lock().await.sync_service.is_some() {
+                tracing::warn!("StartSync: already running, ignoring duplicate call");
+                return Ok(());
+            }
             let client = get_client(&state).await?;
             register_new_message_handler(&client, tx.clone());
             register_redaction_handler(&client, tx.clone());
             register_reaction_handler(&client, tx.clone());
             register_sticker_handler(&client, tx.clone());
+            register_receipt_handler(&client, tx.clone());
             register_pinned_events_handler(&client, tx.clone());
             register_poll_handlers(&client, tx.clone());
             register_presence_handler(&client, tx.clone());
@@ -1286,7 +1436,7 @@ async fn handle(
                 .members(matrix_sdk::RoomMemberships::JOIN)
                 .await?
                 .into_iter()
-                .map(|m| (m.user_id().to_string(), m.name().to_string()))
+                .map(|m| (m.user_id().to_string(), m.name().to_string(), m.avatar_url().map(|u| u.to_string())))
                 .collect();
 
             tx.send(Event::Members { room_id, members }).ok();
@@ -1353,7 +1503,17 @@ async fn handle(
             // a "sending…" indicator; this gives back the real event ID (or
             // an error) as soon as the HTTP round trip completes, without
             // waiting on a `/sync` echo.
-            match room.send(content).await {
+            //
+            // Reusing `local_id` itself as the event's transaction ID (rather
+            // than letting `room.send` generate a random one) is what lets
+            // `register_new_message_handler`'s live echo read it straight
+            // back off `unsigned.transaction_id` once this message comes
+            // down `/sync` — see `TimelineEvent::local_id`'s doc comment —
+            // so `app.js` can reconcile that echo with the optimistic
+            // "sending…" bubble it already rendered instead of showing the
+            // message twice.
+            let txn_id: matrix_sdk::ruma::OwnedTransactionId = local_id.as_str().into();
+            match room.send(content).with_transaction_id(txn_id).await {
                 Ok(_) => {
                     tx.send(Event::MessageSent {
                         thread_id,
@@ -1404,6 +1564,71 @@ async fn handle(
             };
             let mut content = RoomMessageEventContent::new(MessageType::Image(
                 ImageMessageEventContent::plain(filename, upload.content_uri),
+            ));
+
+            if let Some(thread_id) = &thread_id {
+                let root_event_id = OwnedEventId::try_from(thread_id.as_str())?;
+                content.relates_to =
+                    Some(matrix_sdk::ruma::events::room::message::Relation::Thread(
+                        matrix_sdk::ruma::events::relation::Thread::without_fallback(root_event_id),
+                    ));
+            }
+
+            match room.send(content).await {
+                Ok(_) => {
+                    tx.send(Event::MessageSent {
+                        thread_id,
+                        local_id,
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    tx.send(Event::MessageSendFailed {
+                        thread_id,
+                        local_id,
+                        error: e.to_string(),
+                    })
+                    .ok();
+                }
+            }
+        }
+
+        Command::SendFile {
+            room_id,
+            thread_id,
+            filename,
+            bytes,
+            mime,
+            local_id,
+        } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            let content_type: mime::Mime = mime.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+            let size = bytes.len();
+
+            let upload = match client.media().upload(&content_type, bytes, None).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tx.send(Event::MessageSendFailed {
+                        thread_id,
+                        local_id,
+                        error: e.to_string(),
+                    })
+                    .ok();
+                    return Ok(());
+                }
+            };
+
+            use matrix_sdk::ruma::events::room::message::{
+                FileInfo, FileMessageEventContent, MessageType, RoomMessageEventContent,
+            };
+            let mut info = FileInfo::default();
+            info.mimetype = Some(content_type.to_string());
+            info.size = matrix_sdk::ruma::UInt::new(size as u64);
+            let mut content = RoomMessageEventContent::new(MessageType::File(
+                FileMessageEventContent::plain(filename, upload.content_uri).info(Box::new(info)),
             ));
 
             if let Some(thread_id) = &thread_id {
@@ -1594,24 +1819,38 @@ async fn handle(
                 ReplacementMetadata, RoomMessageEventContent,
             };
 
-            let new_content = match html_body {
+            let mut new_content = match html_body {
                 Some(html) => RoomMessageEventContent::text_html(body.clone(), html),
                 None => RoomMessageEventContent::text_plain(body.clone()),
             };
-            let mut edit =
-                new_content.make_replacement(ReplacementMetadata::new(target, None));
             if !mentions.is_empty() {
                 let user_ids: std::collections::BTreeSet<_> = mentions
                     .iter()
                     .filter_map(|m| matrix_sdk::ruma::OwnedUserId::try_from(m.as_str()).ok())
                     .collect();
                 if !user_ids.is_empty() {
-                    edit = edit
+                    new_content = new_content
                         .add_mentions(matrix_sdk::ruma::events::Mentions::with_user_ids(user_ids));
                 }
             }
+            // `add_mentions` must run *before* `make_replacement` — ruma's
+            // own doc comment on it says so explicitly: `make_replacement`
+            // copies the mentions present at call time into `m.new_content`
+            // and filters `content.mentions` against the *original*
+            // message's mentions (via `ReplacementMetadata`) so only
+            // genuinely new mentions re-trigger a notification. Called the
+            // other way around (as this was until now), the edit's own
+            // mentions ended up missing from the sent event — a real bug
+            // on its own, independent of whatever else is wrong with
+            // edits (see the `if let Err` below, added at the same time
+            // to stop a failed edit from silently doing nothing visible).
+            let edit = new_content.make_replacement(ReplacementMetadata::new(target, None));
 
-            room.send(edit).await?;
+            if let Err(e) = room.send(edit).await {
+                tracing::warn!(error = %e, event_id, "EditMessage: room.send failed");
+                tx.send(Event::Error(format!("failed to edit message: {e}"))).ok();
+                return Ok(());
+            }
 
             // Optimistic, same reasoning as `DeleteMessage`.
             tx.send(Event::MessageEdited {
@@ -1692,10 +1931,24 @@ async fn handle(
             };
 
             if let Some(event_id) = latest_event_id {
-                use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
-                use matrix_sdk::ruma::events::receipt::ReceiptThread;
-                room.send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, event_id.clone())
-                    .await?;
+                // `send_single_receipt` alone only advances the public
+                // `m.receipt` — other clients (Element on Android/iOS/web
+                // included) primarily key their own unread-dot/bold-room
+                // state off the *fully-read marker* (`m.fully_read`,
+                // room account data) instead, which that call never
+                // touches. Marking read here but not there meant this
+                // room correctly zeroed its own unread badge in this app,
+                // while every other client/session on the same account
+                // kept showing it unread until they separately caught up
+                // past this point on their own — not actually a Rust bug,
+                // just an incomplete "mark read" that only ever touched
+                // half of what Matrix clients check. `send_multiple_receipts`
+                // sets both in one request.
+                use matrix_sdk::room::Receipts;
+                let receipts = Receipts::new()
+                    .fully_read_marker(event_id.clone())
+                    .public_read_receipt(event_id.clone());
+                room.send_multiple_receipts(receipts).await?;
 
                 let mut guard = state.lock().await;
                 guard.confirmed_read.insert(room_id.clone());
@@ -1848,6 +2101,14 @@ async fn handle(
 
             tx.send(Event::NotificationMode { room_id, mode }).ok();
         }
+        Command::SetRoomFavorite { room_id, favorite } => {
+            let client = get_client(&state).await?;
+            let room = client
+                .get_room(RoomId::parse(&room_id)?.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("room not found"))?;
+            room.set_is_favourite(favorite, None).await?;
+            tx.send(Event::RoomFavoriteSet { room_id, favorite }).ok();
+        }
         Command::ShowNotification { room_id, thread_id, title, body } => {
             // Only the Linux (D-Bus/xdg) backend has an async API
             // (`show_async`/`wait_for_action_async`) — Windows and macOS's
@@ -1855,7 +2116,22 @@ async fn handle(
             // `wait_for_response`), so those run on a blocking-pool thread
             // instead, via `spawn_blocking`, to avoid parking one of the
             // async runtime's own worker threads on `events.recv()`.
-            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "ios"))))]
+            //
+            // Linux goes through `desktop_notify` instead: notify-rust opens a
+            // new session-bus connection per notification and holds it until
+            // clicked/closed, which under swaync's DND is never — leaking
+            // connections until dbus-broker ran out of fds and crashed the
+            // session. See that module's doc comment.
+            #[cfg(target_os = "linux")]
+            {
+                let on_click = move || {
+                    tx.send(Event::NotificationClicked { room_id, thread_id }).ok();
+                };
+                if let Err(err) = crate::desktop_notify::show(&title, &body, on_click).await {
+                    tracing::warn!(error = %err, "failed to show desktop notification");
+                }
+            }
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos", target_os = "android", target_os = "ios"))))]
             {
                 let handle = notify_rust::Notification::new()
                     .summary(&title)
@@ -1969,6 +2245,82 @@ async fn handle(
             .ok();
         }
 
+        // See `Command::SetPushEndpoint`'s own doc comment for the whole
+        // picture. This runs right at cold start (`lib.rs`'s `.setup()`
+        // fires it unconditionally whenever Kotlin has a stored endpoint),
+        // often racing `CheckSession`'s own login restore — waits up to
+        // ~10s for `state.client` to show up rather than just failing once
+        // and never trying again, since there's no other retry for this
+        // one launch (there will be a fresh attempt next launch either
+        // way, but there's no reason to waste this one on a race that
+        // usually resolves within a second or two).
+        Command::SetPushEndpoint { endpoint } => {
+            let client = {
+                let mut client = state.lock().await.client.clone();
+                let mut waited = 0;
+                while client.is_none() && waited < 20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    client = state.lock().await.client.clone();
+                    waited += 1;
+                }
+                client
+            };
+            let Some(client) = client else {
+                tracing::warn!("set_push_endpoint: no session after waiting, skipping for this launch");
+                return Ok(());
+            };
+
+            let endpoint_url = match url::Url::parse(&endpoint) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(error = %e, "set_push_endpoint: invalid endpoint URL");
+                    return Ok(());
+                }
+            };
+            let Some(host) = endpoint_url.host_str() else {
+                tracing::warn!("set_push_endpoint: endpoint URL has no host");
+                return Ok(());
+            };
+            let port_suffix = endpoint_url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            // The distributor's own ntfy-compatible server doubles as the
+            // Matrix push gateway at this fixed path on the same host —
+            // see `ForegroundSyncService.kt`'s sibling doc comment in
+            // `UnifiedPushServiceImpl.kt` for the full flow this is one
+            // half of. `pushkey` is the endpoint itself (unique per
+            // install, carries the topic the gateway needs to forward
+            // to); `data.url` is that gateway's generic notify endpoint,
+            // not the topic-specific one.
+            let gateway_url =
+                format!("{}://{}{}/_matrix/push/v1/notify", endpoint_url.scheme(), host, port_suffix);
+
+            use matrix_sdk::ruma::api::client::push::{set_pusher, Pusher, PusherIds, PusherInit, PusherKind};
+            use matrix_sdk::ruma::push::{HttpPusherData, PushFormat};
+
+            let mut http_data = HttpPusherData::new(gateway_url);
+            // Keeps message content out of the third-party push
+            // gateway/distributor entirely — the homeserver only tells it
+            // "something happened in this room", and the app does its own
+            // real `/sync` once woken to find out what and show it. Same
+            // default Element itself has used for exactly this privacy
+            // reason since it added UnifiedPush support.
+            http_data.format = Some(PushFormat::EventIdOnly);
+
+            let pusher: Pusher = PusherInit {
+                ids: PusherIds::new(endpoint.clone(), "com.example.matrixtauriclient".to_string()),
+                kind: PusherKind::Http(http_data),
+                app_display_name: "Matrix (UnifiedPush)".to_string(),
+                device_display_name: "Android".to_string(),
+                profile_tag: None,
+                lang: "en".to_string(),
+            }
+            .into();
+
+            match client.send(set_pusher::v3::Request::post(pusher)).await {
+                Ok(_) => tracing::info!("set_push_endpoint: pusher registered"),
+                Err(e) => tracing::warn!(error = %e, "set_push_endpoint: pushers/set failed"),
+            }
+        }
+
         Command::ListImagePacks { room_id } => {
             let client = get_client(&state).await?;
             let images = list_image_packs(&client, &room_id).await;
@@ -2044,6 +2396,30 @@ async fn handle(
             let mut users: Vec<(String, String)> = by_id.into_iter().collect();
             users.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
             tx.send(Event::AllUsers { users }).ok();
+        }
+
+        Command::SearchDirectoryUsers { query } => {
+            let client = get_client(&state).await?;
+            let mut users = Vec::new();
+            if !query.trim().is_empty() {
+                match client.search_users(query.trim(), 20).await {
+                    Ok(response) => {
+                        users = response
+                            .results
+                            .into_iter()
+                            .map(|u| crate::models::DirectoryUser {
+                                user_id: u.user_id.to_string(),
+                                display_name: u.display_name,
+                                avatar_url: u.avatar_url.map(|url| url.to_string()),
+                            })
+                            .collect();
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, query, "SearchDirectoryUsers: search failed");
+                    }
+                }
+            }
+            tx.send(Event::DirectoryUsers { query, users }).ok();
         }
 
         Command::ResolveSharedEvent { room_id, event_id } => {
@@ -2164,10 +2540,18 @@ async fn handle(
                     mentions_me: false,
                     mentioned_user_ids: Vec::new(),
                     reactions: Vec::new(),
+                    read_by: Vec::new(),
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    latest_reply_event_id: None,
+                    latest_reply_mentions_me: false,
+                    latest_reply_msg_type: None,
+                    latest_reply_media_url: None,
+                    latest_reply_media_mime: None,
+                    latest_reply_media_encryption: None,
                     is_unread: None,
+                    local_id: None,
                 };
                 tx.send(Event::NewMessage { room_id, event }).ok();
             }
@@ -2226,6 +2610,12 @@ async fn handle(
                 Err(e) => {
                     tx.send(Event::Error(format!("download failed: {e}"))).ok();
                 }
+            }
+        }
+
+        Command::OpenUrl { url } => {
+            if let Err(e) = crate::platform::open_url(&url) {
+                tx.send(Event::Error(format!("failed to open link: {e}"))).ok();
             }
         }
 
@@ -2871,6 +3261,24 @@ async fn get_client(state: &Arc<Mutex<WorkerState>>) -> anyhow::Result<Client> {
         .ok_or_else(|| anyhow::anyhow!("not logged in"))
 }
 
+/// The room list's avatar for a room, with the same "no room avatar set"
+/// fallback `display_name()` already applies to the *name*: for a 1:1 DM
+/// with no explicit `m.room.avatar`, use the other member's profile
+/// avatar (the SDK's computed `heroes()`) instead of leaving it blank.
+/// Without this, a DM whose name correctly falls back to the other
+/// member's display name still shows a blank/initial avatar in the room
+/// list while the timeline (which reads the sender's profile directly)
+/// shows their real photo — the two disagreeing on the same person.
+fn resolve_room_avatar_url(room: &matrix_sdk::Room) -> Option<String> {
+    if let Some(url) = room.avatar_url() {
+        return Some(url.to_string());
+    }
+    if room.direct_targets_length() != 1 {
+        return None;
+    }
+    room.heroes().into_iter().find_map(|hero| hero.avatar_url.map(|u| u.to_string()))
+}
+
 /// Converts one `room_list_service::RoomListItem` (a real, resolved room —
 /// MSC4186/this SDK version has no "not-yet-synced placeholder" concept the
 /// way the older MSC3575 draft's `RoomListEntry::Empty` did) into a
@@ -2905,6 +3313,7 @@ async fn entry_to_summary(
         .await
         .map(|n| n.to_string())
         .unwrap_or_else(|_| room_id_str.clone());
+    let avatar_url = resolve_room_avatar_url(room);
     let is_encrypted = room.encryption_state().is_encrypted();
 
     // Prefer an already-open `Timeline` (see `Command::LoadTimeline`) for
@@ -2972,15 +3381,22 @@ async fn entry_to_summary(
     // (derived from read receipts vs. actual decrypted events), which is
     // what Element itself falls back to for the same reason.
     let unread_count = room.num_unread_notifications();
+    // Same client-side derivation, scoped to just the messages that
+    // actually ping this account — see `RoomSummary::mention_count`'s doc
+    // comment.
+    let mention_count = room.num_unread_mentions();
 
     RoomSummary {
         room_id: room_id_str,
         name,
+        avatar_url,
         last_message,
         last_message_ts,
         unread_count,
+        mention_count,
         is_encrypted,
         is_invite,
+        is_favorite: room.is_favourite(),
         is_space: false,
         is_loading: false,
     }
@@ -3192,16 +3608,20 @@ async fn refresh_spaces(state: &Arc<Mutex<WorkerState>>, tx: &UnboundedSender<Ev
             .await
             .map(|n| n.to_string())
             .unwrap_or_else(|_| room.room_id().to_string());
+        let avatar_url = room.avatar_url().map(|u| u.to_string());
         let is_encrypted = room.encryption_state().is_encrypted();
 
         spaces.push(RoomSummary {
             room_id: room.room_id().to_string(),
             name,
+            avatar_url,
             last_message: None,
             last_message_ts: 0,
             unread_count: 0,
+            mention_count: 0,
             is_encrypted,
             is_invite,
+            is_favorite: room.is_favourite(),
             is_space: true,
             is_loading: false,
         });
@@ -3634,13 +4054,42 @@ async fn fetch_poll_data(
     use matrix_sdk::ruma::events::relation::RelationType;
     use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedUserId, UInt};
 
-    let raw_root = room.event(poll_event_id, None).await.ok()?;
-    let start_value: serde_json::Value = raw_root.raw().deserialize_as().ok()?;
+    // Every early return below used to be a silent `?` — harmless when a
+    // poll really did just fail to exist (deleted, no permission), but
+    // indistinguishable from a genuine parsing bug quietly making a poll
+    // that *does* exist vanish from `Command::ListPolls`'s results (and,
+    // for a live vote/end update, from `register_poll_handlers`'s
+    // re-fetch) with zero trace of why. Logged instead so "created a poll
+    // but it never shows up" has an actual error to look at.
+    let raw_root = match room.event(poll_event_id, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, %poll_event_id, "fetch_poll_data: room.event failed");
+            return None;
+        }
+    };
+    let start_value: serde_json::Value = match raw_root.raw().deserialize_as() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, %poll_event_id, "fetch_poll_data: failed to deserialize raw event as JSON");
+            return None;
+        }
+    };
     let start_value =
         decrypt_if_needed(room, raw_root.raw().cast_ref_unchecked(), start_value).await;
 
+    let Some(content_value) = start_value.get("content") else {
+        tracing::warn!(%poll_event_id, ?start_value, "fetch_poll_data: event has no \"content\" field");
+        return None;
+    };
     let start_content: UnstablePollStartEventContent =
-        serde_json::from_value(start_value.get("content")?.clone()).ok()?;
+        match serde_json::from_value(content_value.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, %poll_event_id, content = %content_value, "fetch_poll_data: failed to parse poll start content");
+                return None;
+            }
+        };
     let poll_block = start_content.poll_start().clone();
 
     // A poll started inside a thread carries the same `m.relates_to:
@@ -3659,7 +4108,13 @@ async fn fetch_poll_data(
         RelationType::Reference,
     );
     request.limit = Some(UInt::from(500u32));
-    let response = client.send(request).await.ok()?;
+    let response = match client.send(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, %poll_event_id, "fetch_poll_data: fetching poll responses/end via /relations failed");
+            return None;
+        }
+    };
 
     let mut owned_responses: Vec<(OwnedUserId, MilliSecondsSinceUnixEpoch, Vec<String>)> = Vec::new();
     let mut end_ts: Option<MilliSecondsSinceUnixEpoch> = None;
@@ -3964,20 +4419,26 @@ async fn fetch_reaction_events(
 }
 
 /// Groups raw reaction events by emoji into what the frontend actually
-/// renders — a count and whether `my_id` is among the reactors.
+/// renders — a count, the list of reactors, and whether `my_id` is among
+/// them.
 fn summarize_reactions(reactions: &[RawReaction], my_id: Option<&str>) -> Vec<crate::models::ReactionSummary> {
-    let mut by_emoji: Vec<(String, u64, bool)> = Vec::new();
+    let mut by_emoji: Vec<(String, Vec<String>, bool)> = Vec::new();
     for r in reactions {
         if let Some(entry) = by_emoji.iter_mut().find(|(e, ..)| e == &r.emoji) {
-            entry.1 += 1;
+            entry.1.push(r.sender.clone());
             entry.2 = entry.2 || my_id == Some(r.sender.as_str());
         } else {
-            by_emoji.push((r.emoji.clone(), 1, my_id == Some(r.sender.as_str())));
+            by_emoji.push((r.emoji.clone(), vec![r.sender.clone()], my_id == Some(r.sender.as_str())));
         }
     }
     by_emoji
         .into_iter()
-        .map(|(emoji, count, by_me)| crate::models::ReactionSummary { emoji, count, by_me })
+        .map(|(emoji, senders, by_me)| crate::models::ReactionSummary {
+            emoji,
+            count: senders.len() as u64,
+            by_me,
+            senders,
+        })
         .collect()
 }
 
@@ -4109,6 +4570,43 @@ async fn parse_raw_message_event(
     let latest_reply_ts = latest_event
         .and_then(|e| e.get("origin_server_ts"))
         .and_then(|v| v.as_i64());
+    let latest_reply_event_id = latest_event
+        .and_then(|e| e.get("event_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let latest_reply_mentions_me =
+        mentions_user(latest_event.and_then(|e| e.get("content")), client.user_id());
+    // Same field-by-field extraction `parse_raw_message_event`'s own
+    // `msg_type`/`media_url`/`media_mime`/`media_encryption` above use on
+    // this function's own `content` — mirrored here against the latest
+    // reply's bundled `content` so an image/video/file reply previews as
+    // more than just its filename text.
+    let latest_reply_content = latest_event.and_then(|e| e.get("content"));
+    let latest_reply_msgtype = latest_reply_content
+        .and_then(|c| c.get("msgtype"))
+        .and_then(|v| v.as_str());
+    let latest_reply_media_url = latest_reply_content
+        .and_then(|c| {
+            c.get("url")
+                .and_then(|v| v.as_str())
+                .or_else(|| c.pointer("/file/url").and_then(|v| v.as_str()))
+        })
+        .map(|s| s.to_string());
+    let latest_reply_media_mime = latest_reply_content
+        .and_then(|c| c.pointer("/info/mimetype"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let latest_reply_media_encryption = latest_reply_content
+        .and_then(|c| c.get("file"))
+        .map(|f| f.to_string());
+    let latest_reply_msg_type = match (latest_reply_msgtype, &latest_reply_media_url) {
+        (Some("m.notice"), _) => Some("notice".to_string()),
+        (Some("m.image"), Some(_)) => Some("image".to_string()),
+        (Some("m.video"), Some(_)) => Some("video".to_string()),
+        (Some("m.audio"), Some(_)) => Some("audio".to_string()),
+        (_, Some(_)) => Some("file".to_string()),
+        _ => None,
+    };
     // The server's own answer to "is this thread unread", derived from
     // this account's actual *threaded* read receipt (`m.receipt` with
     // `thread_id` — MSC3771) for it, if one exists — not a session-local
@@ -4144,10 +4642,18 @@ async fn parse_raw_message_event(
         mentions_me,
         mentioned_user_ids,
         reactions: Vec::new(),
+        read_by: Vec::new(),
         latest_reply_sender_name,
         latest_reply_body,
         latest_reply_ts,
+        latest_reply_event_id,
+        latest_reply_mentions_me,
+        latest_reply_msg_type,
+        latest_reply_media_url,
+        latest_reply_media_mime,
+        latest_reply_media_encryption,
         is_unread,
+        local_id: None,
     })
 }
 
@@ -4480,10 +4986,24 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     mentions_me,
                     mentioned_user_ids,
                     reactions: Vec::new(),
+                    read_by: Vec::new(),
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    latest_reply_event_id: None,
+                    latest_reply_mentions_me: false,
+                    latest_reply_msg_type: None,
+                    latest_reply_media_url: None,
+                    latest_reply_media_mime: None,
+                    latest_reply_media_encryption: None,
                     is_unread: None,
+                    // Only ever `Some` down the sync stream reaching the
+                    // exact device that sent this — see `local_id`'s doc
+                    // comment on `TimelineEvent`. `Command::SendMessage`
+                    // sets this event's transaction ID to its own
+                    // `local_id` (see `with_transaction_id` below) so this
+                    // round-trips straight back here.
+                    local_id: ev.unsigned.transaction_id.as_ref().map(|id| id.to_string()),
                 };
 
                 if let Some(thread_root_id) = thread_root_id {
@@ -4518,6 +5038,38 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
 /// there live for the same reason `Command::SendMeme` has to handle its
 /// own — it shows in the main timeline instead until that thread is next
 /// opened/reloaded, which reads raw JSON and gets it right.
+/// Pushes `Event::UnreadCountChanged` whenever an `m.receipt` ephemeral
+/// event arrives for a room — including one that's just this account's own
+/// receipt echoing back down `/sync` after being sent from a *different*
+/// device/session (see `Command::MarkRoomRead`'s `send_multiple_receipts`
+/// call). Without this, marking a room read on desktop only ever cleared
+/// its unread badge *there* — every other session on the same account kept
+/// showing it unread (the server-side state was correct the whole time;
+/// nothing here ever re-read it) until that session happened to restart
+/// and recompute its whole room list from scratch, which is what made it
+/// look like the fix only "really" took effect after a reload. Recomputes
+/// fresh from `room.num_unread_notifications()`/`num_unread_mentions()` —
+/// same client-side derivation `entry_to_summary` uses for the initial
+/// `RoomSummary`, now just re-run on demand instead of only once at load.
+fn register_receipt_handler(client: &Client, tx: UnboundedSender<Event>) {
+    client.add_event_handler(
+        move |_ev: matrix_sdk::ruma::events::SyncEphemeralRoomEvent<
+                  matrix_sdk::ruma::events::receipt::ReceiptEventContent,
+              >,
+              room: matrix_sdk::room::Room| {
+            let tx = tx.clone();
+            async move {
+                tx.send(Event::UnreadCountChanged {
+                    room_id: room.room_id().to_string(),
+                    unread_count: room.num_unread_notifications(),
+                    mention_count: room.num_unread_mentions(),
+                })
+                .ok();
+            }
+        },
+    );
+}
+
 fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
     client.add_event_handler(
         move |ev: matrix_sdk::ruma::events::sticker::OriginalSyncStickerEvent,
@@ -4558,10 +5110,18 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                     mentions_me: false,
                     mentioned_user_ids: Vec::new(),
                     reactions: Vec::new(),
+                    read_by: Vec::new(),
                     latest_reply_sender_name: None,
                     latest_reply_body: None,
                     latest_reply_ts: None,
+                    latest_reply_event_id: None,
+                    latest_reply_mentions_me: false,
+                    latest_reply_msg_type: None,
+                    latest_reply_media_url: None,
+                    latest_reply_media_mime: None,
+                    latest_reply_media_encryption: None,
                     is_unread: None,
+                    local_id: None,
                 };
                 tx.send(Event::NewMessage { room_id: room.room_id().to_string(), event })
                     .ok();

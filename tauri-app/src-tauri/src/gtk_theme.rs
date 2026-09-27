@@ -39,31 +39,56 @@ pub fn watch(app: AppHandle, tx: UnboundedSender<Event>) {
             return;
         };
 
-        read_and_send(&gtk_window, &tx);
+        let mut last_sent = read_and_send(&gtk_window, &tx);
 
-        let Some(settings) = gtk::Settings::default() else {
-            return;
-        };
-        use gtk::prelude::GtkSettingsExt;
+        if let Some(settings) = gtk::Settings::default() {
+            use gtk::prelude::GtkSettingsExt;
 
-        // Two different ways a theme switch reaches this app: the theme
-        // name itself changing (picking a different GTK theme), or just
-        // the "prefer dark variant" toggle flipping for the *same* theme
-        // (most GTK themes ship a `-dark` CSS variant selected this way,
-        // which is exactly the "auto dark mode" case) — either one means
-        // every color this app cares about needs re-reading.
-        {
-            let gtk_window = gtk_window.clone();
-            let tx = tx.clone();
-            settings.connect_gtk_theme_name_notify(move |_| {
-                read_and_send(&gtk_window, &tx);
-            });
+            // Two different ways a theme switch reaches this app: the theme
+            // name itself changing (picking a different GTK theme), or just
+            // the "prefer dark variant" toggle flipping for the *same* theme
+            // (most GTK themes ship a `-dark` CSS variant selected this way,
+            // which is exactly the "auto dark mode" case) — either one means
+            // every color this app cares about needs re-reading.
+            {
+                let gtk_window = gtk_window.clone();
+                let tx = tx.clone();
+                settings.connect_gtk_theme_name_notify(move |_| {
+                    read_and_send(&gtk_window, &tx);
+                });
+            }
+            {
+                let gtk_window = gtk_window.clone();
+                let tx = tx.clone();
+                settings.connect_gtk_application_prefer_dark_theme_notify(move |_| {
+                    read_and_send(&gtk_window, &tx);
+                });
+            }
         }
+
+        // Belt-and-suspenders fallback for the two signals above: they
+        // fire off GTK's own settings-changed notification, which in turn
+        // depends on a running XSettings-alike (gsettings/dconf, an
+        // xsettingsd, ...) actually telling GTK a theme changed. A
+        // wlroots/Sway setup with no such daemon running — a GTK theme
+        // switcher (nwg-look, say) that writes `~/.config/gtk-3.0/
+        // settings.ini` directly and nothing else — never fires either
+        // signal at all, so this app's colors would otherwise only catch
+        // up on the *next restart*, not live, despite the doc comment at
+        // the top of this file promising exactly that. Polling every 2s
+        // and only sending when the resolved colors actually differ from
+        // the last-sent set keeps this cheap and non-spammy while still
+        // catching every case the signals above might miss.
         {
-            let gtk_window = gtk_window.clone();
             let tx = tx.clone();
-            settings.connect_gtk_application_prefer_dark_theme_notify(move |_| {
-                read_and_send(&gtk_window, &tx);
+            gtk::glib::timeout_add_seconds_local(2, move || {
+                if let Some(theme) = read_theme(&gtk_window) {
+                    if last_sent.as_ref() != Some(&theme) {
+                        last_sent = Some(theme.clone());
+                        let _ = tx.send(Event::SystemTheme(theme));
+                    }
+                }
+                gtk::glib::ControlFlow::Continue
             });
         }
     });
@@ -72,10 +97,10 @@ pub fn watch(app: AppHandle, tx: UnboundedSender<Event>) {
     }
 }
 
-fn read_and_send(gtk_window: &gtk::ApplicationWindow, tx: &UnboundedSender<Event>) {
-    if let Some(theme) = read_theme(gtk_window) {
-        let _ = tx.send(Event::SystemTheme(theme));
-    }
+fn read_and_send(gtk_window: &gtk::ApplicationWindow, tx: &UnboundedSender<Event>) -> Option<SystemTheme> {
+    let theme = read_theme(gtk_window)?;
+    let _ = tx.send(Event::SystemTheme(theme.clone()));
+    Some(theme)
 }
 
 /// Standard GTK3 theme-provided symbolic colors (`@define-color` names

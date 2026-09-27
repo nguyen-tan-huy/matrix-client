@@ -7,11 +7,31 @@
 pub struct RoomSummary {
     pub room_id: String,
     pub name: String,
+    /// The room's own `mxc://` avatar (its `m.room.avatar`, or the other
+    /// member's for a DM whose room has none set — see
+    /// `resolve_room_avatar_url` in `matrix::worker`), if any. Fetched
+    /// through the same
+    /// `FetchImage`/`state.imageCache` pipeline every other avatar in this
+    /// app uses. `None` falls back to a colored-initial circle, same as a
+    /// member with no avatar set.
+    pub avatar_url: Option<String>,
     pub last_message: Option<String>,
     pub last_message_ts: i64,
     pub unread_count: u64,
+    /// Unread messages that ping the logged-in user specifically — an
+    /// `m.mentions` mention or a keyword/room-notify highlight, computed
+    /// client-side the same way as `unread_count` (see `entry_to_summary`
+    /// in `matrix/worker.rs`). Drives the room list's red mention badge and
+    /// the "mentions" filter, as opposed to `unread_count`'s grey badge for
+    /// "just unread".
+    pub mention_count: u64,
     pub is_encrypted: bool,
     pub is_invite: bool,
+    /// The room's `m.favourite` tag (`Command::SetRoomFavorite`) — the
+    /// room list sorts these to the top, same as Element's own "Favourites"
+    /// treatment. Read straight from `Room::is_favourite()`'s already-
+    /// synced local cache, not a live server round-trip.
+    pub is_favorite: bool,
     /// True for a Matrix Space (`m.room.create`'s `type` is `m.space`) —
     /// holds no messages of its own, just `m.space.child` links to other
     /// rooms. Drives the space-picker row in the room list.
@@ -78,11 +98,11 @@ pub struct TimelineEvent {
     /// pill instead of plain text, same as Element does — see `app.js`'s
     /// `applyMentionPills`.
     pub mentioned_user_ids: Vec<String>,
-    /// Emoji reactions on this message, aggregated by emoji. Starts empty
-    /// on initial load (fetched on demand — see `Command::ToggleReaction`
-    /// and `Event::Reactions` — rather than eagerly for every message,
-    /// which would mean an extra request per message just to render a
-    /// list) and gets filled in once something reacts to it this session.
+    /// Emoji reactions on this message, aggregated by emoji. Populated from
+    /// the timeline item's own bundled aggregation (`content.reactions()`)
+    /// at load time — no extra request per message needed, since the SDK
+    /// already carries this — and refreshed via `Command::ToggleReaction`
+    /// / `Event::Reactions` (see those for the live-update path).
     pub reactions: Vec<ReactionSummary>,
     /// For a thread root only (`thread_count.is_some()`): the display name
     /// of whoever sent the thread's most recent reply, straight from the
@@ -97,19 +117,72 @@ pub struct TimelineEvent {
     /// Same bundled-aggregation source as `latest_reply_sender_name` — the
     /// most recent reply's `origin_server_ts`.
     pub latest_reply_ts: Option<i64>,
+    /// Same bundled-aggregation source as `latest_reply_sender_name` — the
+    /// most recent reply's event ID. Lets the UI mark a thread read (send
+    /// a threaded receipt for its latest reply) straight from a
+    /// threads-list row, without first opening the thread to learn which
+    /// event that receipt should point at.
+    pub latest_reply_event_id: Option<String>,
+    /// Same bundled-aggregation source as `latest_reply_sender_name` —
+    /// whether the thread's most recent reply itself pings this account
+    /// (an `m.mentions` mention, same check as `mentions_me` above, just
+    /// against the reply's content instead of this event's own). A thread
+    /// can ping you through any of its replies, not only through its root
+    /// message — this is what lets the threads-list panel's "you were
+    /// mentioned" indicator/filter catch that case too, instead of only
+    /// ever looking at `mentions_me` (the root's own mention).
+    pub latest_reply_mentions_me: bool,
+    /// Same bundled-aggregation source as `latest_reply_sender_name` —
+    /// `"image"` | `"video"` | `"audio"` | `"file"` | `"notice"` when the
+    /// latest reply itself is an attachment/notice, `None` for a plain
+    /// text reply (or when there's no latest reply at all). Lets the
+    /// threads-list panel render an actual image thumbnail for "latest
+    /// reply: [photo]" instead of just the filename text `latest_reply_body`
+    /// alone would show.
+    pub latest_reply_msg_type: Option<String>,
+    /// The latest reply's `mxc://` media, when `latest_reply_msg_type` is
+    /// one of the attachment kinds.
+    pub latest_reply_media_url: Option<String>,
+    /// The latest reply's declared MIME type for `latest_reply_media_url`,
+    /// same role as `media_mime` above.
+    pub latest_reply_media_mime: Option<String>,
+    /// JSON-encoded `EncryptedFile` for `latest_reply_media_url` when the
+    /// latest reply is an encrypted-room attachment, same role as
+    /// `media_encryption` above.
+    pub latest_reply_media_encryption: Option<String>,
     /// For a thread root only: whether this account's own threaded read
     /// receipt (server state, not a session-local guess — see
     /// `thread_is_unread` in `worker.rs`) is behind the thread's latest
     /// reply. `None` for every other kind of event, and for a thread root
     /// whose read state couldn't be determined.
     pub is_unread: Option<bool>,
+    /// The client-generated `Command::SendMessage.local_id` this event's
+    /// sender attached as the event's transaction ID, echoed back by the
+    /// homeserver on `unsigned.transaction_id` — but *only* down the sync
+    /// stream reaching the exact device that sent it (see
+    /// `register_new_message_handler`). Lets `app.js` match a live event
+    /// against the optimistic "sending…" bubble it already rendered for
+    /// that `local_id` and reconcile the two instead of showing the
+    /// message twice. `None` for every event this app didn't itself just
+    /// send with a transaction ID (which is every path but that live
+    /// handler).
+    pub local_id: Option<String>,
+    /// User IDs (`@user:server`) whose read receipt (`m.receipt`) points
+    /// at exactly this event — i.e. this is the newest message that user
+    /// has read. Populated from the timeline item's own bundled
+    /// `read_receipts()` (see `convert.rs`), same "already loaded, no
+    /// extra fetch" reasoning as `reactions` above. Excludes the logged-in
+    /// user's own receipt — nothing useful to show yourself that you've
+    /// read your own messages. Drives the small "seen by" avatar stack
+    /// Element shows under the last message each person has read.
+    pub read_by: Vec<String>,
 }
 
 /// Resolved system-theme colors, straight from the running GTK theme (see
 /// `gtk_theme.rs`) — every field is a `#rrggbb` hex string, matching what
 /// `app.js` sets as CSS custom properties directly. Named to mirror the
 /// `--bg`/`--bg-alt`/etc. custom properties in `style.css` one-to-one.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SystemTheme {
     pub bg: String,
     pub bg_alt: String,
@@ -128,6 +201,10 @@ pub struct ReactionSummary {
     /// highlighting the pill and determines whether clicking it removes
     /// vs. adds a reaction.
     pub by_me: bool,
+    /// User IDs (`@user:server`) of everyone who reacted with this emoji,
+    /// in reaction order. Lets the frontend show "who reacted" (e.g. a
+    /// hover tooltip on the pill) instead of just a bare count.
+    pub senders: Vec<String>,
 }
 
 /// One message found by `Command::SearchUserMessages` — a `TimelineEvent`
@@ -138,6 +215,17 @@ pub struct UserSearchHit {
     pub room_id: String,
     pub room_name: String,
     pub event: TimelineEvent,
+}
+
+/// One hit from `Command::SearchDirectoryUsers` — the homeserver's user
+/// directory search, so (unlike `Command::ListAllUsers`) this can surface
+/// people the logged-in user has no room in common with yet, which is
+/// exactly who "invite by name" needs to find.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DirectoryUser {
+    pub user_id: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 /// The logged-in user's own profile — response to `Command::GetOwnProfile`,

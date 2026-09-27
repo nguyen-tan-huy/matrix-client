@@ -115,6 +115,37 @@ fn raw_media_url(event: &matrix_sdk_ui::timeline::EventTimelineItem) -> Option<S
         .map(|s| s.to_string())
 }
 
+/// Converts the timeline item's own bundled reaction aggregation
+/// (`content.reactions()` — already loaded from the local store/sync, no
+/// `/relations` fetch needed) into what the frontend renders. Same shape
+/// as `summarize_reactions` in `worker.rs`, which covers the live-update
+/// path (`Command::ToggleReaction`/`register_reaction_handler`); this is
+/// what actually fills the pills on a normal timeline load, including
+/// right after reopening the app, since that path never touches this
+/// function's caller (`convert_item`) at all.
+fn reactions_from_bundled(
+    reactions: Option<&matrix_sdk_ui::timeline::ReactionsByKeyBySender>,
+    my_id: Option<&matrix_sdk::ruma::UserId>,
+) -> Vec<crate::models::ReactionSummary> {
+    let Some(reactions) = reactions else {
+        return Vec::new();
+    };
+    reactions
+        .iter()
+        .filter(|(_, by_sender)| !by_sender.is_empty())
+        .map(|(emoji, by_sender)| {
+            let senders: Vec<String> = by_sender.keys().map(|u| u.to_string()).collect();
+            let by_me = my_id.is_some_and(|id| by_sender.contains_key(id));
+            crate::models::ReactionSummary {
+                emoji: emoji.clone(),
+                count: senders.len() as u64,
+                by_me,
+                senders,
+            }
+        })
+        .collect()
+}
+
 pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<TimelineEvent> {
     let event = item.as_event()?;
 
@@ -278,6 +309,14 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
 
     let (reply_to_event_id, reply_to_preview) = reply_preview(event);
     let mentioned_user_ids = mentioned_user_ids_from_raw(event);
+    let reactions = reactions_from_bundled(event.content().reactions(), client.user_id());
+    let own_id = client.user_id();
+    let read_by: Vec<String> = event
+        .read_receipts()
+        .keys()
+        .filter(|id| Some(id.as_ref()) != own_id)
+        .map(|id| id.to_string())
+        .collect();
 
     Some(TimelineEvent {
         event_id: event.event_id()?.to_string(),
@@ -297,7 +336,8 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         reply_to_preview,
         mentions_me: event.is_highlighted(),
         mentioned_user_ids,
-        reactions: Vec::new(),
+        reactions,
+        read_by,
         // Only populated for the `/threads`-endpoint path (see
         // `parse_thread_root` in `worker.rs`) that backs the threads-list
         // panel — a thread root as it appears inline in the main timeline
@@ -306,7 +346,14 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         latest_reply_sender_name: None,
         latest_reply_body: None,
         latest_reply_ts: None,
+        latest_reply_event_id: None,
+        latest_reply_mentions_me: false,
+        latest_reply_msg_type: None,
+        latest_reply_media_url: None,
+        latest_reply_media_mime: None,
+        latest_reply_media_encryption: None,
         is_unread: None,
+        local_id: None,
     })
 }
 

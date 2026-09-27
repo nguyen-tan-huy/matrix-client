@@ -1,5 +1,42 @@
 const { invoke } = window.__TAURI__.core;
 
+/** Whether the phone-width layout (style.css's `(max-width: 720px),
+ * (max-height: 500px), (hover: none) and (pointer: coarse)` media query)
+ * is currently active — kept as one function so every JS call site
+ * agrees with each other and with that stylesheet rule on what counts as
+ * "narrow," rather than three separately-typed copies of the same query
+ * string quietly drifting apart. The touch clause is what actually makes
+ * this phone-*shaped* rather than just phone-*sized*: a real touchscreen
+ * phone can report a CSS viewport width well outside the plain
+ * width/height checks (a ~360–430px assumption a desktop browser's
+ * DevTools device emulator trains you to expect doesn't hold for every
+ * device), so checking the *input* type too is what actually catches it
+ * reliably. See the media query's own comment in style.css for the full
+ * reasoning. */
+function isNarrowLayout() {
+  return window.matchMedia("(max-width: 720px), (max-height: 500px), (hover: none) and (pointer: coarse)").matches;
+}
+
+/** Keeps `--app-height` (used by `html, body` in style.css) in sync with
+ * `window.visualViewport` — the piece of viewport actually visible right
+ * now, as opposed to the *layout* viewport `100%`/`100vh` measure, which
+ * on Android's WebView stays full-height even once the on-screen keyboard
+ * has covered the bottom of the screen. Without this, opening the
+ * keyboard while composing a message pushed the send/attach/markdown
+ * buttons (all anchored to the bottom of that never-shrinking 100%-tall
+ * column) out from under the visible area — still technically on screen,
+ * just physically behind the keyboard. `visualViewport` is undefined on
+ * very old WebViews; this is simply a no-op there; on desktop there's no
+ * on-screen keyboard to react to and `resize` essentially never fires
+ * from this cause. */
+if (window.visualViewport) {
+  const applyVisualViewportHeight = () => {
+    document.documentElement.style.setProperty("--app-height", `${window.visualViewport.height}px`);
+  };
+  window.visualViewport.addEventListener("resize", applyVisualViewportHeight);
+  applyVisualViewportHeight();
+}
+
 /** Sends a `Command` — `data` omitted entirely for unit variants (no
  * fields), matching serde's adjacently-tagged representation. */
 function send(type, data) {
@@ -82,6 +119,11 @@ const state = {
   spaceChildren: {}, // space_room_id -> [room_id]
   roomFilter: "",
   unreadOnly: false,
+  // Mirrors `unreadOnly`, but for `[ @mentions ]` — filters the room list
+  // down to rooms with an unread message that pings this account
+  // specifically (`room.mention_count > 0`), for "which rooms have
+  // something I was actually tagged in and haven't seen yet".
+  mentionsOnly: false,
   reloadingRooms: false,
   // Index into the currently-visible (filtered) room list, i.e. the row
   // arrow-key navigation currently has "selected" — separate from
@@ -121,6 +163,11 @@ const state = {
   // then cached for the rest of the session).
   allUsers: null,
   allUsersLoading: false,
+  // Live homeserver user-directory search results for the "invite to room"
+  // dialog — `{ query, users }` from the most recent `Event::DirectoryUsers`
+  // (`query` lets a stale, slow response be dropped if the input has since
+  // changed), or `null` before the first search answers.
+  directorySearch: null,
   notificationModes: {}, // room_id -> mode
   // `{ roomId, threadRootId }` for whichever `Command::Summarize` the
   // currently-open summary dialog (if any) is waiting on — `Event::Summary`
@@ -131,9 +178,19 @@ const state = {
   pendingReply: null, // { roomId, threadId, eventId, preview }
   pendingEdit: null, // { roomId, threadId, eventId }
   pendingImage: null, // { roomId, threadId, dataUrl, bytes, filename, mime }
+  pendingFile: null, // { roomId, threadId, bytes, filename, mime, size } — any file, no dataUrl/thumbnail
   composeMentions: [], // [{userId, displayName}] selected via autocomplete
   threadComposeMentions: [], // same, for the thread panel's compose box
   sending: false,
+  // local_id -> { roomId, threadId } for every `Command::SendMessage` this
+  // session has fired but not yet resolved — tracks the optimistic
+  // "sending…" bubble `sendCurrentMessage`/thread-compose render straight
+  // into the timeline the moment Send is pressed, so `MessageSent`/
+  // `MessageSendFailed` (and the live echo carrying the same `local_id`
+  // back on `event.local_id`, see `TimelineEvent` on the Rust side) know
+  // which placeholder row to reconcile without needing the room/thread
+  // context re-derived from scratch.
+  pendingSends: new Map(),
 
   rightPanel: null, // {kind:'threads-list', scope: roomId|null} | {kind:'thread', roomId, root, events} | {kind:'security'}
   threadsByRoom: {}, // room_id -> [TimelineEvent] (thread roots)
@@ -143,6 +200,15 @@ const state = {
   threadsListReachedEnd: new Set(),
   threadsListPaginationInFlight: new Set(),
   unreadThreads: new Set(), // "room_id|thread_root_id"
+  // Threads known to have an unread reply that pings this account
+  // specifically — same "root_id|thread_root_id" keying and same
+  // session-local-heuristic caveat as `unreadThreads` (see its own doc
+  // comment): a thread root's own `mentions_me` covers the case where the
+  // *first* message tagged you, and this Set catches a live reply doing
+  // so later in the session (see the `ThreadReply` handler) — there's no
+  // deeper per-reply mention history to fetch beyond what's already
+  // loaded, same limitation `unreadThreads` already has.
+  mentionThreads: new Set(),
   threadCompose: { sending: false },
   threadPaginationReachedStart: new Set(),
   // Keyboard roving-highlight index into the threads-list panel's
@@ -170,6 +236,10 @@ const state = {
   // with plenty of genuinely-unread threads sitting in already-loaded
   // room data. Defaults to off, same as the room list's own toggle.
   threadsListUnreadOnly: false,
+  // Mirrors `mentionsOnly` for the room list's "[ @mentions ]" — filters
+  // the threads-list panel down to unread threads that ping this account
+  // (see `isThreadMentioningMe`).
+  threadsListMentionsOnly: false,
   // Set once `scanAllRoomThreads` has fired, so it only ever runs once
   // per app launch (see the `Rooms` event handler).
   threadsScanStarted: false,
@@ -244,11 +314,23 @@ const state = {
   // live `Event::PollUpdated` while it's open can re-render it in place
   // instead of only updating `state.polls` silently until it's reopened.
   pollsDialogRoomId: null,
+  // Same idea as `pollsDialogRoomId`, for the pinned-messages dialog — a
+  // pinned image's `Event::ImageBytes` (or a still-loading preview's
+  // `Event::EventPreview`) finishing while it's open re-renders it in
+  // place instead of leaving a stale placeholder up until it's reopened.
+  pinnedEventsDialogRoomId: null,
   // `null` (follow the system/GTK theme, this app's original behavior) |
   // "light" | "dark" — the "[ theme: ... ]" button in the chats menu,
   // persisted to `localStorage` so it survives a restart. See
   // `applyThemeOverride()`.
   themeOverride: null,
+  // `null` (default, `--font-family`'s CSS value) | one of `FONT_FAMILY_OPTIONS`'s
+  // `value`s — the "[ font ]" dialog's font-family choice, persisted to
+  // `localStorage`. See `applyFontSettings()`.
+  fontFamily: null,
+  // `null` (default, `--font-size`'s CSS value) | a number of px — same
+  // dialog's font-size choice, persisted to `localStorage`.
+  fontSize: null,
   // `MediaRecorder` instance + captured chunks/analyser while a voice
   // message is being recorded — `null` when not recording. See
   // `toggleVoiceRecording()`.
@@ -268,6 +350,7 @@ const el = {
   spacePicker: document.getElementById("space-picker"),
   roomFilter: document.getElementById("room-filter"),
   btnUnreadOnly: document.getElementById("btn-unread-only"),
+  btnMentionsOnly: document.getElementById("btn-mentions-only"),
   roomListItems: document.getElementById("room-list-items"),
   btnProfile: document.getElementById("btn-profile"),
   btnSecurity: document.getElementById("btn-security"),
@@ -277,7 +360,9 @@ const el = {
   btnUserSearch: document.getElementById("btn-user-search"),
   btnMessageSearch: document.getElementById("btn-message-search"),
   btnTheme: document.getElementById("btn-theme"),
+  btnFontSettings: document.getElementById("btn-font-settings"),
   btnShortcuts: document.getElementById("btn-shortcuts"),
+  btnLogout: document.getElementById("btn-logout"),
   btnChatsMenu: document.getElementById("btn-chats-menu"),
   chatsMenu: document.getElementById("chats-menu"),
   btnBackToRooms: document.getElementById("btn-back-to-rooms"),
@@ -287,6 +372,7 @@ const el = {
   btnRoomThreads: document.getElementById("btn-room-threads"),
   btnRoomMenu: document.getElementById("btn-room-menu"),
   roomMenu: document.getElementById("room-menu"),
+  btnFavoriteRoom: document.getElementById("btn-favorite-room"),
   btnInvite: document.getElementById("btn-invite"),
   btnLeaveRoom: document.getElementById("btn-leave-room"),
   notificationMode: document.getElementById("notification-mode"),
@@ -302,6 +388,8 @@ const el = {
   editIndicator: document.getElementById("edit-indicator"),
   mentionSuggestions: document.getElementById("mention-suggestions"),
   pendingImagePreview: document.getElementById("pending-image-preview"),
+  pendingFilePreview: document.getElementById("pending-file-preview"),
+  genericFileInput: document.getElementById("generic-file-input"),
   composeRow: document.getElementById("compose-row"),
   composeInput: document.getElementById("compose-input"),
   composeToolbar: document.getElementById("compose-toolbar"),
@@ -349,6 +437,41 @@ function showLoginError(msg) {
   el.loginError.style.display = "block";
 }
 
+/** Drops back to the login screen after `Event::SessionExpired` (the
+ * server rejected this device's access token — see that event's doc
+ * comment in `event.rs`) or `Event::LoggedOut` (`Command::Logout`, the
+ * user signing out deliberately). Both wipe the local session/store on
+ * the Rust side before sending their event, so there's nothing left to
+ * reuse either way.
+ *
+ * A full page reload rather than manually resetting `state` back to its
+ * initial shape: `state` has grown dozens of fields over time (rooms,
+ * every open room's timeline/thread/image/member/... caches, dialog
+ * state, ...) and hand-picking every one that needs clearing is exactly
+ * the kind of thing that quietly rots the next time a field gets added
+ * elsewhere and someone forgets this needs to know about it too — a
+ * fresh page load can't have that problem, it starts from the same
+ * `const state = {...}` literal a real first launch does. The one thing
+ * a reload *can't* do on its own is re-ask the backend whether a session
+ * exists — the Rust worker only runs `Command::CheckSession` once, right
+ * as its own process starts (see the "---- Boot ----" comment below) —
+ * but that's fine here: both callers already know for certain there's no
+ * valid session left, so the reloaded page landing on its default login
+ * screen (nothing yet having called `enterChat()`) is exactly right,
+ * no re-check needed. `message`, if given, survives the reload via
+ * `sessionStorage` and is shown once the fresh page's login form exists
+ * (see the boot-time check for `postReloadLoginMessage` below). */
+function reloadToLogin(message) {
+  try {
+    if (message) sessionStorage.setItem("postReloadLoginMessage", message);
+    else sessionStorage.removeItem("postReloadLoginMessage");
+  } catch {
+    // Private-browsing-style storage blocks, etc. — the reload itself
+    // still works fine, the only loss is the explanatory message.
+  }
+  window.location.reload();
+}
+
 function enterChat() {
   state.screen = "chat";
   el.loginScreen.classList.add("hidden");
@@ -371,6 +494,12 @@ function enterChat() {
   el.roomListItems.innerHTML = "";
   el.roomListItems.appendChild(loadingPlaceholder);
   roomRowEls.set("startup-loading-placeholder", loadingPlaceholder);
+  // Fetched here (not just lazily when the profile panel opens, its only
+  // previous caller) so `state.ownProfile` is already populated by the
+  // time the user sends their first message — `sendCurrentMessage` needs
+  // it to stamp a sender name/avatar onto the optimistic "sending…" bubble
+  // it renders immediately, before any server round trip.
+  if (!state.ownProfile) send("GetOwnProfile");
 }
 
 // =========================================================================
@@ -475,6 +604,12 @@ el.btnUnreadOnly.addEventListener("click", () => {
   renderRooms();
 });
 
+el.btnMentionsOnly.addEventListener("click", () => {
+  state.mentionsOnly = !state.mentionsOnly;
+  el.btnMentionsOnly.classList.toggle("selected", state.mentionsOnly);
+  renderRooms();
+});
+
 /** Vietnamese-aware "search ignoring accents" — `normalize("NFD")` peels
  * off every combining diacritic (Latin base letters only) but leaves "đ"
  * alone, since it's its own base codepoint rather than "d" + a combining
@@ -516,19 +651,29 @@ function normalizeForSearch(s) {
 const recentlyMarkedRead = new Map(); // room_id -> Date.now() it was marked
 const RECENTLY_MARKED_READ_WINDOW_MS = 5000;
 const knownUnreadCounts = new Map(); // room_id -> highest unread_count observed
+// Same race, same fix, for the mention-specific count — see
+// `RoomSummary::mention_count`.
+const knownMentionCounts = new Map(); // room_id -> highest mention_count observed
 
 function applyUnreadFloor(value) {
   if (!value) return value;
   const markedAt = recentlyMarkedRead.get(value.room_id);
   if (markedAt && Date.now() - markedAt < RECENTLY_MARKED_READ_WINDOW_MS) {
     knownUnreadCounts.set(value.room_id, value.unread_count);
+    knownMentionCounts.set(value.room_id, value.mention_count);
     return value;
   }
-  const floor = knownUnreadCounts.get(value.room_id) || 0;
-  if (value.unread_count < floor) {
-    return { ...value, unread_count: floor };
+  const unreadFloor = knownUnreadCounts.get(value.room_id) || 0;
+  const mentionFloor = knownMentionCounts.get(value.room_id) || 0;
+  knownUnreadCounts.set(value.room_id, Math.max(value.unread_count, unreadFloor));
+  knownMentionCounts.set(value.room_id, Math.max(value.mention_count, mentionFloor));
+  if (value.unread_count < unreadFloor || value.mention_count < mentionFloor) {
+    return {
+      ...value,
+      unread_count: Math.max(value.unread_count, unreadFloor),
+      mention_count: Math.max(value.mention_count, mentionFloor),
+    };
   }
-  knownUnreadCounts.set(value.room_id, value.unread_count);
   return value;
 }
 
@@ -577,11 +722,48 @@ function applyRoomListOp(entries, op) {
   }
 }
 
+/** Shared ordering for `state.rooms`: invites first, then favorited rooms
+ * (`Command::SetRoomFavorite` — this app's "pin to top", same `m.favourite`
+ * tag Element's own "Favourites" uses), then whatever relative order was
+ * already there. A *stable* sort — Array.prototype.sort has guaranteed
+ * stability since ES2019 — so this only ever hoists invites/favorites up
+ * without reshuffling anything else, whether that existing order is
+ * `roomEntries`' own sliding-sync activity order (`rebuildRoomsFromEntries`)
+ * or the recency bump `Event::NewMessage` applies itself right before
+ * calling this. */
+function sortRoomsList() {
+  state.rooms.sort((a, b) => (b.is_invite - a.is_invite) || (b.is_favorite - a.is_favorite));
+}
+
 /** Rebuilds the flat `state.rooms` array — what every other part of the UI
  * reads — from the two index-mirrored source arrays, invites first (same
- * ordering convention `refresh_rooms` used before this migration). */
+ * ordering convention `refresh_rooms` used before this migration), then
+ * favorites (see `sortRoomsList`). */
 function rebuildRoomsFromEntries() {
   state.rooms = [...state.inviteEntries, ...state.roomEntries];
+  sortRoomsList();
+}
+
+// `poll_events` drains its whole backlog in one synchronous JS turn (see
+// its own comment in lib.rs) — on a freshly reopened app, the initial
+// sync burst can deliver dozens of `RoomListUpdate` events in a single
+// poll. Each one used to call `renderRooms()` directly, which rebuilds
+// the space picker and (below the virtualization threshold) measures
+// `getBoundingClientRect()` per row for the FLIP animation — calling
+// that once per event back-to-back with no yield is exactly what froze
+// the UI (clicks/scroll unresponsive) while the room list was still
+// catching up. State (`state.rooms`, via `rebuildRoomsFromEntries`)
+// still applies immediately every time so nothing reads stale data;
+// only the expensive DOM rebuild is coalesced to once per animation
+// frame no matter how many updates land before it fires.
+let roomsRenderScheduled = false;
+function scheduleRoomsRender() {
+  if (roomsRenderScheduled) return;
+  roomsRenderScheduled = true;
+  requestAnimationFrame(() => {
+    roomsRenderScheduled = false;
+    renderRooms();
+  });
 }
 
 // Sentinel `selectedSpace` value for the dedicated "invites" tab — not a
@@ -697,10 +879,13 @@ function renderInviteRow(room) {
 function renderRoomRow(room, rowIndex) {
   const key = "room:" + room.room_id;
   let row = roomRowEls.get(key);
-  let nameEl, badgeEl;
+  let avatarEl, nameEl, badgeEl;
   if (!row) {
     row = document.createElement("div");
     row.className = "room-row";
+    avatarEl = renderAvatar(room.avatar_url, room.name, room.room_id, 32);
+    avatarEl.dataset.avatarSrc = room.avatar_url || "";
+    row.appendChild(avatarEl);
     nameEl = document.createElement("div");
     nameEl.className = "room-name";
     row.appendChild(nameEl);
@@ -712,8 +897,21 @@ function renderRoomRow(room, rowIndex) {
     });
     roomRowEls.set(key, row);
   } else {
+    avatarEl = row.querySelector(".avatar");
     nameEl = row.querySelector(".room-name");
     badgeEl = row.querySelector(".room-badge");
+  }
+
+  // Rebuilt only when the room's own avatar actually changed (rare) —
+  // `renderAvatar` handles its own image-cache/fallback-initial logic,
+  // so re-running it every patch (this function is called on every room-
+  // list update, not just when something room-specific changed) would be
+  // wasted work for the overwhelmingly common case of nothing changing.
+  if (avatarEl.dataset.avatarSrc !== (room.avatar_url || "")) {
+    const freshAvatar = renderAvatar(room.avatar_url, room.name, room.room_id, 32);
+    freshAvatar.dataset.avatarSrc = room.avatar_url || "";
+    avatarEl.replaceWith(freshAvatar);
+    avatarEl = freshAvatar;
   }
 
   row.dataset.roomId = room.room_id;
@@ -724,7 +922,7 @@ function renderRoomRow(room, rowIndex) {
     (room.room_id === state.selectedRoom ? " selected" : "") +
     (rowIndex === state.roomListActiveIndex ? " kbd-active" : "");
 
-  const name = (room.is_encrypted ? "[e] " : "") + room.name;
+  const name = (room.is_favorite ? "★ " : "") + (room.is_encrypted ? "[e] " : "") + room.name;
   if (nameEl.textContent !== name) nameEl.textContent = name;
   nameEl.className = "room-name" + (room.unread_count > 0 ? " unread" : "");
 
@@ -736,6 +934,9 @@ function renderRoomRow(room, rowIndex) {
       row.appendChild(badgeEl);
     }
     if (badgeEl.textContent !== badgeText) badgeEl.textContent = badgeText;
+    // Red "you were mentioned" styling instead of the plain grey
+    // just-unread badge — same visual distinction Element makes.
+    badgeEl.classList.toggle("mention", room.mention_count > 0);
   } else if (badgeEl) {
     badgeEl.remove();
   }
@@ -780,6 +981,7 @@ function renderRooms() {
     if (filter && !normalizeForSearch(room.name).includes(filter)) continue;
     if (spaceFilter && !spaceFilter.includes(room.room_id)) continue;
     if (state.unreadOnly && !(room.unread_count > 0)) continue;
+    if (state.mentionsOnly && !(room.mention_count > 0)) continue;
     matchedRooms.push(room);
   }
   state.visibleRoomIds = matchedRooms.map((room) => room.room_id);
@@ -815,7 +1017,7 @@ function renderRooms() {
   // the extra measuring. Skipped while filtering: the search-as-you-type
   // case gets no benefit from the animation (results are still settling
   // keystroke to keystroke) and re-triggers this function most often.
-  const filtering = Boolean(filter) || Boolean(spaceFilter) || state.unreadOnly;
+  const filtering = Boolean(filter) || Boolean(spaceFilter) || state.unreadOnly || state.mentionsOnly;
   const prevRects = new Map();
   if (!filtering) {
     for (const [key, node] of roomRowEls) {
@@ -840,17 +1042,17 @@ function renderRooms() {
     }
   }
 
-  const showEmptyPlaceholder = state.unreadOnly && orderedRows.length === 0;
+  const showEmptyPlaceholder = (state.unreadOnly || state.mentionsOnly) && orderedRows.length === 0;
   if (showEmptyPlaceholder) {
     const key = "empty-placeholder";
     let row = roomRowEls.get(key);
     if (!row) {
       row = document.createElement("div");
       row.style.cssText = "padding:12px;color:var(--text-weak);font-size:12px;text-align:center;";
-      row.textContent = "no unread rooms";
       row.dataset.rowKey = key;
       roomRowEls.set(key, row);
     }
+    row.textContent = state.mentionsOnly ? "no unread mentions" : "no unread rooms";
     keepKeys.add(key);
     orderedRows.push(row);
   }
@@ -1082,6 +1284,10 @@ function closeDialog() {
  * Tapping/clicking anywhere on the overlay closes it — same as
  * `showDialog`'s backdrop, just without needing to land exactly on a
  * particular element first. */
+const LIGHTBOX_MIN_SCALE = 1;
+const LIGHTBOX_MAX_SCALE = 6;
+const LIGHTBOX_DOUBLE_TAP_SCALE = 2.5;
+
 function openLightbox(src, alt) {
   closeLightbox();
   const overlay = document.createElement("div");
@@ -1091,17 +1297,204 @@ function openLightbox(src, alt) {
   img.className = "lightbox-img";
   img.src = src;
   img.alt = alt || "image";
+  img.draggable = false;
   overlay.appendChild(img);
   const closeBtn = document.createElement("button");
   closeBtn.className = "lightbox-close small-btn";
   closeBtn.textContent = "[ x ]";
   overlay.appendChild(closeBtn);
-  overlay.addEventListener("click", closeLightbox);
+  const zoomControl = document.createElement("div");
+  zoomControl.className = "lightbox-zoom-controls";
+  zoomControl.innerHTML = `
+    <button type="button" class="small-btn" data-zoom="out" title="zoom out">−</button>
+    <button type="button" class="small-btn" data-zoom="reset" title="reset zoom">${Math.round(LIGHTBOX_MIN_SCALE * 100)}%</button>
+    <button type="button" class="small-btn" data-zoom="in" title="zoom in">+</button>
+  `;
+  overlay.appendChild(zoomControl);
+
+  // Zoom/pan state — `scale`/`tx`/`ty` back a plain CSS
+  // `translate(tx, ty) scale(scale)` on the image itself (see
+  // `applyTransform` below). Reset fresh on every open.
+  const zoom = { scale: 1, tx: 0, ty: 0 };
+
+  const applyTransform = () => {
+    img.style.transform = `translate(${zoom.tx}px, ${zoom.ty}px) scale(${zoom.scale})`;
+    img.style.cursor = zoom.scale > 1 ? "grab" : "zoom-in";
+    zoomControl.querySelector('[data-zoom="reset"]').textContent = `${Math.round(zoom.scale * 100)}%`;
+    // The backdrop's own click-to-close only makes sense back at 1x — once
+    // zoomed in, a plain click/tap on the image is how you'd expect to pan
+    // from, not close the whole viewer out from under you.
+    overlay.style.cursor = zoom.scale > 1 ? "default" : "zoom-out";
+  };
+
+  // Zooms so that the point under `clientX,clientY` stays fixed on screen —
+  // standard "zoom toward cursor" — rather than always zooming toward the
+  // image's own center, which feels wrong the moment you're not perfectly
+  // centered on whatever you're trying to look closer at.
+  const zoomTo = (newScale, clientX, clientY) => {
+    const clamped = Math.min(LIGHTBOX_MAX_SCALE, Math.max(LIGHTBOX_MIN_SCALE, newScale));
+    // `getBoundingClientRect()` reflects the *current* transform, so its
+    // center is already `naturalCenter + (tx, ty)` — `dx`/`dy` below are
+    // the cursor's offset from that already-translated center, not from
+    // the image's untransformed natural center.
+    const rect = img.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    const ratio = clamped / zoom.scale;
+    // Cursor exactly on the current center (`dx`/`dy` = 0) must leave
+    // `tx`/`ty` unchanged — scaling around the point already under the
+    // cursor doesn't move that point. `tx * ratio` (scaling the existing
+    // offset down too) would violate that; plain `+ zoom.tx` is correct.
+    zoom.tx = dx * (1 - ratio) + zoom.tx;
+    zoom.ty = dy * (1 - ratio) + zoom.ty;
+    zoom.scale = clamped;
+    if (zoom.scale === LIGHTBOX_MIN_SCALE) {
+      zoom.tx = 0;
+      zoom.ty = 0;
+    }
+    applyTransform();
+  };
+
+  img.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const factor = e.deltaY < 0 ? 1.2 : 1 / 1.2;
+    zoomTo(zoom.scale * factor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  img.addEventListener("dblclick", (e) => {
+    e.stopPropagation();
+    if (zoom.scale > LIGHTBOX_MIN_SCALE) {
+      zoomTo(LIGHTBOX_MIN_SCALE, e.clientX, e.clientY);
+    } else {
+      zoomTo(LIGHTBOX_DOUBLE_TAP_SCALE, e.clientX, e.clientY);
+    }
+  });
+
+  // Drag-to-pan (mouse), only once actually zoomed in. `mousemove`/`mouseup`
+  // are only ever attached to `window` for the duration of one actual drag
+  // (added in `mousedown`, removed in `onDragUp`) — same pattern
+  // `setupResizer` uses for the panel-resize handles, and for the same
+  // reason: attaching them once up front and never removing them would
+  // leak a pair of window-level listeners (holding onto this whole
+  // closure — `zoom`, `img`, ...) every single time an image is opened,
+  // for the rest of the session.
+  let dragStart = null;
+  function onDragMove(e) {
+    if (!dragStart) return;
+    zoom.tx = dragStart.tx + (e.clientX - dragStart.x);
+    zoom.ty = dragStart.ty + (e.clientY - dragStart.y);
+    applyTransform();
+  }
+  function onDragUp() {
+    dragStart = null;
+    img.style.cursor = zoom.scale > 1 ? "grab" : "zoom-in";
+    window.removeEventListener("mousemove", onDragMove);
+    window.removeEventListener("mouseup", onDragUp);
+  }
+  // Closing (Escape, the [x] button, ...) mid-drag must still clean these
+  // up — `closeLightbox()` is a plain global function with no idea this
+  // particular drag is in progress, so it calls this via the property
+  // instead of just removing the overlay outright.
+  overlay.lightboxCleanup = () => {
+    if (dragStart) onDragUp();
+  };
+  img.addEventListener("mousedown", (e) => {
+    if (zoom.scale <= LIGHTBOX_MIN_SCALE) return;
+    e.preventDefault();
+    dragStart = { x: e.clientX, y: e.clientY, tx: zoom.tx, ty: zoom.ty };
+    img.style.cursor = "grabbing";
+    window.addEventListener("mousemove", onDragMove);
+    window.addEventListener("mouseup", onDragUp);
+  });
+
+  // Touch: pinch-to-zoom with two fingers, drag-to-pan with one (once
+  // zoomed), double-tap to toggle zoom — same gestures as every native
+  // photo viewer, since this same build also ships on Android.
+  let pinchStartDist = null;
+  let pinchStartScale = 1;
+  let touchPanStart = null;
+  let lastTapTime = 0;
+  const touchDist = (touches) => Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+  const touchMid = (touches) => ({
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2,
+  });
+  img.addEventListener("touchstart", (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      pinchStartDist = touchDist(e.touches);
+      pinchStartScale = zoom.scale;
+      touchPanStart = null;
+    } else if (e.touches.length === 1) {
+      const now = Date.now();
+      if (now - lastTapTime < 300) {
+        const t = e.touches[0];
+        if (zoom.scale > LIGHTBOX_MIN_SCALE) zoomTo(LIGHTBOX_MIN_SCALE, t.clientX, t.clientY);
+        else zoomTo(LIGHTBOX_DOUBLE_TAP_SCALE, t.clientX, t.clientY);
+        lastTapTime = 0;
+        return;
+      }
+      lastTapTime = now;
+      if (zoom.scale > LIGHTBOX_MIN_SCALE) {
+        touchPanStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, tx: zoom.tx, ty: zoom.ty };
+      }
+    }
+  }, { passive: false });
+  img.addEventListener("touchmove", (e) => {
+    if (e.touches.length === 2 && pinchStartDist) {
+      e.preventDefault();
+      const mid = touchMid(e.touches);
+      const newScale = pinchStartScale * (touchDist(e.touches) / pinchStartDist);
+      zoomTo(newScale, mid.x, mid.y);
+    } else if (e.touches.length === 1 && touchPanStart) {
+      e.preventDefault();
+      zoom.tx = touchPanStart.tx + (e.touches[0].clientX - touchPanStart.x);
+      zoom.ty = touchPanStart.ty + (e.touches[0].clientY - touchPanStart.y);
+      applyTransform();
+    }
+  }, { passive: false });
+  img.addEventListener("touchend", (e) => {
+    if (e.touches.length < 2) pinchStartDist = null;
+    if (e.touches.length < 1) touchPanStart = null;
+  });
+
+  zoomControl.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const action = e.target.closest("[data-zoom]")?.dataset.zoom;
+    if (!action) return;
+    const rect = img.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    if (action === "in") zoomTo(zoom.scale * 1.5, cx, cy);
+    else if (action === "out") zoomTo(zoom.scale / 1.5, cx, cy);
+    else zoomTo(LIGHTBOX_MIN_SCALE, cx, cy);
+  });
+
+  // Only the backdrop itself (not the image, not the zoom controls)
+  // closes the viewer now that the image has its own click-driven
+  // interactions (double-click to zoom, drag to pan) — closing on
+  // `e.target === img` too used to also fire on the very first click of
+  // a double-click (scale is still 1 and nothing's been dragged yet at
+  // that point), destroying the overlay before `dblclick` ever got a
+  // chance to fire.
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) closeLightbox();
+  });
+  closeBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    closeLightbox();
+  });
   document.addEventListener("keydown", lightboxKeyHandler);
   document.body.appendChild(overlay);
+  applyTransform();
 }
 function closeLightbox() {
-  document.getElementById("active-lightbox")?.remove();
+  const overlay = document.getElementById("active-lightbox");
+  overlay?.lightboxCleanup?.();
+  overlay?.remove();
   document.removeEventListener("keydown", lightboxKeyHandler);
 }
 function lightboxKeyHandler(e) {
@@ -1129,20 +1522,19 @@ function selectRoom(roomId) {
   cancelEdit();
   const room = state.rooms.find((r) => r.room_id === roomId);
   el.timelineTitle.textContent = room ? room.name : roomId;
+  updateFavoriteButtonLabel(room);
   el.timelineHeaderActions.style.display = "flex";
   el.composeRow.style.display = "flex";
   el.composeToolbar.style.display = "flex";
   // Opening a room opens its threads list by default (rather than
-  // leaving `rightPanel` closed until the user hits Ctrl+T) — same
+  // leaving `rightPanel` closed until the user hits Alt+T) — same
   // request/state shape as `openRoomThreadsList()`, inlined instead of
   // calling it since that function also calls `renderSidePanel()` itself,
-  // which happens below anyway. Desktop-width only: below the same
-  // `720px`/`500px` breakpoint `renderSidePanel()` uses elsewhere (see its
-  // `isNarrowLayout` comment), `#side-panel` is a full-screen overlay, so
-  // this would otherwise bury the timeline the user just tapped to see
-  // behind the thread list on every single room open.
-  const isNarrowLayout = window.matchMedia("(max-width: 720px), (max-height: 500px)").matches;
-  if (isNarrowLayout) {
+  // which happens below anyway. Desktop layout only: on a narrow/phone
+  // layout (see `isNarrowLayout()`), `#side-panel` is a full-screen
+  // overlay, so this would otherwise bury the timeline the user just
+  // tapped to see behind the thread list on every single room open.
+  if (isNarrowLayout()) {
     state.rightPanel = null;
   } else {
     send("ListThreads", { room_id: roomId });
@@ -1203,32 +1595,130 @@ document.addEventListener("click", (e) => {
   }
 });
 
+/** Sends the invite and closes the dialog — shared by clicking a search
+ * result and by typing a full id and pressing enter. */
+function submitInvite(roomId, userId, displayLabel) {
+  if (!userId) return;
+  send("InviteUser", { room_id: roomId, user_id: userId });
+  showToast(`invite sent to ${displayLabel || userId}`);
+  closeDialog();
+}
+
+/** Renders the result list inside the "invite to room" dialog: known
+ * contacts (`state.allUsers`, from every joined room, filtered locally —
+ * instant) merged with the homeserver's user directory search
+ * (`state.directorySearch`, debounced, so it can also surface people the
+ * account has no room in common with yet), deduped by user id. */
+function renderInviteDialogList() {
+  const listEl = document.getElementById("dlg-invite-list");
+  if (!listEl) return;
+  const roomId = state.selectedRoom;
+  const rawQuery = document.getElementById("dlg-invite-filter").value.trim();
+  const query = normalizeForSearch(rawQuery);
+
+  const byId = new Map(); // user_id -> { userId, name, avatarUrl }
+  if (query && state.allUsers) {
+    for (const [userId, name] of state.allUsers) {
+      if (normalizeForSearch(name).includes(query) || normalizeForSearch(userId).includes(query)) {
+        byId.set(userId, { userId, name, avatarUrl: null });
+      }
+    }
+  }
+  const searching = query.length > 0 && (state.directorySearch === null || state.directorySearch.query !== rawQuery);
+  if (state.directorySearch && state.directorySearch.query === rawQuery) {
+    for (const u of state.directorySearch.users) {
+      byId.set(u.user_id, { userId: u.user_id, name: u.display_name || u.user_id, avatarUrl: u.avatar_url });
+    }
+  }
+
+  listEl.innerHTML = "";
+  if (!query) {
+    listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--text-weak)">type a name, or a full @user:server id</div>`;
+    return;
+  }
+  const matches = [...byId.values()].slice(0, 50);
+  if (matches.length === 0) {
+    listEl.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--text-weak)">${
+      searching ? "searching..." : "no matching user"
+    }${rawQuery.startsWith("@") && rawQuery.includes(":") ? " — press enter to invite this id anyway" : ""}</div>`;
+    return;
+  }
+  for (const { userId, name, avatarUrl } of matches) {
+    const item = document.createElement("div");
+    item.className = "mention-item";
+    item.style.display = "flex";
+    item.style.alignItems = "center";
+    item.style.gap = "8px";
+    item.appendChild(renderAvatar(avatarUrl, name, userId, 24));
+    const label = document.createElement("span");
+    label.textContent = userId === name ? name : `${name}  (${userId})`;
+    item.appendChild(label);
+    item.addEventListener("click", () => submitInvite(roomId, userId, name));
+    listEl.appendChild(item);
+  }
+  if (searching) {
+    const loading = document.createElement("div");
+    loading.style.padding = "6px 8px";
+    loading.style.fontSize = "12px";
+    loading.style.color = "var(--text-weak)";
+    loading.textContent = "searching directory...";
+    listEl.appendChild(loading);
+  }
+}
+
+/** Keeps the room menu's "[ ☆ favorite ]"/"[ ★ favorited ]" button label
+ * in sync with `room.is_favorite` — called on every `selectRoom()` and
+ * again once `Event::RoomFavoriteSet` confirms a toggle. `room` may be
+ * `undefined` right after switching to a room whose summary hasn't
+ * synced in yet; the button just falls back to the unfavorited label
+ * until it has. */
+function updateFavoriteButtonLabel(room) {
+  el.btnFavoriteRoom.textContent = room?.is_favorite ? "[ ★ favorited ]" : "[ ☆ favorite ]";
+}
+
+el.btnFavoriteRoom.addEventListener("click", () => {
+  closeRoomMenu();
+  if (!state.selectedRoom) return;
+  const room = state.rooms.find((r) => r.room_id === state.selectedRoom);
+  send("SetRoomFavorite", { room_id: state.selectedRoom, favorite: !room?.is_favorite });
+});
+
+let inviteSearchDebounceTimer = null;
+
 el.btnInvite.addEventListener("click", () => {
   closeRoomMenu();
   if (!state.selectedRoom) return;
   const roomId = state.selectedRoom;
+  state.directorySearch = null;
   showDialog(`
     <h3>invite to room</h3>
-    <label>matrix user id</label>
-    <input type="text" id="dlg-invite-user" placeholder="@user:server" />
+    <label>search by name, or type a full @user:server id</label>
+    <input type="text" id="dlg-invite-filter" placeholder="name or @user:server" autocomplete="off" />
+    <div id="dlg-invite-list" class="user-search-list"></div>
     <div class="actions">
       <button id="dlg-cancel">cancel</button>
-      <button id="dlg-invite">invite</button>
     </div>
   `);
   document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
-  const submit = () => {
-    const userId = document.getElementById("dlg-invite-user").value.trim();
-    if (!userId) return;
-    send("InviteUser", { room_id: roomId, user_id: userId });
-    showToast(`invite sent to ${userId}`);
-    closeDialog();
-  };
-  document.getElementById("dlg-invite").addEventListener("click", submit);
-  document.getElementById("dlg-invite-user").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") submit();
+  const filterInput = document.getElementById("dlg-invite-filter");
+  filterInput.addEventListener("input", () => {
+    renderInviteDialogList();
+    const query = filterInput.value.trim();
+    clearTimeout(inviteSearchDebounceTimer);
+    if (!query) return;
+    inviteSearchDebounceTimer = setTimeout(() => send("SearchDirectoryUsers", { query }), 250);
   });
-  document.getElementById("dlg-invite-user").focus();
+  filterInput.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const typed = filterInput.value.trim();
+    if (typed.startsWith("@") && typed.includes(":")) submitInvite(roomId, typed, typed);
+  });
+  if (state.allUsers === null && !state.allUsersLoading) {
+    state.allUsersLoading = true;
+    send("ListAllUsers");
+  }
+  renderInviteDialogList();
+  filterInput.focus();
 });
 
 el.btnLeaveRoom.addEventListener("click", () => {
@@ -1250,14 +1740,14 @@ el.notificationMode.addEventListener("change", () => {
 });
 
 /** Patches every already-rendered presence dot in place (main timeline and
- * thread panel both — see the `data-presence-user` marker `renderMessage`
- * puts on each one) rather than a full re-render, since a presence change
- * is exactly the kind of thing that can arrive in a steady trickle while
- * scrolled somewhere unrelated. */
+ * thread panel both — see the `data-presence-user` marker `renderMessageGroup`
+ * puts on each one, overlaid on the sender's avatar) rather than a full
+ * re-render, since a presence change is exactly the kind of thing that can
+ * arrive in a steady trickle while scrolled somewhere unrelated. */
 function updateMemberListPresenceDots() {
   document.querySelectorAll("[data-presence-user]").forEach((dot) => {
     const info = state.presence[dot.dataset.presenceUser];
-    dot.className = "presence-dot" + (info ? ` ${info.presence}` : "");
+    dot.className = "avatar-presence-dot" + (info ? ` ${info.presence}` : "");
     dot.title = info ? info.presence : "";
   });
 }
@@ -1409,8 +1899,29 @@ function openPinsDialog(roomId) {
       // rather than showing the raw `$eventId` forever.
       const ev = findEvent(roomId, eventId) || getEventPreview(roomId, eventId);
       let preview;
-      if (ev) {
-        preview = `${escapeHtml(ev.sender_name)}: ${escapeHtml(truncate(ev.body || "", 100))}`;
+      if (ev && ev.msg_type === "image" && ev.media_url) {
+        // Same fetch/cache pipeline `renderMessage` uses for an inline
+        // image (`state.imageCache`/`requestImage`) — a pinned image
+        // showing just its filename ("image.png") isn't a useful preview
+        // of *which* pinned photo this is.
+        if (ev.media_mime) state.imageMime[ev.media_url] = ev.media_mime;
+        if (ev.media_encryption) state.imageEncryption[ev.media_url] = ev.media_encryption;
+        const cached = state.imageCache[ev.media_url];
+        const senderLabel = `${escapeHtml(ev.sender_name)}: ${escapeHtml(ev.body || "image")}`;
+        if (cached) {
+          preview = `<div>${senderLabel}</div><img src="${cached}" alt="${escapeHtml(ev.body || "image")}" style="max-width:160px;max-height:160px;display:block;margin-top:6px;border-radius:6px;object-fit:cover;" />`;
+        } else {
+          preview = `<div>${senderLabel}</div>${loadingHtml("loading image...")}`;
+          if (!state.imageRequested.has(ev.media_url)) requestImage(ev.media_url);
+        }
+      } else if (ev) {
+        // `renderMarkdown` (not a plain `escapeHtml`) — same reasoning as
+        // `case "Summary"`'s own switch to it: a pinned message keeping
+        // its **bold**/`code`/lists intact previews meaningfully better
+        // than the raw markdown source showing up as literal asterisks
+        // and backticks. Still fully escaped first, same as every other
+        // `renderMarkdown` call in this app.
+        preview = `<span class="shared-link-sender">${escapeHtml(ev.sender_name)}:</span> ${renderMarkdownPreview(ev.body || "", 100)}`;
       } else if (ev === null) {
         preview = `<span style="color:var(--text-weak);">(message unavailable)</span>`;
       } else {
@@ -1422,12 +1933,16 @@ function openPinsDialog(roomId) {
       </div>`;
     })
     .join("");
+  state.pinnedEventsDialogRoomId = roomId;
   showDialog(`
     <h3>pinned messages</h3>
     ${rows || `<p style="color:var(--text-weak);font-size:12px;">no pinned messages</p>`}
     <div class="actions"><button id="dlg-cancel">close</button></div>
   `);
-  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  document.getElementById("dlg-cancel").addEventListener("click", () => {
+    state.pinnedEventsDialogRoomId = null;
+    closeDialog();
+  });
   document.querySelectorAll(".dlg-unpin").forEach((btn) => {
     btn.addEventListener("click", () => {
       send("UnpinMessage", { room_id: roomId, event_id: btn.dataset.eventId });
@@ -1585,9 +2100,12 @@ function renderMessageSearchResults(results, truncated) {
   container.innerHTML = results
     .map(
       (hit) => `<div class="thread-row" data-room-id="${escapeHtml(hit.room_id)}" data-event-id="${escapeHtml(hit.event.event_id)}">
-        <div class="thread-room-name">${escapeHtml(hit.room_name)}</div>
-        <div class="sender">${escapeHtml(hit.event.sender_name)}</div>
-        <div class="thread-row-body">${escapeHtml(truncate(hit.event.body || "", 160))}</div>
+        ${avatarHtml(hit.event.sender_avatar_url, hit.event.sender_name, hit.event.sender, 28)}
+        <div class="thread-row-content">
+          <div class="thread-room-name">${escapeHtml(hit.room_name)}</div>
+          <div class="sender">${escapeHtml(hit.event.sender_name)}</div>
+          <div class="thread-row-body">${renderMarkdownPreview(hit.event.body || "", 160)}</div>
+        </div>
       </div>`
     )
     .join("") + (truncated ? `<div style="padding:6px;color:var(--text-weak);font-size:11px;">results truncated — narrow your search</div>` : "");
@@ -1687,63 +2205,279 @@ async function toggleVoiceRecording() {
 }
 
 // =========================================================================
-// Theme override (system / light / dark) — see style.css's comment on the
-// (deliberately empty) light `@media` block for why this lives here as
-// inline custom-property overrides instead.
+// Theme override (system, plus a curated set of named palettes) — see
+// style.css's comment on the (deliberately empty) light `@media` block for
+// why this lives here as inline custom-property overrides instead.
 // =========================================================================
-const LIGHT_PALETTE = {
-  bg: "#f7f5f0",
-  bgAlt: "#ffffff",
-  border: "#d9d3c7",
-  text: "#2a2620",
-  textWeak: "#6e675c",
-  accent: "#b5791c",
-  accentStrong: "#8f5f12",
+/** One entry per selectable theme, `id: null` reserved for "system" (drops
+ * every override below and lets `Event::SystemTheme`/the plain `:root`
+ * defaults take back over — see `applyThemeOverride`). `"dark"` has no
+ * palette of its own for the same reason: it just *is* this app's own
+ * `:root` defaults (the terminal-tool amber-on-near-black look), so
+ * there's nothing to override back to. Every other theme is a genuine,
+ * named palette (not GTK-driven), so unlike the old light-only override
+ * these also set `--accent-strong`/`--border`/etc. explicitly enough to
+ * look coherent rather than just inverted. Colors are each theme's own
+ * well-known published values, not approximated. */
+const THEME_PALETTES = {
+  light: {
+    bg: "#f7f5f0", bgAlt: "#ffffff", border: "#d9d3c7",
+    text: "#2a2620", textWeak: "#6e675c", accent: "#b5791c", accentStrong: "#8f5f12",
+    colorScheme: "light",
+  },
+  dracula: {
+    bg: "#282a36", bgAlt: "#343746", border: "#44475a",
+    text: "#f8f8f2", textWeak: "#6272a4", accent: "#bd93f9", accentStrong: "#ff79c6",
+    colorScheme: "dark",
+  },
+  nord: {
+    bg: "#2e3440", bgAlt: "#3b4252", border: "#4c566a",
+    text: "#e5e9f0", textWeak: "#81a1c1", accent: "#88c0d0", accentStrong: "#5e81ac",
+    colorScheme: "dark",
+  },
+  gruvbox: {
+    bg: "#282828", bgAlt: "#3c3836", border: "#504945",
+    text: "#ebdbb2", textWeak: "#a89984", accent: "#fabd2f", accentStrong: "#d79921",
+    colorScheme: "dark",
+  },
+  "solarized-dark": {
+    bg: "#002b36", bgAlt: "#073642", border: "#586e75",
+    text: "#93a1a1", textWeak: "#657b83", accent: "#268bd2", accentStrong: "#2aa198",
+    colorScheme: "dark",
+  },
+  "solarized-light": {
+    bg: "#fdf6e3", bgAlt: "#eee8d5", border: "#c9c2ab",
+    text: "#586e75", textWeak: "#839496", accent: "#268bd2", accentStrong: "#cb4b16",
+    colorScheme: "light",
+  },
+  "one-dark": {
+    bg: "#282c34", bgAlt: "#2c313a", border: "#3e4451",
+    text: "#abb2bf", textWeak: "#5c6370", accent: "#61afef", accentStrong: "#c678dd",
+    colorScheme: "dark",
+  },
+  monokai: {
+    bg: "#272822", bgAlt: "#3e3d32", border: "#49483e",
+    text: "#f8f8f2", textWeak: "#8d8a7d", accent: "#a6e22e", accentStrong: "#f92672",
+    colorScheme: "dark",
+  },
+  "tokyo-night": {
+    bg: "#1a1b26", bgAlt: "#24283b", border: "#414868",
+    text: "#c0caf5", textWeak: "#7982a9", accent: "#7aa2f7", accentStrong: "#bb9af7",
+    colorScheme: "dark",
+  },
+  "catppuccin-mocha": {
+    bg: "#1e1e2e", bgAlt: "#313244", border: "#45475a",
+    text: "#cdd6f4", textWeak: "#a6adc8", accent: "#89b4fa", accentStrong: "#f5c2e7",
+    colorScheme: "dark",
+  },
+  "high-contrast": {
+    bg: "#000000", bgAlt: "#1a1a1a", border: "#ffffff",
+    text: "#ffffff", textWeak: "#d8d8d8", accent: "#ffff00", accentStrong: "#00ffff",
+    colorScheme: "dark",
+  },
 };
+const THEME_OPTIONS = [
+  { id: null, label: "System" },
+  { id: "dark", label: "Dark (default)" },
+  { id: "light", label: "Light" },
+  { id: "dracula", label: "Dracula" },
+  { id: "nord", label: "Nord" },
+  { id: "gruvbox", label: "Gruvbox Dark" },
+  { id: "solarized-dark", label: "Solarized Dark" },
+  { id: "solarized-light", label: "Solarized Light" },
+  { id: "one-dark", label: "One Dark" },
+  { id: "monokai", label: "Monokai" },
+  { id: "tokyo-night", label: "Tokyo Night" },
+  { id: "catppuccin-mocha", label: "Catppuccin Mocha" },
+  { id: "high-contrast", label: "High Contrast" },
+];
 const THEME_VARS = ["--bg", "--bg-alt", "--border", "--text", "--text-weak", "--accent", "--accent-strong"];
 function applyThemeOverride() {
   const root = document.documentElement.style;
-  if (state.themeOverride === "light") {
-    root.setProperty("--bg", LIGHT_PALETTE.bg);
-    root.setProperty("--bg-alt", LIGHT_PALETTE.bgAlt);
-    root.setProperty("--border", LIGHT_PALETTE.border);
-    root.setProperty("--text", LIGHT_PALETTE.text);
-    root.setProperty("--text-weak", LIGHT_PALETTE.textWeak);
-    root.setProperty("--accent", LIGHT_PALETTE.accent);
-    root.setProperty("--accent-strong", LIGHT_PALETTE.accentStrong);
-    document.documentElement.style.colorScheme = "light";
-  } else if (state.themeOverride === "dark") {
-    THEME_VARS.forEach((v) => root.removeProperty(v));
-    document.documentElement.style.colorScheme = "dark";
+  const palette = THEME_PALETTES[state.themeOverride];
+  if (palette) {
+    root.setProperty("--bg", palette.bg);
+    root.setProperty("--bg-alt", palette.bgAlt);
+    root.setProperty("--border", palette.border);
+    root.setProperty("--text", palette.text);
+    root.setProperty("--text-weak", palette.textWeak);
+    root.setProperty("--accent", palette.accent);
+    root.setProperty("--accent-strong", palette.accentStrong);
+    document.documentElement.style.colorScheme = palette.colorScheme;
   } else {
-    // "system" — drop any override and let the next `Event::SystemTheme`
-    // (Linux/GTK) or, absent that, the plain `:root` CSS defaults (every
-    // other platform) take over again.
+    // "dark" (this app's own `:root` defaults, nothing to override) or
+    // `null`/"system" (drop any override and let the next
+    // `Event::SystemTheme` — Linux/GTK — or, absent that, those same
+    // plain `:root` defaults take over again).
     THEME_VARS.forEach((v) => root.removeProperty(v));
     document.documentElement.style.colorScheme = "dark";
   }
-  el.btnTheme.textContent = `[ theme: ${state.themeOverride || "system"} ]`;
+  const current = THEME_OPTIONS.find((t) => t.id === state.themeOverride);
+  el.btnTheme.textContent = `[ theme: ${current ? current.label : "system"} ]`;
 }
-el.btnTheme.addEventListener("click", () => {
-  const order = [null, "light", "dark"];
-  const next = order[(order.indexOf(state.themeOverride) + 1) % order.length];
-  state.themeOverride = next;
+function persistThemeOverride() {
   try {
-    if (next) localStorage.setItem("themeOverride", next);
+    if (state.themeOverride) localStorage.setItem("themeOverride", state.themeOverride);
     else localStorage.removeItem("themeOverride");
   } catch (e) {
     // Private-browsing-style storage block — the override just won't
     // survive a restart, nothing else depends on it persisting.
   }
-  applyThemeOverride();
+}
+el.btnTheme.addEventListener("click", () => {
+  showDialog(`
+    <h3>theme</h3>
+    <label>theme</label>
+    <select id="dlg-theme">
+      ${THEME_OPTIONS.map(
+        (t) =>
+          `<option value="${t.id ? escapeHtml(t.id) : ""}"${t.id === state.themeOverride ? " selected" : ""}>${escapeHtml(t.label)}</option>`
+      ).join("")}
+    </select>
+    <div class="actions">
+      <button id="dlg-cancel">close</button>
+    </div>
+  `);
+  document.getElementById("dlg-theme").addEventListener("change", (e) => {
+    state.themeOverride = e.target.value || null;
+    applyThemeOverride();
+    persistThemeOverride();
+  });
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
 });
 try {
   const saved = localStorage.getItem("themeOverride");
-  if (saved === "light" || saved === "dark") state.themeOverride = saved;
+  if (THEME_OPTIONS.some((t) => t.id === saved)) state.themeOverride = saved;
 } catch (e) {
   // same as above
 }
 applyThemeOverride();
+
+/** Curated rather than a free-text field: a font name that doesn't exist
+ * on the OS just silently falls through to the browser default with no
+ * feedback, so picking from a list of names actually likely to be
+ * installed (mirroring what `renderMarkdown`'s `<code>` styling and the
+ * rest of this app's CSS already assume) avoids a picker that quietly
+ * does nothing for most typed input. Monospace options keep the
+ * terminal-tool look this app defaults to; the rest are for anyone who'd
+ * rather it read like a normal chat app. Each still carries a generic
+ * fallback family so an OS missing that exact face doesn't fall back all
+ * the way to serif. */
+const FONT_FAMILY_OPTIONS = [
+  { label: "Inter (default)", value: null },
+  { label: "Noto Sans", value: '"Noto Sans", sans-serif' },
+  { label: "DejaVu Sans", value: '"DejaVu Sans", sans-serif' },
+  { label: "Liberation Sans", value: '"Liberation Sans", sans-serif' },
+  { label: "Roboto", value: '"Roboto", sans-serif' },
+  { label: "Segoe UI", value: '"Segoe UI", sans-serif' },
+  { label: "Helvetica", value: '"Helvetica", "Arial", sans-serif' },
+  { label: "System default", value: "system-ui, sans-serif" },
+  { label: "JetBrains Mono (monospace)", value: '"JetBrains Mono", monospace' },
+  { label: "DejaVu Sans Mono (monospace)", value: '"DejaVu Sans Mono", monospace' },
+  { label: "Noto Sans Mono (monospace)", value: '"Noto Sans Mono", monospace' },
+  { label: "Liberation Mono (monospace)", value: '"Liberation Mono", monospace' },
+  { label: "Ubuntu Mono (monospace)", value: '"Ubuntu Mono", monospace' },
+  { label: "Cascadia Code (monospace)", value: '"Cascadia Code", monospace' },
+  { label: "Fira Code (monospace)", value: '"Fira Code", monospace' },
+  { label: "Consolas (monospace)", value: '"Consolas", monospace' },
+  { label: "Menlo (monospace)", value: '"Menlo", monospace' },
+  { label: "SF Mono (monospace)", value: '"SF Mono", monospace' },
+  { label: "Roboto Mono (monospace)", value: '"Roboto Mono", monospace' },
+  { label: "IBM Plex Mono (monospace)", value: '"IBM Plex Mono", monospace' },
+  { label: "Source Code Pro (monospace)", value: '"Source Code Pro", monospace' },
+  { label: "Space Mono (monospace)", value: '"Space Mono", monospace' },
+  { label: "Inconsolata (monospace)", value: '"Inconsolata", monospace' },
+  { label: "Courier New (monospace)", value: '"Courier New", monospace' },
+];
+const FONT_SIZE_MIN = 12;
+const FONT_SIZE_MAX = 22;
+const FONT_SIZE_DEFAULT = 15; // must match `--font-size` in style.css
+
+/** Same `root.style.setProperty`/`removeProperty` shape as
+ * `applyThemeOverride()` above — a `null` state value drops the override
+ * and lets `:root`'s plain CSS default (style.css) take back over. */
+function applyFontSettings() {
+  const root = document.documentElement.style;
+  if (state.fontFamily) root.setProperty("--font-family", state.fontFamily);
+  else root.removeProperty("--font-family");
+  if (state.fontSize) root.setProperty("--font-size", `${state.fontSize}px`);
+  else root.removeProperty("--font-size");
+}
+try {
+  const savedFamily = localStorage.getItem("fontFamily");
+  if (savedFamily && FONT_FAMILY_OPTIONS.some((o) => o.value === savedFamily)) {
+    state.fontFamily = savedFamily;
+  }
+  const savedSize = parseInt(localStorage.getItem("fontSize"), 10);
+  if (Number.isFinite(savedSize) && savedSize >= FONT_SIZE_MIN && savedSize <= FONT_SIZE_MAX) {
+    state.fontSize = savedSize;
+  }
+} catch (e) {
+  // Private-browsing-style storage block, same as the theme override above.
+}
+applyFontSettings();
+
+el.btnFontSettings.addEventListener("click", () => {
+  showDialog(`
+    <h3>font</h3>
+    <label>font family</label>
+    <select id="dlg-font-family">
+      ${FONT_FAMILY_OPTIONS.map(
+        (o) =>
+          `<option value="${o.value ? escapeHtml(o.value) : ""}"${o.value === state.fontFamily ? " selected" : ""}>${escapeHtml(o.label)}</option>`
+      ).join("")}
+    </select>
+    <label>font size (${FONT_SIZE_MIN}-${FONT_SIZE_MAX}px)</label>
+    <input type="number" id="dlg-font-size" min="${FONT_SIZE_MIN}" max="${FONT_SIZE_MAX}" value="${state.fontSize || FONT_SIZE_DEFAULT}" />
+    <div class="actions">
+      <button id="dlg-font-reset">reset to default</button>
+      <button id="dlg-font-save">save</button>
+      <button id="dlg-cancel">close</button>
+    </div>
+  `);
+  const familySel = document.getElementById("dlg-font-family");
+  const sizeInput = document.getElementById("dlg-font-size");
+  const persist = () => {
+    try {
+      if (state.fontFamily) localStorage.setItem("fontFamily", state.fontFamily);
+      else localStorage.removeItem("fontFamily");
+      if (state.fontSize) localStorage.setItem("fontSize", String(state.fontSize));
+      else localStorage.removeItem("fontSize");
+    } catch (e) {
+      // same as above — the change still applies for this session
+    }
+  };
+  familySel.addEventListener("change", () => {
+    state.fontFamily = familySel.value || null;
+    applyFontSettings();
+    persist();
+  });
+  sizeInput.addEventListener("input", () => {
+    const n = parseInt(sizeInput.value, 10);
+    if (!Number.isFinite(n) || n < FONT_SIZE_MIN || n > FONT_SIZE_MAX) return;
+    state.fontSize = n;
+    applyFontSettings();
+    persist();
+  });
+  document.getElementById("dlg-font-reset").addEventListener("click", () => {
+    state.fontFamily = null;
+    state.fontSize = null;
+    applyFontSettings();
+    persist();
+    familySel.value = "";
+    sizeInput.value = FONT_SIZE_DEFAULT;
+  });
+  document.getElementById("dlg-font-save").addEventListener("click", () => {
+    // Everything above already applies + persists live on every change —
+    // this button doesn't do anything the live updates haven't already
+    // done, it just gives an explicit "I'm done, this is saved" action to
+    // click instead of only "close", so the choice reads as confirmed
+    // rather than dismissed.
+    persist();
+    closeDialog();
+  });
+  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+});
 
 /** Opens the "summarizing..." popup and kicks off `Command::Summarize`
  * for the main room timeline (`threadRootId: null`) or one open thread
@@ -1793,12 +2527,173 @@ function openSummaryDialog(roomId, threadRootId) {
  * since it's already close, just not exact. */
 function scrollToBottom(container) {
   container.scrollTop = container.scrollHeight;
+  scrollAnchorFor(container)?.stickToBottom();
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       container.scrollTop = container.scrollHeight;
     });
   });
 }
+
+/** Manual scroll anchoring for a message list — keeps whichever message
+ * the user is reading pinned at the same on-screen position whenever
+ * layout *above* it changes: an older page prepended by "load more", an
+ * image/avatar/link preview above the viewport finishing its load (which
+ * `rerenderMessageInPlace` swaps in with a different height), the "load
+ * more" row flipping to "loading...". Or, if the list was scrolled all
+ * the way down, keeps it there. Browsers' own CSS scroll anchoring
+ * (`overflow-anchor`) would do this, but WebKitGTK — this app's desktop
+ * webview — doesn't implement it at all, so every one of those layout
+ * changes used to visibly shove the timeline around after the one-off
+ * scroll fixup in `prependMessages` had already run. It's turned off in
+ * style.css for these containers too, so Android's Chromium WebView
+ * doesn't adjust a second time on top of this.
+ *
+ * `sync()` undoes any layout shift since the last sync, then re-records
+ * the anchor. It runs from a `ResizeObserver` on each `.msg-row` (after
+ * layout, before paint, so the correction never shows up as a visible
+ * jump), on every scroll, and around programmatic inserts. Never just
+ * re-recording without correcting first matters: a scroll landing in the
+ * same frame as an image swap would otherwise bake that shift in.
+ * `getContainer` returns the current scroll container (or `null`) since
+ * the thread panel's `#side-panel-body` is recreated on every full
+ * `renderSidePanel()`; `rootEl` is a stable ancestor to watch for rows
+ * being added/removed. */
+const scrollAnchors = [];
+function scrollAnchorFor(container) {
+  return scrollAnchors.find((a) => a.container() === container) || null;
+}
+function createScrollAnchor(getContainer, rootEl) {
+  const OBSERVED = ".msg-row, #load-more-row";
+  let capturedFor = null;
+  let capturedScrollTop = 0;
+  let atBottom = true;
+  let anchorEventId = null;
+  let anchorOffset = 0;
+
+  const resolveContainer = () => {
+    const c = getContainer();
+    return c && c.isConnected ? c : null;
+  };
+
+  /** First `.msg-item` whose bottom edge is below the container's top —
+   * binary search, since items are in document (= vertical) order and a
+   * long timeline can hold thousands of them. */
+  const firstVisibleItem = (c, top) => {
+    const items = c.getElementsByClassName("msg-item");
+    let lo = 0;
+    let hi = items.length - 1;
+    let found = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (items[mid].getBoundingClientRect().bottom > top) {
+        found = items[mid];
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return found;
+  };
+
+  const findAnchorEl = (c) =>
+    anchorEventId ? c.querySelector(`.msg-item[data-event-id="${CSS.escape(anchorEventId)}"]`) : null;
+
+  const capture = () => {
+    const c = resolveContainer();
+    capturedFor = c;
+    anchorEventId = null;
+    if (!c) return;
+    capturedScrollTop = c.scrollTop;
+    atBottom = c.scrollHeight - c.scrollTop - c.clientHeight <= 2;
+    if (atBottom) return;
+    const top = c.getBoundingClientRect().top;
+    const item = firstVisibleItem(c, top);
+    if (!item) return;
+    anchorEventId = item.dataset.eventId;
+    anchorOffset = item.getBoundingClientRect().top - top;
+  };
+
+  const sync = () => {
+    const c = resolveContainer();
+    if (!c || c !== capturedFor) {
+      capture();
+      return;
+    }
+    if (atBottom) {
+      // Something else deliberately scrolled away from the bottom (a
+      // jump-to-message `scrollIntoView`, ...) before the scroll
+      // listener got to recapture — respect that rather than yanking
+      // back down.
+      if (Math.abs(c.scrollTop - capturedScrollTop) > 1) {
+        capture();
+        return;
+      }
+      c.scrollTop = c.scrollHeight;
+    } else {
+      const anchorEl = findAnchorEl(c);
+      if (anchorEl) {
+        // Pure scrolling moves the anchor by exactly the scroll delta;
+        // anything beyond that is a layout shift above it to undo.
+        const expected = anchorOffset - (c.scrollTop - capturedScrollTop);
+        const actual = anchorEl.getBoundingClientRect().top - c.getBoundingClientRect().top;
+        const delta = actual - expected;
+        if (Math.abs(delta) >= 1) c.scrollTop += delta;
+      }
+    }
+    capture();
+  };
+
+  const resizeObserver = new ResizeObserver(sync);
+  const forEachObserved = (node, fn) => {
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    if (node.matches(OBSERVED)) fn(node);
+    for (const child of node.querySelectorAll(OBSERVED)) fn(child);
+  };
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const n of m.removedNodes) forEachObserved(n, (x) => resizeObserver.unobserve(x));
+      for (const n of m.addedNodes) forEachObserved(n, (x) => resizeObserver.observe(x));
+    }
+  }).observe(rootEl, { childList: true, subtree: true });
+  forEachObserved(rootEl, (x) => resizeObserver.observe(x));
+
+  // Capture phase, so this also sees scrolls of a descendant container
+  // (scroll events don't bubble) that gets recreated under `rootEl`.
+  let rafPending = false;
+  rootEl.addEventListener(
+    "scroll",
+    () => {
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(() => {
+        rafPending = false;
+        sync();
+      });
+    },
+    true,
+  );
+
+  const anchor = {
+    container: resolveContainer,
+    sync,
+    stickToBottom() {
+      const c = resolveContainer();
+      capturedFor = c;
+      anchorEventId = null;
+      atBottom = true;
+      if (c) capturedScrollTop = c.scrollTop;
+    },
+  };
+  scrollAnchors.push(anchor);
+  return anchor;
+}
+
+const timelineScrollAnchor = createScrollAnchor(() => el.timeline, el.timeline);
+const threadScrollAnchor = createScrollAnchor(
+  () => (state.rightPanel?.kind === "thread" ? document.getElementById("side-panel-body") : null),
+  el.sidePanel,
+);
 
 function renderTimeline() {
   const events = state.timelines[state.selectedRoom] || [];
@@ -1826,11 +2721,9 @@ function renderTimeline() {
     updateJumpLatestVisibility();
     return;
   }
-  let prev = null;
-  for (const event of events) {
-    const grouped = isGrouped(prev, event);
-    el.timeline.appendChild(renderMessage(event, { roomId: state.selectedRoom, threadId: null }, { grouped }));
-    prev = event;
+  const ctx = { roomId: state.selectedRoom, threadId: null };
+  for (const run of groupIntoRuns(events)) {
+    el.timeline.appendChild(renderMessageGroup(run, ctx));
   }
   scrollToBottom(el.timeline);
   updateJumpLatestVisibility();
@@ -1848,25 +2741,94 @@ function isGrouped(prev, event) {
   return Math.abs(event.timestamp - prev.timestamp) < 5 * 60 * 1000;
 }
 
-/** Re-renders exactly the DOM row for one event, in place — no
+/** Builds the optimistic placeholder shown the instant Send is pressed —
+ * same shape as a real `TimelineEvent` from the backend, so it flows
+ * through `renderMessageItem`/`renderMessageGroup`/grouping exactly like
+ * one, just tagged `_sendStatus: "sending"` for the "· sending..." meta
+ * suffix. Reconciled away once either `MessageSent`/`MessageSendFailed`
+ * or (more usually first) the live echo carrying the same `local_id`
+ * arrives — see `state.pendingSends` and the `NewMessage`/`ThreadReply`
+ * handlers. Returns `null` when `state.ownProfile` hasn't loaded yet
+ * (right after login, before `Command::GetOwnProfile` answers) — sending
+ * still works, it just falls back to waiting for the real echo like
+ * before, rather than showing a bubble with no name/avatar. */
+function makeOptimisticEvent(localId, body, replyToEventId, mentionedUserIds) {
+  const profile = state.ownProfile;
+  if (!profile) return null;
+  return {
+    event_id: `local:${localId}`,
+    local_id: localId,
+    sender: profile.user_id,
+    sender_name: profile.display_name,
+    sender_avatar_url: profile.avatar_url,
+    body,
+    msg_type: "text",
+    media_url: null,
+    media_mime: null,
+    media_encryption: null,
+    thumbnail_url: null,
+    timestamp: Date.now(),
+    thread_count: null,
+    is_own: true,
+    reply_to_event_id: replyToEventId,
+    reply_to_preview: null,
+    mentions_me: false,
+    mentioned_user_ids: mentionedUserIds,
+    reactions: [],
+    read_by: [],
+    latest_reply_sender_name: null,
+    latest_reply_body: null,
+    latest_reply_ts: null,
+    latest_reply_event_id: null,
+    latest_reply_mentions_me: false,
+    latest_reply_msg_type: null,
+    latest_reply_media_url: null,
+    latest_reply_media_mime: null,
+    latest_reply_media_encryption: null,
+    is_unread: null,
+    _sendStatus: "sending",
+  };
+}
+
+/** Swaps a still-pending optimistic placeholder (`event_id: "local:<id>"`,
+ * see `makeOptimisticEvent`) for the real event that just arrived carrying
+ * the same `local_id` back on `unsigned.transaction_id` — in both the
+ * backing `events` array and, if it's actually on screen right now, the
+ * rendered DOM row, without disturbing anything else in the timeline.
+ * Returns `false` (caller falls back to just appending normally) when
+ * there's no matching placeholder left to swap — e.g. `MessageSendFailed`
+ * already turned it into a "failed to send" row instead. */
+function reconcileLocalEcho(events, containerEl, localId, realEvent, ctx) {
+  const placeholderId = `local:${localId}`;
+  const idx = events.findIndex((e) => e.event_id === placeholderId);
+  if (idx === -1) return false;
+  events[idx] = realEvent;
+  const itemEl = containerEl?.querySelector(`.msg-item[data-event-id="${CSS.escape(placeholderId)}"]`);
+  if (itemEl) itemEl.replaceWith(renderMessageItem(realEvent, ctx));
+  return true;
+}
+
+/** Re-renders exactly the DOM `.msg-item` for one event, in place — no
  * `renderTimeline()` teardown, so the rest of the timeline (and wherever
  * the user has scrolled to) is left completely untouched. Used for
  * edits/deletes and an image finishing its download, both of which used
  * to force a full rebuild-and-jump-to-bottom for a change to a single
- * message. Falls back to a full render if the row isn't there to patch
+ * message. Only the one message's own content needs rebuilding — which
+ * run it's grouped into never changes from an edit/delete/image-load, so
+ * unlike the old per-row version this doesn't need to recompute grouping
+ * at all. Falls back to a full render if the item isn't there to patch
  * (shouldn't normally happen — caller already checked the room matches). */
 function rerenderMessageInPlace(roomId, eventId) {
   if (roomId !== state.selectedRoom) return;
   const events = state.timelines[roomId] || [];
-  const idx = events.findIndex((e) => e.event_id === eventId);
-  if (idx === -1) return;
-  const row = el.timeline.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`);
-  if (!row) {
+  const event = events.find((e) => e.event_id === eventId);
+  if (!event) return;
+  const itemEl = el.timeline.querySelector(`.msg-item[data-event-id="${CSS.escape(eventId)}"]`);
+  if (!itemEl) {
     renderTimeline();
     return;
   }
-  const grouped = isGrouped(idx > 0 ? events[idx - 1] : null, events[idx]);
-  row.replaceWith(renderMessage(events[idx], { roomId, threadId: null }, { grouped }));
+  itemEl.replaceWith(renderMessageItem(event, { roomId, threadId: null }));
 }
 
 /** Appends exactly one new message at the bottom instead of tearing down
@@ -1885,8 +2847,15 @@ function appendMessage(roomId, event) {
   }
   const wasNearBottom =
     el.timeline.scrollHeight - el.timeline.scrollTop - el.timeline.clientHeight < 120;
+  const ctx = { roomId, threadId: null };
   const grouped = isGrouped(events[events.length - 2], event);
-  el.timeline.appendChild(renderMessage(event, { roomId, threadId: null }, { grouped }));
+  const lastRow = grouped ? el.timeline.lastElementChild : null;
+  const lastBubble = lastRow?.classList.contains("msg-row") ? lastRow.querySelector(".bubble") : null;
+  if (lastBubble) {
+    lastBubble.appendChild(renderMessageItem(event, ctx));
+  } else {
+    el.timeline.appendChild(renderMessageGroup([event], ctx));
+  }
   if (wasNearBottom) scrollToBottom(el.timeline);
   updateJumpLatestVisibility();
 }
@@ -1914,27 +2883,48 @@ function prependMessages(roomId, prevEvents, allEvents) {
   }
 
   const newEvents = allEvents.slice(0, newCount);
-  const scrollTopBefore = el.timeline.scrollTop;
-  const scrollHeightBefore = el.timeline.scrollHeight;
+  // Pins the message currently at the top of the view (or the bottom, if
+  // scrolled all the way down — which is also the case right after
+  // opening a room whose first page doesn't fill the viewport yet, while
+  // `maybeAutoLoadMore` keeps calling this to fill it). Restored below,
+  // and kept pinned afterwards as the new rows' images etc. finish
+  // loading — see `createScrollAnchor`.
+  timelineScrollAnchor.sync();
+
+  // The new page's last (most recent) event may group with the room's
+  // previous first event (same sender, close in time — common, since
+  // that's exactly what pagination boundaries land on mid-conversation).
+  // Rather than falling back to a full `renderTimeline()` for that case —
+  // which used to force the scroll position back to the bottom, the very
+  // "jump to newest message on load more" this function exists to avoid —
+  // fold it into the existing first row's bubble below instead, updating
+  // that row's header timestamp to the (now older) start of the group.
+  const ctx = { roomId, threadId: null };
+  let mergeEvent = null;
+  let runEvents = newEvents;
+  if (isGrouped(newEvents[newEvents.length - 1], prevEvents[0])) {
+    mergeEvent = newEvents[newEvents.length - 1];
+    runEvents = newEvents.slice(0, -1);
+  }
+  const firstRow = loadMoreRow.nextSibling;
 
   const frag = document.createDocumentFragment();
-  let prev = null;
-  for (const event of newEvents) {
-    const grouped = isGrouped(prev, event);
-    frag.appendChild(renderMessage(event, { roomId, threadId: null }, { grouped }));
-    prev = event;
-  }
-  // The first already-rendered message's grouping may change now that a
-  // new predecessor immediately precedes it (was previously the room's
-  // very first message, so never grouped).
-  const firstOldRow = loadMoreRow.nextElementSibling;
-  if (firstOldRow) {
-    const firstOldEvent = prevEvents[0];
-    const grouped = isGrouped(newEvents[newEvents.length - 1], firstOldEvent);
-    firstOldRow.replaceWith(renderMessage(firstOldEvent, { roomId, threadId: null }, { grouped }));
+  for (const run of groupIntoRuns(runEvents)) {
+    frag.appendChild(renderMessageGroup(run, ctx));
   }
 
   el.timeline.insertBefore(frag, loadMoreRow.nextSibling);
+
+  if (mergeEvent && firstRow) {
+    const bubble = firstRow.querySelector(".bubble");
+    const sender = bubble?.querySelector(".sender");
+    const headerTime = sender?.querySelector("time");
+    if (headerTime) headerTime.textContent = formatMessageTimestamp(mergeEvent.timestamp);
+    if (bubble && sender) {
+      bubble.insertBefore(renderMessageItem(mergeEvent, ctx), sender.nextSibling);
+      firstRow.dataset.eventId = mergeEvent.event_id;
+    }
+  }
 
   if (state.reachedStart.has(roomId)) {
     loadMoreRow.remove();
@@ -1946,12 +2936,7 @@ function prependMessages(roomId, prevEvents, allEvents) {
     loadMoreRow.appendChild(btn);
   }
 
-  // Standard "keep the reading position anchored" formula for prepending
-  // above the current scroll position — not just the height delta alone
-  // (which silently assumed `scrollTopBefore` was 0, off by however far
-  // past the top pagination actually triggers, see the scroll listener
-  // below).
-  el.timeline.scrollTop = scrollTopBefore + (el.timeline.scrollHeight - scrollHeightBefore);
+  timelineScrollAnchor.sync();
   updateJumpLatestVisibility();
 }
 
@@ -1992,9 +2977,24 @@ function paginateBack(roomId) {
   send("PaginateBack", { room_id: roomId });
 }
 
+// Throttled to one check per animation frame — same reasoning as the
+// room list's own scroll handler (see `el.roomListItems`'s). Without
+// this, a fast scroll/trackpad fling fires this on every single scroll
+// event (can be dozens per second), and `updateJumpLatestVisibility()`
+// reading `scrollHeight`/`scrollTop`/`clientHeight` forces a synchronous
+// layout recalculation each time — a real, measurable source of the
+// scroll stutter on WebKitGTK specifically (see `#timeline`'s own
+// `will-change: scroll-position` comment for the same underlying
+// "WebKitGTK doesn't proactively optimize this like Chromium does" gap).
+let timelineScrollRafPending = false;
 el.timeline.addEventListener("scroll", () => {
-  if (el.timeline.scrollTop < 80) paginateBack(state.selectedRoom);
-  updateJumpLatestVisibility();
+  if (timelineScrollRafPending) return;
+  timelineScrollRafPending = true;
+  requestAnimationFrame(() => {
+    timelineScrollRafPending = false;
+    if (el.timeline.scrollTop < 80) paginateBack(state.selectedRoom);
+    updateJumpLatestVisibility();
+  });
 });
 
 /** Shows/hides the floating "jump to latest message" button (works the
@@ -2100,13 +3100,128 @@ function openReactionPicker(anchorEl, toggle) {
   }, 0);
 }
 
+/** A much broader curated set than `QUICK_REACTIONS` above — that one is
+ * a tiny fixed set of reaction shortcuts, this backs the compose box's
+ * own emoji picker (inserting a character into the message being typed),
+ * where "just six" would be far too limiting. Loosely grouped by
+ * category but rendered as one flat scrollable grid (see
+ * `openEmojiPicker`) — a set this size doesn't need its own tab/category
+ * UI to stay browsable. */
+const EMOJI_PICKER_SET = [
+  "😀", "😃", "😄", "😁", "😆", "😅", "😂", "🤣", "😊", "😇", "🙂", "🙃", "😉", "😌", "😍", "🥰",
+  "😘", "😗", "😙", "😚", "😋", "😛", "😝", "😜", "🤪", "🤨", "🧐", "🤓", "😎", "🥸", "🤩", "🥳",
+  "😏", "😒", "😞", "😔", "😟", "😕", "🙁", "☹️", "😣", "😖", "😫", "😩", "🥺", "😢", "😭", "😤",
+  "😠", "😡", "🤬", "🤯", "😳", "🥵", "🥶", "😱", "😨", "😰", "😥", "😓", "🤗", "🤔", "🤭", "🤫",
+  "🤥", "😶", "😐", "😑", "😬", "🙄", "😯", "😦", "😧", "😮", "😲", "🥱", "😴", "🤤", "😪", "😵",
+  "🤐", "🥴", "🤢", "🤮", "🤧", "😷", "🤒", "🤕", "🤑", "🤠", "😈", "👿", "🤡", "💩", "👻", "💀",
+  "👽", "🤖", "👍", "👎", "👌", "🤌", "🤏", "✌️", "🤞", "🤟", "🤘", "🤙", "👈", "👉", "👆", "🖕",
+  "👇", "☝️", "👏", "🙌", "👐", "🤲", "🙏", "✍️", "💪", "🖐️", "✋", "👋", "🤝", "👊", "✊", "❤️",
+  "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔", "❣️", "💕", "💞", "💓", "💗", "💖", "💘",
+  "💝", "💯", "💢", "💥", "💫", "💦", "💨", "💣", "💬", "👀", "🎉", "🎊", "🎈", "🎁", "🔥", "✨",
+  "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐨", "🐯", "🦁", "🐮", "🐷", "🐸", "🐵", "🙈",
+  "🙉", "🙊", "🐔", "🐧", "🐦", "🦆", "🦉", "🐺", "🐴", "🦄", "🐝", "🦋", "🐢", "🐍", "🍏", "🍎",
+  "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🍒", "🍑", "🥭", "🍍", "🥥", "🥝", "🍅", "🌽", "🍞", "🧀",
+  "🍔", "🍟", "🍕", "🌭", "🌮", "🍜", "🍣", "🍤", "🍩", "🍪", "🎂", "🍰", "🍫", "🍬", "☕", "🍵",
+  "🍺", "🍻", "🥂", "🍷", "🚀", "✈️", "🚗", "🚲", "⛵", "🌍", "🌙", "⭐", "☀️", "⛅", "🌈", "☂️",
+  "❄️", "⚡", "🎄", "🎃", "🎆", "🏆", "⚽", "🏀", "🎮", "🎲", "📱", "💻", "📷", "📞", "⏰", "💡",
+  "📚", "✏️", "💰", "✉️", "📦", "🔒", "🔑", "🔨", "⚙️", "🔬", "🔭", "🛒",
+];
+
+/** Opens the compose box's own emoji picker, anchored to `emojiBtn` —
+ * inserts the pick into `textarea` at the cursor (see `insertEmoji`),
+ * unlike `openReactionPicker`'s "toggle a reaction on this message".
+ * Portaled to `document.body` and positioned `fixed` from the button's
+ * own on-screen rect, same reasoning as `openReactionPicker`/
+ * `openActionsMenu` — the compose row sits at the very bottom of the
+ * window, so the picker almost always needs to open *upward* to have
+ * anywhere to actually render, which a plain absolutely-positioned
+ * child of the toolbar can't do without also getting clipped by
+ * whatever scrolls above it. */
+function openEmojiPicker(emojiBtn, textarea) {
+  document.querySelectorAll(".emoji-picker").forEach((p) => p.remove());
+  const picker = document.createElement("div");
+  picker.className = "emoji-picker";
+  for (const emoji of EMOJI_PICKER_SET) {
+    const opt = document.createElement("button");
+    opt.type = "button";
+    opt.textContent = emoji;
+    opt.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      insertEmoji(textarea, emoji);
+    });
+    picker.appendChild(opt);
+  }
+
+  picker.style.position = "fixed";
+  document.body.appendChild(picker);
+  const anchorRect = emojiBtn.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+  const margin = 4;
+  let top = anchorRect.top - pickerRect.height - 4;
+  if (top < margin) top = anchorRect.bottom + 4;
+  top = Math.max(margin, Math.min(top, window.innerHeight - pickerRect.height - margin));
+  let left = anchorRect.left;
+  left = Math.max(margin, Math.min(left, window.innerWidth - pickerRect.width - margin));
+  picker.style.top = `${top}px`;
+  picker.style.left = `${left}px`;
+
+  setTimeout(() => {
+    document.addEventListener(
+      "click",
+      (e) => {
+        if (!picker.contains(e.target) && e.target !== emojiBtn) picker.remove();
+      },
+      { once: true },
+    );
+  }, 0);
+}
+
+/** Inserts `emoji` at the compose textarea's cursor (replacing any
+ * current selection) — same insertion mechanics as `toggleWrap`/
+ * `insertLink` above, just plain text with no wrapping markup. */
+function insertEmoji(textarea, emoji) {
+  const { value, selectionStart: start, selectionEnd: end } = textarea;
+  textarea.value = value.slice(0, start) + emoji + value.slice(end);
+  const cursor = start + emoji.length;
+  textarea.setSelectionRange(cursor, cursor);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  textarea.focus();
+}
+
 /** Existing reaction pills only (emoji + count, highlighted if the
  * logged-in user is a reactor) — returns `null` when there are none, so
  * a bubble with no reactions doesn't reserve a row of space for an empty
- * list (that's what the corner "add reaction" trigger in `renderMessage`
+ * list (that's what the corner "add reaction" trigger in `renderMessageItem`
  * is for instead, which only shows up on hover). Shared by the main
- * timeline and the thread panel — same `renderMessage()` call, same
+ * timeline and the thread panel — same `renderMessageItem()` call, same
  * `Command::ToggleReaction` either way. */
+/** The small overlapping avatar stack under a message showing who's read
+ * up to exactly that message — Element's own "seen by" indicator.
+ * `event.read_by` (see `TimelineEvent`'s doc comment on the Rust side) is
+ * already just the list of user IDs whose receipt points here, so this is
+ * purely presentation: resolve each ID to a name/avatar via the room's
+ * member list (already loaded for @mention autocomplete —
+ * `renderReactions` above resolves reactor names the same way) and stack
+ * them. `null` when nobody's receipt is on this message, same "don't
+ * reserve empty space" convention `renderReactions` uses. */
+function renderReadReceipts(event, ctx) {
+  if (!event.read_by || event.read_by.length === 0) return null;
+  const roomMembers = state.roomMembers[ctx.roomId] || [];
+  const memberFor = (userId) => roomMembers.find(([id]) => id === userId);
+
+  const wrap = document.createElement("div");
+  wrap.className = "read-receipts";
+  for (const userId of event.read_by) {
+    const member = memberFor(userId);
+    const name = member ? member[1] : userId;
+    const avatarUrl = member ? member[2] : null;
+    const avatar = renderAvatar(avatarUrl, name, userId, 16);
+    avatar.title = `seen by ${name}`;
+    wrap.appendChild(avatar);
+  }
+  return wrap;
+}
+
 function renderReactions(event, ctx) {
   if (!event.reactions || event.reactions.length === 0) return null;
   const wrap = document.createElement("div");
@@ -2116,11 +3231,19 @@ function renderReactions(event, ctx) {
     send("ToggleReaction", { room_id: ctx.roomId, event_id: event.event_id, emoji });
   };
 
+  const roomMembers = state.roomMembers[ctx.roomId] || [];
+  const nameFor = (userId) => {
+    const member = roomMembers.find(([id]) => id === userId);
+    return member ? member[1] : userId;
+  };
+
   for (const r of event.reactions) {
     const pill = document.createElement("button");
     pill.className = "reaction-pill" + (r.by_me ? " mine" : "");
     pill.textContent = `${r.emoji} ${r.count}`;
-    pill.title = r.by_me ? "click to remove your reaction" : "click to react";
+    const who = (r.senders || []).map(nameFor).join(", ") || "no one yet";
+    const action = r.by_me ? "click to remove your reaction" : "click to react";
+    pill.title = `${who} — ${action}`;
     pill.addEventListener("click", () => toggle(r.emoji));
     wrap.appendChild(pill);
   }
@@ -2138,53 +3261,86 @@ function renderReactions(event, ctx) {
   return wrap;
 }
 
-function renderMessage(event, ctx, opts = {}) {
-  const side = event.is_own ? "own" : "other";
-  const row = document.createElement("div");
-  row.className = `msg-row ${side}` + (opts.grouped ? " grouped" : "");
-  row.dataset.eventId = event.event_id;
+/** A bubble's timestamp — just the time for a message sent today (the
+ * common case, where the date would be redundant clutter on every single
+ * bubble), and "dd/mm HH:mm" for anything from an earlier day, so
+ * scrolling back into history (or a thread that's been going for weeks)
+ * still says *which* day each message landed on. */
+function formatMessageTimestamp(timestampMs) {
+  const d = new Date(timestampMs);
+  const now = new Date();
+  const isToday =
+    d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (isToday) return time;
+  const date = d.toLocaleDateString([], { day: "2-digit", month: "2-digit" });
+  return `${date} ${time}`;
+}
 
-  // Avatar sits to the left of another person's bubble, same as the
-  // sender name right below it — shown only on the first bubble of a
-  // consecutive group (an empty same-width spacer on the rest, so every
-  // bubble in the group still lines up under the first one instead of
-  // sliding left to fill the gap). Own messages never get one — they're
-  // always "you", right-aligned, no avatar needed.
-  if (!event.is_own) {
-    if (!opts.grouped) {
-      row.appendChild(renderAvatar(event.sender_avatar_url, event.sender_name, event.sender, 28));
-    } else {
-      const spacer = document.createElement("div");
-      spacer.className = "avatar-spacer";
-      spacer.style.width = "28px";
-      spacer.style.height = "28px";
-      row.appendChild(spacer);
+/** Shows/positions `actions` (a message's react/reply/thread/more row)
+ * on hovering `item` or `actions` itself — `position: fixed`, computed
+ * here from `item`'s real on-screen rect rather than plain CSS
+ * (`left: 100%` relative to the message's own box), because a *wide*
+ * message (one whose text already reaches close to the column's own
+ * max-width) left no room for a purely-CSS "float to the right" to land
+ * in without pushing the buttons — the "⋯" trigger specifically — off
+ * the edge of the visible timeline entirely, inaccessible. Clamped
+ * against the nearest scrollable message container instead, falling
+ * back toward the message's own right edge if there's truly no room to
+ * spare (better than off-screen, if rare in practice). Hovering `actions`
+ * itself also keeps it shown (with a short delay on leaving either one)
+ * so moving the cursor from the text onto the buttons never drops them
+ * mid-transition. */
+function wireMsgActionsHover(item, actions) {
+  let hideTimer = null;
+  const show = () => {
+    clearTimeout(hideTimer);
+    const itemRect = item.getBoundingClientRect();
+    const container = item.closest("#timeline, #thread-messages") || document.body;
+    const containerRect = container.getBoundingClientRect();
+    const buttonCount = actions.children.length;
+    const width = buttonCount * 32 + Math.max(0, buttonCount - 1) * 6;
+    const margin = 6;
+    let left = itemRect.right + margin;
+    if (left + width > containerRect.right - margin) {
+      left = containerRect.right - margin - width;
     }
-  }
+    const top = itemRect.bottom - 32;
+    actions.style.left = `${left}px`;
+    actions.style.top = `${top}px`;
+    actions.classList.add("visible");
+  };
+  const hide = () => {
+    hideTimer = setTimeout(() => actions.classList.remove("visible"), 80);
+  };
+  item.addEventListener("mouseenter", show);
+  item.addEventListener("mouseleave", hide);
+  actions.addEventListener("mouseenter", show);
+  actions.addEventListener("mouseleave", hide);
+}
 
-  const col = document.createElement("div");
-  col.className = "msg-col";
-
-  const bubble = document.createElement("div");
-  bubble.className = `bubble ${side}` + (event.mentions_me ? " mentioned" : "");
-
-  // Sender is secondary info now — small and weak, and only on the first
-  // bubble of a consecutive-from-the-same-person group. Own messages never
-  // show it (it's always "you"; the right-alignment already says that).
-  if (!event.is_own && !opts.grouped) {
-    const sender = document.createElement("div");
-    sender.className = "sender";
-    const presenceDot = document.createElement("span");
-    const presenceInfo = state.presence[event.sender];
-    presenceDot.className = "presence-dot" + (presenceInfo ? ` ${presenceInfo.presence}` : "");
-    presenceDot.title = presenceInfo ? presenceInfo.presence : "";
-    presenceDot.dataset.presenceUser = event.sender;
-    presenceDot.style.marginRight = "4px";
-    sender.appendChild(presenceDot);
-    sender.appendChild(document.createTextNode(event.sender_name));
-    sender.style.color = senderColor(event.sender);
-    bubble.appendChild(sender);
-  }
+/** Builds ONE message's own content — reply-preview, body/media,
+ * thread-badge, reactions/trigger, "⋯" menu — as a single
+ * `.msg-item[data-event-id]` div. Does NOT build the avatar/sender
+ * header or the outer row; `renderMessageGroup` below owns those, once
+ * per run of consecutive same-sender messages (see `groupIntoRuns`),
+ * with each event's own `.msg-item` stacked tightly inside that one
+ * shared bubble — a whole run reads as one continuous block (Element's
+ * own grouping) instead of each message getting its own avatar-height
+ * row regardless of whether it actually needed one. */
+function renderMessageItem(event, ctx) {
+  const item = document.createElement("div");
+  item.className = "msg-item" + (event.mentions_me ? " mentioned" : "");
+  item.dataset.eventId = event.event_id;
+  // Everything below except `.msg-actions` (appended straight to `item`,
+  // right after this) goes into `.msg-content` — `.msg-actions` floats
+  // over the corner via `position: absolute` (see its own CSS comment
+  // for why: a real flex sibling that only sometimes exists pushes
+  // every other message around on each hover in/out). `bubble` is kept
+  // as the local alias every `bubble.appendChild(...)` below already uses.
+  const content = document.createElement("div");
+  content.className = "msg-content";
+  const bubble = content;
 
   if (event.reply_to_event_id) {
     const preview = event.reply_to_preview || findReplyPreview(ctx.roomId, event.reply_to_event_id);
@@ -2336,16 +3492,37 @@ function renderMessage(event, ctx, opts = {}) {
     body.className = "body" + (event.msg_type === "notice" ? " notice" : "");
     body.innerHTML = renderMarkdown(event.body || "");
     applyMentionPills(body, event.mentioned_user_ids, ctx.roomId);
+    decorateSharedLinks(body, ctx.roomId);
     bubble.appendChild(body);
   }
 
+  // Every message's own timestamp — hidden until this specific
+  // `.msg-item` is hovered (see `.meta` in style.css), since the group's
+  // header line already shows the *first* message's time and repeating
+  // it, small and permanent, under every single one is what used to make
+  // a quick back-to-back run from one person take up more vertical space
+  // than the same messages read in Element.
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = new Date(event.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (state.sendingLocalIds && state.sendingLocalIds.has(event.event_id)) {
-    meta.textContent += " · sending...";
-  }
+  meta.textContent = formatMessageTimestamp(event.timestamp);
   bubble.appendChild(meta);
+
+  // Unlike `.meta` above (hidden until hover — fine for a timestamp
+  // nobody needs to see immediately), a message's own send state is worth
+  // knowing about right away: this is what makes the optimistic bubble
+  // `sendCurrentMessage` renders the instant Send is pressed actually
+  // read as "sending", not just a message that silently appeared, and
+  // what surfaces a failed send at all (which used to only ever reach
+  // `console.error`).
+  if (event._sendStatus === "sending" || event._sendStatus === "failed") {
+    const status = document.createElement("div");
+    status.className = `send-status ${event._sendStatus}`;
+    status.textContent =
+      event._sendStatus === "sending"
+        ? "sending…"
+        : `failed to send${event._sendError ? ` — ${event._sendError}` : ""}`;
+    bubble.appendChild(status);
+  }
 
   // A message with a thread stays flagged all the time, not just on
   // hover — otherwise it's easy to miss that replies exist at all.
@@ -2372,50 +3549,70 @@ function renderMessage(event, ctx, opts = {}) {
   const reactions = renderReactions(event, ctx);
   if (reactions) bubble.appendChild(reactions);
 
+  // React/reply/thread(/more) all share one `.msg-actions` wrapper,
+  // floating over the corner via `position: absolute` (see its CSS
+  // comment) — hover-only, and outside layout entirely so showing/
+  // hiding it never reflows the messages around it.
+  const actions = document.createElement("div");
+  actions.className = "msg-actions";
+
   // A message with no reactions yet gets a small "add reaction" icon
-  // floating on the bubble's corner instead — hidden until hover (see the
-  // `.reaction-trigger` CSS, same `visibility` trick as `.actions`), so it
-  // costs no space at all rather than reserving an empty pill row like
-  // `renderReactions` used to unconditionally do.
+  // here instead — hidden until hover, so it costs no space at all
+  // rather than reserving an empty pill row like `renderReactions` used
+  // to unconditionally do. Just the emoji, no "+" — that second glyph is
+  // what didn't fit next to it inside this button's fixed circle at a
+  // large chosen message font-size (the icon's own size is fixed, not
+  // tied to that setting, precisely so this can't recur — see its CSS).
   if (!reactions) {
     const trigger = document.createElement("button");
     trigger.className = "reaction-trigger";
     trigger.title = "add reaction";
-    trigger.textContent = "🙂+";
+    trigger.textContent = "🙂";
     trigger.addEventListener("click", (e) => {
       e.stopPropagation();
       openReactionPicker(bubble, (emoji) => {
         send("ToggleReaction", { room_id: ctx.roomId, event_id: event.event_id, emoji });
       });
     });
-    bubble.appendChild(trigger);
+    actions.appendChild(trigger);
   }
 
-  // `.actions` only ever reveals on `:hover` (see its CSS) — there's no
-  // hover on a touchscreen, so on mobile it was simply never reachable at
-  // all. A tap on the bubble toggles it there instead (see the
-  // `.actions-open` mobile-only CSS); harmless everywhere else, since
-  // nothing there reads that class. Skipped when the tap actually landed
-  // on a real interactive element inside the bubble (a link, the reply
-  // preview, an image, a button) so it doesn't fight with that element's
-  // own click behavior.
-  bubble.addEventListener("click", (e) => {
-    if (e.target.closest("a, button, img")) return;
-    row.classList.toggle("actions-open");
+  // Reply — its own always-visible icon now (used to live only inside
+  // the "⋯" dropdown), same react/reply/more row a normal chat app's
+  // message toolbar has.
+  const replyTrigger = document.createElement("button");
+  replyTrigger.className = "reply-trigger";
+  replyTrigger.title = "reply";
+  replyTrigger.textContent = "↩";
+  replyTrigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    startReply(ctx.roomId, ctx.threadId, event);
   });
+  actions.appendChild(replyTrigger);
 
-  col.appendChild(bubble);
+  // Thread — same, its own icon now, but only for a message that
+  // doesn't already have one (once it does, the thread-count badge above
+  // is itself the "open this thread" entry point — a second one here
+  // would be redundant, same condition the old dropdown item used).
+  if (!ctx.threadId && !threadCount) {
+    const threadTrigger = document.createElement("button");
+    threadTrigger.className = "thread-trigger";
+    threadTrigger.title = "reply in thread";
+    threadTrigger.textContent = "🧵";
+    threadTrigger.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openThread(ctx.roomId, event);
+    });
+    actions.appendChild(threadTrigger);
+  }
 
-  // A single "⋯" trigger opening a dropdown menu, not a whole row of
-  // always-visible `[ reply ] [ share ] [ react ] ...` text links —
-  // that many labels at once (up to 7) was cramped and easy to
-  // mis-click, and the side gutter they lived in kept needing more and
-  // more clamping logic (see git history) to avoid overflowing a narrow
-  // column. One small button anchored to the bubble's own corner sidesteps
-  // that whole class of problem, and `openActionsMenu` (portaled to
-  // `document.body`, same as `openReactionPicker`) positions its dropdown
-  // from the trigger's actual on-screen rect, so it's never at the mercy
-  // of `.msg-row`'s `content-visibility` containment either.
+  // The remaining, less-frequent actions stay behind "⋯" rather than
+  // becoming their own icons too — `.msg-actions` reads as a normal
+  // chat app's react/reply/thread/more row, not a wall of buttons.
+  // `openActionsMenu` (portaled to `document.body`, same as
+  // `openReactionPicker`) positions its dropdown from the trigger's
+  // actual on-screen rect, so it's never at the mercy of `.msg-row`'s
+  // layout shifting underneath it after it's already open.
   const menuTrigger = document.createElement("button");
   menuTrigger.className = "msg-menu-trigger";
   menuTrigger.title = "more actions";
@@ -2423,18 +3620,7 @@ function renderMessage(event, ctx, opts = {}) {
   menuTrigger.addEventListener("click", (e) => {
     e.stopPropagation();
     const items = [];
-    if (!ctx.threadId && !threadCount) {
-      items.push({ label: "thread", onClick: () => openThread(ctx.roomId, event) });
-    }
-    items.push({ label: "reply", onClick: () => startReply(ctx.roomId, ctx.threadId, event) });
     items.push({ label: "share", onClick: () => shareMessage(ctx.roomId, event.event_id, ctx.threadId) });
-    items.push({
-      label: "react",
-      onClick: () =>
-        openReactionPicker(bubble, (emoji) => {
-          send("ToggleReaction", { room_id: ctx.roomId, event_id: event.event_id, emoji });
-        }),
-    });
     items.push({
       label: "from user",
       title: `see every message from ${event.sender_name}, across all rooms`,
@@ -2457,28 +3643,100 @@ function renderMessage(event, ctx, opts = {}) {
     }
     openActionsMenu(menuTrigger, items);
   });
-  bubble.appendChild(menuTrigger);
+  actions.appendChild(menuTrigger);
 
-  row.appendChild(col);
+  const readBy = renderReadReceipts(event, ctx);
+  if (readBy) content.appendChild(readBy);
+
+  item.appendChild(content);
+  item.appendChild(actions);
+  wireMsgActionsHover(item, actions);
 
   // Re-applies a still-active "jump to this message" highlight across a
-  // rebuild of this exact row — see `lastJumpHighlightedEventId`'s doc
+  // rebuild of this exact item — see `lastJumpHighlightedEventId`'s doc
   // comment for why that's tracked by event ID rather than a DOM
   // reference in the first place.
   if (event.event_id === lastJumpHighlightedEventId) {
-    row.classList.add("jump-highlight");
+    item.classList.add("jump-highlight");
   }
 
+  return item;
+}
+
+/** Splits a chronological `events` array into runs of consecutive
+ * same-sender messages (see `isGrouped`) — one run backs one
+ * `renderMessageGroup` call (one avatar/header, many stacked
+ * `.msg-item`s), the same grouping decision the old per-message
+ * `opts.grouped` flag used to make one row at a time. */
+function groupIntoRuns(events) {
+  const runs = [];
+  let prev = null;
+  for (const event of events) {
+    if (prev && isGrouped(prev, event)) {
+      runs[runs.length - 1].push(event);
+    } else {
+      runs.push([event]);
+    }
+    prev = event;
+  }
+  return runs;
+}
+
+/** Builds one `.msg-row` for a run of consecutive same-sender messages
+ * (see `groupIntoRuns`) — avatar + sender header from `events[0]`, then
+ * each event's own `.msg-item` (see `renderMessageItem`) stacked inside
+ * the same bubble, reading as one continuous block instead of one
+ * avatar-height row per message regardless of whether it needed one. */
+function renderMessageGroup(events, ctx) {
+  const first = events[0];
+  const side = first.is_own ? "own" : "other";
+  const row = document.createElement("div");
+  row.className = `msg-row ${side}`;
+  row.dataset.eventId = first.event_id;
+
+  const avatarEl = renderAvatar(first.sender_avatar_url, first.sender_name, first.sender, 28);
+  // Presence now overlays the avatar's own corner (Slack/Discord-style
+  // badge) instead of sitting as a separate dot on the sender-name line —
+  // cleaner next to the name, and this is the one place presence is
+  // already scoped to a single person, so it needs no dot-plus-label
+  // pairing to stay legible the way, say, a member list would.
+  const presenceDot = document.createElement("span");
+  const presenceInfo = state.presence[first.sender];
+  presenceDot.className = "avatar-presence-dot" + (presenceInfo ? ` ${presenceInfo.presence}` : "");
+  presenceDot.title = presenceInfo ? presenceInfo.presence : "";
+  presenceDot.dataset.presenceUser = first.sender;
+  avatarEl.appendChild(presenceDot);
+  row.appendChild(avatarEl);
+
+  const col = document.createElement("div");
+  col.className = "msg-col";
+  const bubble = document.createElement("div");
+  bubble.className = `bubble ${side}`;
+
+  const sender = document.createElement("div");
+  sender.className = "sender";
+  sender.appendChild(document.createTextNode(first.sender_name));
+  sender.style.color = senderColor(first.sender);
+  const time = document.createElement("time");
+  time.textContent = formatMessageTimestamp(first.timestamp);
+  sender.appendChild(time);
+  bubble.appendChild(sender);
+
+  for (const event of events) {
+    bubble.appendChild(renderMessageItem(event, ctx));
+  }
+
+  col.appendChild(bubble);
+  row.appendChild(col);
   return row;
 }
 
 /** Opens a small dropdown menu anchored to `anchorEl` — `items` is
  * `[{label, onClick, title?}]`. Shared by every "⋯" trigger (currently
- * just `renderMessage`'s). Appended to `document.body` and positioned
- * `fixed` from `anchorEl`'s real on-screen rect, same approach as
- * `openReactionPicker` — see its own comment for why that matters (a
- * `.msg-row`-nested popup can get silently clipped by its `content-visibility`
- * containment). */
+ * just `renderMessageItem`'s). Appended to `document.body` and positioned
+ * `fixed` from `anchorEl`'s real on-screen rect, so it's never at the
+ * mercy of `.msg-row`'s own layout (a resize, a scroll, ...) shifting
+ * underneath it after it's already open. */
 function openActionsMenu(anchorEl, items) {
   document.querySelectorAll(".actions-menu").forEach((m) => m.remove());
   const menu = document.createElement("div");
@@ -2606,35 +3864,98 @@ function sniffImageMime(u8) {
   return null;
 }
 
-function bytesToDataUrl(bytes, mimeHint) {
-  const u8 = new Uint8Array(bytes);
+/** Wraps `bytes` in a `Blob` and hands back an `object URL` for it — an
+ * `<img>`/`<audio>` `src` works identically either way, but this used to
+ * base64-encode the whole thing into a `data:` URL instead (chunked
+ * `String.fromCharCode` + `btoa`, to avoid blowing the call stack on a
+ * multi-MB photo). That's real synchronous main-thread work scaling with
+ * the image's size — a several-MB photo (an ordinary phone camera shot)
+ * could visibly stutter the UI for a moment right as it finished
+ * downloading, and worse with several arriving close together (opening a
+ * room with a handful of images in view, e.g. the mention-picker/threads-
+ * list image thumbnails). `URL.createObjectURL` does no such encoding —
+ * it just hands the engine a reference to the same bytes already in
+ * memory — so this is both faster and simpler. (Never revoked: this
+ * app's `state.imageCache` keeps entries for the whole session, same
+ * effective lifetime a base64 string sitting in that same map already
+ * had — nothing here makes retention worse, an explicit `revokeObjectURL`
+ * would only matter if entries were ever evicted before then, which they
+ * currently aren't.) */
+function bytesToImageUrl(bytes, mimeHint) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   const mime = mimeHint || sniffImageMime(u8) || "application/octet-stream";
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < u8.length; i += chunk) {
-    binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
-  }
-  return `data:${mime};base64,${btoa(binary)}`;
+  return URL.createObjectURL(new Blob([u8], { type: mime }));
 }
 
 // ---- Minimal markdown: **bold**, *italic*, `code`, ```blocks```, links,
 // bare URLs, and paragraph breaks on blank lines. Deliberately small — just
 // enough for normal chat formatting, not a full CommonMark implementation.
+// `marked` (github.com/markedjs/marked) + `DOMPurify` (github.com/cure53/DOMPurify),
+// vendored locally in dist/ and loaded before this script (see index.html)
+// — real, battle-tested markdown/sanitization instead of this file hand-
+// rolling regex substitutions for it (a previous version did exactly
+// that; it covered bold/italic/code/links, then headers/lists, and kept
+// needing another pass for whatever it missed next — tables, nested
+// lists, blockquotes, ... a real parser just doesn't have that class of
+// gap). Configured once, at load, rather than passing the same options
+// to every `marked.parse()` call.
+marked.use({ gfm: true, breaks: true });
+
+/** Markdown → sanitized HTML, for anywhere message bodies/LLM summaries
+ * get displayed. Two separate steps, in this order, and both required:
+ * `marked.parse` turns the markdown into HTML but — per its own docs —
+ * does *not* sanitize it (raw HTML already present in the source passes
+ * straight through, by design, since that's valid CommonMark); this app's
+ * "markdown" almost always comes from other, untrusted room members (a
+ * message body) or an LLM summarizing them (`Command::Summarize`), so
+ * `DOMPurify.sanitize` on the result is what actually keeps a
+ * `<script>`/`onerror=`/etc. in someone's message from ever executing —
+ * skipping it (or reordering the two calls) reopens a straightforward
+ * stored-XSS hole. */
 function renderMarkdown(text) {
-  const escaped = escapeHtml(text);
-  const withBlocks = escaped.replace(/```([\s\S]*?)```/g, (_, code) => `<pre>${code}</pre>`);
-  const paragraphs = withBlocks.split(/\n\n+/).map((p) => {
-    if (p.startsWith("<pre>")) return p;
-    let html = p
-      .replace(/`([^`]+)`/g, "<code>$1</code>")
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, "<em>$1</em>")
-      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank">$1</a>')
-      .replace(/(^|[\s(])(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank">$2</a>')
-      .replace(/\n/g, "<br>");
-    return `<p>${html}</p>`;
-  });
-  return paragraphs.join("");
+  return DOMPurify.sanitize(marked.parse(text ?? ""));
+}
+
+/** A preview-length version of `renderMarkdown`: renders the *full* body
+ * first, then trims the already-rendered HTML down to `maxChars` of
+ * visible text — rather than every call site's old pattern of
+ * `renderMarkdown(truncate(text, maxChars))`, which truncated the raw
+ * markdown *source* before parsing it. That corrupted anything the cut
+ * landed in the middle of: a `[label](https://very/long/url)` link with
+ * the cut partway through its URL left the `[label](` sitting there as
+ * literal text with only the broken tail auto-linkified (marked's GFM
+ * autolinker doesn't need a closing `)` the way an actual link does), and
+ * the same happens to `**bold**`/`` `code` `` spans straddling the cut.
+ * Walking the *rendered* HTML's text nodes instead means a link's `href`
+ * always stays intact even once its label text is what's cut short. */
+function renderMarkdownPreview(text, maxChars) {
+  const container = document.createElement("div");
+  container.innerHTML = renderMarkdown(text);
+  let remaining = maxChars;
+  let done = false;
+  const walk = (node) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (done) {
+        child.remove();
+        continue;
+      }
+      if (child.nodeType === Node.TEXT_NODE) {
+        const t = child.textContent;
+        if (t.length > remaining) {
+          child.textContent = t.slice(0, remaining) + "…";
+          remaining = 0;
+          done = true;
+        } else {
+          remaining -= t.length;
+        }
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        walk(child);
+        if (!child.textContent) child.remove();
+      }
+    }
+  };
+  walk(container);
+  return container.innerHTML;
 }
 
 function escapeHtml(s) {
@@ -2683,9 +4004,17 @@ function applyMentionPills(containerEl, mentionedUserIds, roomId) {
   let node;
   while ((node = walker.nextNode())) textNodes.push(node);
 
+  // A word-character check (Unicode-aware, so Vietnamese diacritics count)
+  // used to keep a bare-name match (see below) from firing mid-word.
+  const isWordChar = (ch) => Boolean(ch) && /[\p{L}\p{N}]/u.test(ch);
+
   for (const textNode of textNodes) {
     const text = textNode.nodeValue;
-    if (!text.includes("@")) continue;
+    // Quick skip: bail unless the text could possibly contain *some*
+    // target, either as "@Name" (this app's own composer inserts that
+    // literally) or as a bare "Name" — real Element's plain-text mention
+    // fallback has no "@" at all, just the display name.
+    if (!targets.some((t) => text.includes(t.name))) continue;
     const parent = textNode.parentNode;
     if (!parent) continue;
 
@@ -2695,9 +4024,27 @@ function applyMentionPills(containerEl, mentionedUserIds, roomId) {
     while (rest.length > 0) {
       let best = null;
       for (const t of targets) {
-        const needle = "@" + t.name;
-        const idx = rest.indexOf(needle);
-        if (idx !== -1 && (!best || idx < best.idx)) best = { idx, needle, t };
+        const atIdx = rest.indexOf("@" + t.name);
+        if (atIdx !== -1 && (!best || atIdx < best.idx)) {
+          best = { idx: atIdx, len: t.name.length + 1, t };
+        }
+        // Bare-name fallback, gated on word boundaries so e.g. a target
+        // named "An" doesn't fire inside "Anh". Only tried where it'd
+        // beat (or tie, favoring the "@"-prefixed match already found)
+        // the current best, since a real "@Name" hit is always preferred.
+        let searchFrom = 0;
+        while (searchFrom <= rest.length) {
+          const idx = rest.indexOf(t.name, searchFrom);
+          if (idx === -1) break;
+          if (best && idx >= best.idx) break;
+          const before = rest[idx - 1];
+          const after = rest[idx + t.name.length];
+          if (!isWordChar(before) && !isWordChar(after)) {
+            best = { idx, len: t.name.length, t };
+            break;
+          }
+          searchFrom = idx + 1;
+        }
       }
       if (!best) {
         frag.appendChild(document.createTextNode(rest));
@@ -2712,10 +4059,57 @@ function applyMentionPills(containerEl, mentionedUserIds, roomId) {
       pill.textContent = "@" + best.t.name;
       pill.title = best.t.userId;
       frag.appendChild(pill);
-      rest = rest.slice(best.idx + best.needle.length);
+      rest = rest.slice(best.idx + best.len);
     }
     if (changed) parent.replaceChild(frag, textNode);
   }
+}
+
+/** Turns a bare `https://matrix.to/#/!room/$event` link left over from
+ * `renderMarkdown`'s auto-linkify (i.e. one nobody gave custom link text —
+ * `[click here](...)` keeps its own text untouched) into a small preview
+ * card showing who sent the shared message and a snippet of it — same
+ * idea as Element's own permalink pills, instead of a long raw URL
+ * wrapping across the bubble. Keeps the underlying `<a href>` unchanged
+ * (only its class/innerHTML change), so the existing global matrix.to
+ * click handler (see the "Share message" section below) still opens it
+ * exactly as before — this only changes what it looks like.
+ *
+ * The target event's sender/body come from whatever's already loaded
+ * locally (`findEvent` — covers the timeline, an open thread panel, and
+ * the thread-roots cache) or, failing that, `getEventPreview`'s server
+ * fetch (same one `Command::GetEventPreview` backs for the pinned-messages
+ * dialog) — its `Event::EventPreview` answer patches this exact anchor
+ * back in once it arrives, see that event's handler. */
+function decorateSharedLinks(containerEl, currentRoomId) {
+  const anchors = containerEl.querySelectorAll('a[href^="https://matrix.to/#/!"]');
+  anchors.forEach((a) => {
+    const href = a.getAttribute("href");
+    if (a.textContent !== href) return; // custom link text — leave it alone
+    const m = href.match(/^https:\/\/matrix\.to\/#\/(![^/?]+)\/(\$[^/?]+)(\?[^#]*)?/);
+    if (!m) return;
+    const roomId = decodeURIComponent(m[1]);
+    const eventId = decodeURIComponent(m[2]);
+    a.classList.add("shared-link-preview");
+    a.dataset.sharedRoomId = roomId;
+    a.dataset.sharedEventId = eventId;
+    renderSharedLinkPreviewInto(a, roomId, eventId, currentRoomId);
+  });
+}
+
+function renderSharedLinkPreviewInto(a, roomId, eventId, currentRoomId) {
+  const ev = findEvent(roomId, eventId) || getEventPreview(roomId, eventId);
+  let bodyHtml;
+  if (ev) {
+    const room = roomId !== currentRoomId ? state.rooms.find((r) => r.room_id === roomId) : null;
+    const roomLabel = room ? `<span class="shared-link-room">${escapeHtml(room.name)}</span>` : "";
+    bodyHtml = `${roomLabel}<span class="shared-link-sender">${escapeHtml(ev.sender_name)}</span>: ${escapeHtml(truncate(ev.body || "", 80))}`;
+  } else if (ev === null) {
+    bodyHtml = `<span style="color:var(--text-weak);">message unavailable</span>`;
+  } else {
+    bodyHtml = loadingHtml("loading shared message...");
+  }
+  a.innerHTML = `<span class="shared-link-icon">🔗</span><span class="shared-link-body">${bodyHtml}</span>`;
 }
 
 /** Every "loading X..." placeholder in the app renders through this, so
@@ -2827,6 +4221,7 @@ function wireMentionAutocomplete(inputEl, suggestionsEl, getRoomId, mentionsList
     const before = inputEl.value.slice(0, at);
     const after = inputEl.value.slice(inputEl.selectionStart);
     inputEl.value = `${before}@${name} ${after}`;
+    inputEl.dispatchEvent(new Event("input", { bubbles: true }));
     mentionsList.push({ userId, displayName: name });
     suggestionsEl.style.display = "none";
     inputEl.focus();
@@ -3048,7 +4443,72 @@ function autoResizeTextarea(textarea) {
  * dropdown claim Enter for itself (pick a suggestion, not send) — same
  * priority the old plain `<input>` gave it. */
 function wireComposeEditor(textarea, { onSend, isSuggestionsOpen }) {
-  textarea.addEventListener("input", () => autoResizeTextarea(textarea));
+  // Hand-rolled undo/redo — WebKitGTK (and some Android WebViews) don't
+  // reliably wire up native Ctrl+Z/Ctrl+Shift+Z undo for a plain
+  // `<textarea>`, confirmed broken here even before any of this app's own
+  // JS touches the box. It also wouldn't have survived this app's own
+  // edits anyway: every programmatic change below (markdown toolbar,
+  // mention/emoji insertion, the paste-a-link-onto-a-selection handler)
+  // reassigns `.value` directly, which silently invalidates whatever
+  // undo history the browser *did* have — there'd be nothing left to
+  // undo back through past the most recent one regardless.
+  //
+  // Snapshots coalesce: plain typing within `COALESCE_MS` of the last
+  // keystroke updates the current step in place rather than pushing a
+  // new one, so undo steps back a *pause's* worth of typing at a time
+  // (like most editors) instead of one character at a time. A
+  // programmatic edit (dispatched as a plain `Event`, not a real
+  // `InputEvent` — `e.inputType` is `undefined` for those, never for an
+  // actual keystroke/IME commit) always starts its own step instead,
+  // since those are deliberate, chunky edits a user would expect to undo
+  // as one unit no matter how soon after typing they happened.
+  const COALESCE_MS = 400;
+  let undoStack = [{ value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd }];
+  let undoIndex = 0;
+  let lastEditAt = 0;
+
+  const currentEntry = () => ({ value: textarea.value, start: textarea.selectionStart, end: textarea.selectionEnd });
+
+  const recordEdit = (isCoalescible) => {
+    const now = Date.now();
+    if (isCoalescible && undoIndex === undoStack.length - 1 && now - lastEditAt < COALESCE_MS) {
+      undoStack[undoIndex] = currentEntry();
+    } else {
+      undoStack = undoStack.slice(0, undoIndex + 1);
+      undoStack.push(currentEntry());
+      undoIndex = undoStack.length - 1;
+      // Cap so an unusually long compose session doesn't grow this
+      // unbounded — losing the oldest step once there are 200 is a
+      // reasonable trade against holding every keystroke of an essay.
+      if (undoStack.length > 200) {
+        undoStack.shift();
+        undoIndex--;
+      }
+    }
+    lastEditAt = now;
+  };
+
+  const restore = (entry) => {
+    textarea.value = entry.value;
+    textarea.setSelectionRange(entry.start, entry.end);
+    autoResizeTextarea(textarea);
+  };
+
+  const undo = () => {
+    if (undoIndex === 0) return;
+    undoIndex--;
+    restore(undoStack[undoIndex]);
+  };
+  const redo = () => {
+    if (undoIndex >= undoStack.length - 1) return;
+    undoIndex++;
+    restore(undoStack[undoIndex]);
+  };
+
+  textarea.addEventListener("input", (e) => {
+    autoResizeTextarea(textarea);
+    recordEdit(e instanceof InputEvent && e.inputType);
+  });
   // Pasting a URL onto a text selection turns the selection into a link to
   // that URL — `[selected text](url)` — instead of just overwriting it
   // with the raw address, the same "paste a link onto a selection" UX
@@ -3078,22 +4538,35 @@ function wireComposeEditor(textarea, { onSend, isSuggestionsOpen }) {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "e") {
       e.preventDefault();
       // Also keeps this from bubbling to the app-wide shortcut handler —
-      // it has no binding on Ctrl+Shift+E, but Ctrl+K below collides with
-      // that handler's "focus room search" (same key most editors use for
-      // "insert link" too); stopping propagation here is what lets the
-      // compose box's meaning win while it has focus.
+      // it has no binding on Ctrl+Shift+E, but stopping propagation here
+      // is the same pattern the Ctrl+Z/Y undo/redo handlers below use, so
+      // the compose box's own meaning always wins over anything the
+      // app-wide handler might someday bind on the same combo.
       e.stopPropagation();
       insertCodeBlock(textarea);
       return;
     }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.shiftKey) redo();
+      else undo();
+      return;
+    }
+    // Ctrl+Y as an alternate redo — the Windows-editor convention,
+    // alongside Ctrl+Shift+Z above (the Mac/most-web-apps one).
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "y") {
+      e.preventDefault();
+      e.stopPropagation();
+      redo();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey) {
-      // No "k" here (unlike bold/italic/code) — Ctrl+K is the app-wide
-      // "focus room search" shortcut (see the `document`-level handler
-      // below), and that binding should win even while the compose box
-      // has focus. Capturing it here for "insert link" instead just ate
-      // the global shortcut every time you were typing a message, which
-      // is most of the time. The link toolbar button still works exactly
-      // the same either way, just without its own keyboard shortcut now.
+      // No "k" here (unlike bold/italic/code) for "insert link" — kept
+      // unbound rather than reused, now that "focus room search" moved to
+      // Alt+K and no longer collides with it (see the `document`-level
+      // handler below). The link toolbar button still works exactly the
+      // same either way, just without its own keyboard shortcut.
       const action = { b: "bold", i: "italic", e: "code" }[e.key.toLowerCase()];
       if (action) {
         e.preventDefault();
@@ -3104,13 +4577,18 @@ function wireComposeEditor(textarea, { onSend, isSuggestionsOpen }) {
   });
 }
 
-/** Wires the B/I/code/link toolbar row above a compose box. */
+/** Wires the B/I/code/link/emoji toolbar row above a compose box. */
 function wireMarkdownToolbar(toolbarEl, textarea) {
   toolbarEl?.querySelectorAll("[data-md]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.preventDefault();
       applyMarkdownAction(textarea, btn.dataset.md);
     });
+  });
+  const emojiBtn = toolbarEl?.querySelector(".emoji-btn");
+  emojiBtn?.addEventListener("click", (e) => {
+    e.preventDefault();
+    openEmojiPicker(emojiBtn, textarea);
   });
 }
 
@@ -3123,6 +4601,10 @@ function sendCurrentMessage() {
   const body = el.composeInput.value.trim();
   if (state.pendingImage && !state.pendingImage.threadId) {
     confirmPendingImage();
+    return;
+  }
+  if (state.pendingFile && !state.pendingFile.threadId) {
+    confirmPendingFile();
     return;
   }
   if (!body || !state.selectedRoom) return;
@@ -3157,13 +4639,22 @@ function sendCurrentMessage() {
 
   const { ids, html } = buildMentionHtml(body, state.composeMentions);
   const replyTo = state.pendingReply && !state.pendingReply.threadId ? state.pendingReply.eventId : null;
+  const roomId = state.selectedRoom;
+  const localId = crypto.randomUUID();
+  const optimistic = makeOptimisticEvent(localId, body, replyTo, ids);
+  if (optimistic) {
+    state.pendingSends.set(localId, { roomId, threadId: null });
+    if (!state.timelines[roomId]) state.timelines[roomId] = [];
+    state.timelines[roomId].push(optimistic);
+    appendMessage(roomId, optimistic);
+  }
   send("SendMessage", {
-    room_id: state.selectedRoom,
+    room_id: roomId,
     body,
     thread_id: null,
     mentions: ids,
     html_body: html,
-    local_id: crypto.randomUUID(),
+    local_id: localId,
     reply_to_event_id: replyTo,
   });
   cancelReply();
@@ -3353,6 +4844,7 @@ el.btnComposePlus.addEventListener("click", (e) => {
   if (!state.selectedRoom) return;
   openActionsMenu(el.btnComposePlus, [
     { label: "📎 image", onClick: () => el.fileInput.click() },
+    { label: "📄 file", onClick: () => el.genericFileInput.click() },
     { label: "🐸 emoji / meme", onClick: toggleMemePicker },
     { label: "🎤 voice message", onClick: toggleVoiceRecording },
     { label: "📊 poll", onClick: openCreatePollDialog },
@@ -3363,6 +4855,12 @@ el.fileInput.addEventListener("change", () => {
   if (!file) return;
   loadPendingImage(file, state.selectedRoom, null);
   el.fileInput.value = "";
+});
+el.genericFileInput.addEventListener("change", () => {
+  const file = el.genericFileInput.files[0];
+  if (!file) return;
+  loadPendingFile(file, state.selectedRoom, null);
+  el.genericFileInput.value = "";
 });
 let pasteHandledByEvent = false;
 
@@ -3419,7 +4917,7 @@ document.addEventListener("keydown", async (e) => {
       showToast("clipboard has no image");
       return;
     }
-    const dataUrl = bytesToDataUrl(bytes, "image/png");
+    const dataUrl = bytesToImageUrl(bytes, "image/png");
     state.pendingImage = { roomId, threadId, dataUrl, bytes, filename: "pasted.png", mime: "image/png" };
     renderPendingImage();
   } catch (err) {
@@ -3436,22 +4934,22 @@ document.addEventListener("keydown", async (e) => {
 // jumping *to* the search box, switching rooms without touching the
 // mouse, and a cheat sheet to find out these exist at all.
 const SHORTCUTS = [
-  ["Ctrl+K or /", "focus room search"],
-  ["Ctrl+M", "focus the main message box"],
-  ["Ctrl+N", "focus the thread's message box"],
-  ["Ctrl+Shift+M", "focus the main timeline"],
-  ["Ctrl+Shift+N", "focus the thread panel"],
-  ["Ctrl+T", "open this room's threads list"],
-  ["Ctrl+Shift+T", "focus the threads-list search box"],
+  ["Alt+K or /", "focus room search"],
+  ["Alt+M", "focus the main message box"],
+  ["Alt+N", "focus the thread's message box"],
+  ["Alt+Shift+M", "focus the main timeline"],
+  ["Alt+Shift+N", "focus the thread panel"],
+  ["Alt+T", "open this room's threads list, and focus its search box"],
   ["↑ / ↓ (in search)", "move through search results"],
   ["Enter (in search)", "open the highlighted room"],
   ["Esc (in search)", "clear search, then unfocus"],
   ["↑ / ↓ (threads list)", "move through the threads list"],
   ["Enter (threads list)", "open the highlighted thread"],
   ["← / → (in tags)", "switch space/tag"],
-  ["Ctrl+↑ / Ctrl+↓", "previous / next room in the list"],
-  ["Ctrl+Shift+L", "toggle unread-only filter"],
-  ["Ctrl+Shift+R", "mark current room as read"],
+  ["Alt+↑ / Alt+↓", "previous / next room in the list"],
+  ["Alt+L", "toggle unread-only filter"],
+  ["Alt+R", "mark current room as read"],
+  ["Alt+U", "mark current thread as read (only while a thread is open)"],
   ["Esc", "close dialog / menu"],
   ["?", "show this list"],
   ["Shift+Enter (compose)", "new line instead of sending"],
@@ -3475,6 +4973,11 @@ el.btnShortcuts.addEventListener("click", () => {
   showShortcutsHelp();
 });
 
+el.btnLogout.addEventListener("click", () => {
+  closeChatsMenu();
+  send("Logout");
+});
+
 /** True while the user is typing somewhere else — global shortcuts (`/`,
  * `?`, ...) that reuse plain, easy-to-hit keys must not fire while that's
  * happening, or every message containing "/" or "?" would get hijacked. */
@@ -3486,7 +4989,16 @@ function isTypingContext(target) {
 document.addEventListener("keydown", (e) => {
   const typing = isTypingContext(e.target);
 
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+  // Alt is this app's one consistent "leader" modifier for app-wide
+  // navigation — a plain Alt+letter is never confusable with a typed
+  // character (unlike the bare `/`/`?`/single-letter shortcuts below,
+  // which do need the `!typing` gate), so none of these check it either.
+  // Previously some of these lived on Ctrl instead, each paired with an
+  // unrelated Alt+<same letter> shortcut below it (Ctrl+M "focus compose"
+  // next to Alt+M "focus timeline", etc.) — collapsed onto Alt throughout
+  // so the whole app has one leader key, with the previously-Alt half of
+  // each pair moved to Alt+Shift instead of losing its binding.
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "k") {
     e.preventDefault();
     el.roomFilter.focus();
     el.roomFilter.select();
@@ -3497,34 +5009,33 @@ document.addEventListener("keydown", (e) => {
     el.roomFilter.focus();
     return;
   }
-  // Not gated by `!typing` — like Ctrl+K above, the Ctrl modifier already
-  // makes these safe to fire no matter what currently has focus (unlike
-  // the bare `/`/`?`/single-letter shortcuts, which would otherwise
-  // hijack a character someone's typing into a message).
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "m") {
+  if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "m") {
     e.preventDefault();
     if (state.selectedRoom) el.composeInput.focus();
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "n") {
+  if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "n") {
     e.preventDefault();
     if (state.rightPanel?.kind === "thread") {
       document.getElementById("thread-compose-input")?.focus();
     }
     return;
   }
-  // Shift variants of the two above — focus the *message list* itself
+  // Alt+Shift variants of the two above — focus the *message list* itself
   // (main timeline / thread panel) rather than its compose box, e.g. to
   // scroll it with Page Up/Down or just move focus off the compose input
   // without sending anything. `tabindex="-1"` on both targets (see
   // index.html) is what makes a plain, non-interactive `<div>` a valid
-  // `.focus()` target at all.
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "m") {
+  // `.focus()` target at all. Alt+Shift+letter rather than some unrelated
+  // key: Alt and Shift both sit under the same hand (bottom-left), so this
+  // stays a one-handed stretch same as plain Alt+letter, just distinct
+  // from "focus compose" on the same letter above.
+  if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "m") {
     e.preventDefault();
     if (state.selectedRoom) el.timeline.focus();
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "n") {
+  if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "n") {
     e.preventDefault();
     if (state.rightPanel?.kind === "thread") {
       // `#side-panel-body`, not `#thread-messages` — the latter doesn't
@@ -3535,18 +5046,15 @@ document.addEventListener("keydown", (e) => {
     }
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "t") {
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "t") {
     e.preventDefault();
-    openRoomThreadsList();
-    return;
-  }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "t") {
-    e.preventDefault();
-    // Opens the current room's thread list if nothing's open yet (same as
-    // plain Ctrl+T) — but leaves it alone if some threads-list panel
-    // (this room's, or "all threads") is already open, so this can't
-    // clobber a broader search someone's mid-typing into with a
-    // room-scoped one.
+    // Opens the current room's thread list if nothing's open yet — but
+    // leaves it alone if some threads-list panel (this room's, or "all
+    // threads") is already open, so this can't clobber a broader search
+    // someone's mid-typing into with a room-scoped one. This single
+    // binding now covers what used to be Ctrl+T (just open it)
+    // separately from Alt+T (open-if-needed, then focus the filter) —
+    // the latter was already a strict superset of the former.
     if (state.rightPanel?.kind !== "threads-list") openRoomThreadsList();
     const filterInput = document.getElementById("threads-filter");
     filterInput?.focus();
@@ -3558,23 +5066,29 @@ document.addEventListener("keydown", (e) => {
     showShortcutsHelp();
     return;
   }
-  // Not Ctrl+Shift+U: on Linux, IBus intercepts that combo at the input
-  // method level to trigger its own "Unicode code point entry" mode
-  // whenever a text field has focus (the room search box, in practice) —
-  // before the keydown event ever reaches this listener, so
-  // `preventDefault()` here can't stop it. Confirmed by testing: it typed
-  // a literal "u" into the search box instead of toggling the filter.
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "l") {
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "l") {
     e.preventDefault();
     el.btnUnreadOnly.click();
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "r") {
+  // Mark the current *room* as read — always the room, regardless of
+  // whatever else is open (a thread panel included), so this key does
+  // one predictable thing rather than switching targets underneath you.
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "r") {
     e.preventDefault();
     el.btnMarkRead.click();
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+  // Mark the current *thread* as read — its own separate key (distinct
+  // from Alt+R above) rather than one key that meant different things
+  // depending on what was open; only does something while a thread panel
+  // is actually open.
+  if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === "u") {
+    e.preventDefault();
+    if (state.rightPanel?.kind === "thread") markCurrentThreadRead();
+    return;
+  }
+  if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
     e.preventDefault();
     if (state.visibleRoomIds.length === 0) return;
     const currentIndex = state.visibleRoomIds.indexOf(state.selectedRoom);
@@ -3616,15 +5130,36 @@ document.addEventListener("keydown", (e) => {
 
 let toastTimer = null;
 function showToast(msg) {
-  console.log("[paste]", msg);
   let toast = document.getElementById("toast");
   if (!toast) {
     toast = document.createElement("div");
     toast.id = "toast";
+    // Bottom-left, not top-center — top-center sat right on top of the
+    // timeline header's own "[ mark read ]"/"[ threads ]"/"[ ... ]"
+    // buttons, which a toast firing from pressing one of those (e.g.
+    // "marked as read") then immediately covered, right when someone
+    // might reach for another one of them. `bottom` itself is set fresh
+    // below every time, not here, since it depends on the compose box's
+    // current height (see below).
     toast.style.cssText =
-      "position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:#222;border:1px solid var(--border);color:var(--text);padding:6px 12px;font-size:12px;z-index:999;max-width:80%;";
+      "position:fixed;left:16px;background:#222;border:1px solid var(--border);color:var(--text);padding:6px 12px;font-size:12px;z-index:999;max-width:80%;";
     document.body.appendChild(toast);
   }
+  // On both desktop and phone-width layouts, `#compose-row` spans out to
+  // (or past) the window's own left edge — desktop's doesn't start until
+  // `#room-list` ends, but phone-width collapses to a single full-width
+  // pane the instant a room's open, and a toast is just as likely to fire
+  // from inside one as from the room list. Anchoring above its actual
+  // current height (0 when it's hidden entirely, e.g. no room selected
+  // yet) keeps this clear of it either way, rather than the fixed 16px
+  // a plain bottom-left placement would need and then silently overlap
+  // the compose box on a narrow window.
+  const composeHeight = el.composeRow.style.display !== "none" ? el.composeRow.getBoundingClientRect().height : 0;
+  // `env(safe-area-inset-bottom)` matches every other fixed-position
+  // element in this app (see e.g. `#side-panel`'s own mobile rule in
+  // style.css) — without it, this would sit under a phone's gesture-nav
+  // bar on Android's edge-to-edge display.
+  toast.style.bottom = `calc(${16 + composeHeight}px + env(safe-area-inset-bottom, 0px))`;
   toast.textContent = msg;
   toast.style.display = "block";
   clearTimeout(toastTimer);
@@ -3635,7 +5170,7 @@ function loadPendingImage(file, roomId, threadId) {
   const reader = new FileReader();
   reader.onload = () => {
     const bytes = Array.from(new Uint8Array(reader.result));
-    const dataUrl = bytesToDataUrl(bytes, file.type);
+    const dataUrl = bytesToImageUrl(bytes, file.type);
     state.pendingImage = {
       roomId,
       threadId,
@@ -3708,13 +5243,114 @@ function confirmPendingImage() {
   renderPendingImage();
 }
 
+/** Same "pick, preview, confirm/cancel" flow as `loadPendingImage`, for an
+ * arbitrary file (no `accept` restriction on the input, and no image
+ * thumbnail — just the filename and size) — the "📄 file" attach option,
+ * for anything a chat's "📎 image" picker won't take (a PDF, a zip, an
+ * APK, ...). */
+function loadPendingFile(file, roomId, threadId) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const bytes = Array.from(new Uint8Array(reader.result));
+    state.pendingFile = {
+      roomId,
+      threadId,
+      bytes,
+      filename: file.name || "file",
+      mime: file.type || "application/octet-stream",
+      size: file.size,
+    };
+    renderPendingFile();
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function renderPendingFile() {
+  const p = state.pendingFile;
+
+  if (p && !p.threadId) {
+    fillPendingFilePreview(el.pendingFilePreview, p);
+  } else {
+    el.pendingFilePreview.style.display = "none";
+  }
+
+  const threadPreviewEl = document.getElementById("thread-pending-file-preview");
+  if (!threadPreviewEl) return;
+  if (p && p.threadId && state.rightPanel?.kind === "thread" && state.rightPanel.root.event_id === p.threadId) {
+    fillPendingFilePreview(threadPreviewEl, p);
+  } else {
+    threadPreviewEl.style.display = "none";
+  }
+}
+
+function fillPendingFilePreview(container, p) {
+  container.style.display = "flex";
+  container.style.alignItems = "center";
+  container.style.gap = "8px";
+  container.innerHTML = "";
+  const label = document.createElement("span");
+  label.textContent = `📄 ${p.filename} (${formatFileSize(p.size)})`;
+  container.appendChild(label);
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const sendBtn = document.createElement("button");
+  sendBtn.textContent = "send file";
+  sendBtn.addEventListener("click", confirmPendingFile);
+  const cancelBtn = document.createElement("button");
+  cancelBtn.textContent = "cancel";
+  cancelBtn.addEventListener("click", () => {
+    state.pendingFile = null;
+    renderPendingFile();
+  });
+  actions.appendChild(sendBtn);
+  actions.appendChild(cancelBtn);
+  container.appendChild(actions);
+}
+
+function formatFileSize(bytes) {
+  if (!Number.isFinite(bytes)) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function confirmPendingFile() {
+  const p = state.pendingFile;
+  if (!p) return;
+  send("SendFile", {
+    room_id: p.roomId,
+    thread_id: p.threadId,
+    filename: p.filename,
+    bytes: p.bytes,
+    mime: p.mime,
+    local_id: crypto.randomUUID(),
+  });
+  state.pendingFile = null;
+  renderPendingFile();
+}
+
 // =========================================================================
 // Threads
 // =========================================================================
 
 function openThread(roomId, root) {
-  state.unreadThreads.delete(`${roomId}|${root.event_id}`);
-  state.rightPanel = { kind: "thread", roomId, root, events: [] };
+  // Deliberately doesn't clear `unreadThreads`/`mentionThreads` for this
+  // thread — opening it no longer marks it read by itself (see
+  // `markCurrentThreadRead`'s doc comment); the unread state stays until
+  // the panel's own "[ mark read ]" button is actually pressed.
+  //
+  // Remembers whichever threads-list panel (if any) was open right before
+  // this call, so the thread panel's own close button can go back to it
+  // instead of leaving the side panel entirely — on mobile (where the side
+  // panel is a full-screen overlay over the timeline, see the
+  // `max-width: 720px` block in style.css) closing a thread would
+  // otherwise dump you straight out to the timeline you were never
+  // looking at, one screen further than the "back" gesture should go. A
+  // thread opened some other way (a reply badge in the main timeline, a
+  // shared-message link, ...) has no threads-list to return to, so its
+  // close button falls back to the old "just close" behavior.
+  const cameFrom = state.rightPanel?.kind === "threads-list" ? state.rightPanel : null;
+  state.rightPanel = { kind: "thread", roomId, root, events: [], cameFrom };
   renderSidePanel();
   send("LoadThread", { room_id: roomId, thread_root_id: root.event_id });
   // @mention autocomplete in the thread panel needs this — opening a
@@ -3835,7 +5471,9 @@ el.btnMarkRead.addEventListener("click", () => {
   const room = state.rooms.find((r) => r.room_id === state.selectedRoom);
   if (room) {
     room.unread_count = 0;
+    room.mention_count = 0;
     knownUnreadCounts.set(room.room_id, 0);
+    knownMentionCounts.set(room.room_id, 0);
     // Exempts this room from `applyUnreadFloor`'s stale-count protection
     // for a few seconds — otherwise the very next room-list diff (which
     // may still carry the server's pre-receipt count) would look exactly
@@ -3850,7 +5488,7 @@ el.btnMarkRead.addEventListener("click", () => {
 el.btnRoomThreads.addEventListener("click", openRoomThreadsList);
 
 /** Opens the current room's thread-list panel — shared by the
- * `[ threads ]` button and the `Ctrl+T` shortcut. */
+ * `[ threads ]` button and the `Alt+T` shortcut. */
 /** Moves/activates the threads-list panel's roving highlight — shared by
  * the global keydown handler (fires when nothing in particular has focus)
  * and `#threads-filter`'s own listener (fires while the search box has
@@ -3869,6 +5507,101 @@ el.btnRoomThreads.addEventListener("click", openRoomThreadsList);
  * available for one specific fetch. */
 function isThreadUnread(roomId, t) {
   return t.is_unread ?? state.unreadThreads.has(`${roomId}|${t.event_id}`);
+}
+
+/** Whether thread `t` has a message tagging this account — anywhere in
+ * the thread, not just its root: the root itself (`t.mentions_me`, its
+ * real `m.mentions`/highlight), its bundled latest-reply preview
+ * (`t.latest_reply_mentions_me` — same check, run server-side against
+ * that reply's own content), or a later live reply this session flagged
+ * via `state.mentionThreads` (see that Set's doc comment). Combined with
+ * `isThreadUnread`, this is what drives the threads-list panel's
+ * "[ @mentions ]" filter — a ping from any reply counts, not only one
+ * from the first message. */
+function isThreadMentioningMe(roomId, t) {
+  return (
+    Boolean(t.mentions_me) ||
+    Boolean(t.latest_reply_mentions_me) ||
+    state.mentionThreads.has(`${roomId}|${t.event_id}`)
+  );
+}
+
+/** Sends the "mark this thread read" receipt and updates local state for
+ * thread `t` — the shared half of `markThreadReadFromList` and
+ * `markAllThreadsRead`, split out so marking a whole batch doesn't
+ * re-render the panel once per thread. Sends the real receipt for the
+ * thread's latest reply (`latest_reply_event_id`, from the root's own
+ * bundled aggregation — falls back to the root itself for a thread with
+ * no replies loaded), same as opening the thread would once it finished
+ * loading. Callers are responsible for `updateThreadsButtonBadge()` and
+ * re-rendering afterwards. */
+function markThreadReadLocal(roomId, t) {
+  const eventId = t.latest_reply_event_id || t.event_id;
+  send("MarkThreadRead", { room_id: roomId, thread_root_id: t.event_id, event_id: eventId });
+  const key = `${roomId}|${t.event_id}`;
+  state.unreadThreads.delete(key);
+  state.mentionThreads.delete(key);
+  const markRead = (list) => {
+    const found = list?.find((e) => e.event_id === t.event_id);
+    if (found) found.is_unread = false;
+  };
+  markRead(state.threadsByRoom[roomId]);
+  markRead(state.timelines[roomId]);
+}
+
+/** Marks thread `t` read straight from the threads-list panel — the "✓
+ * read" button on an unread row, without opening it. */
+function markThreadReadFromList(roomId, t) {
+  markThreadReadLocal(roomId, t);
+  updateThreadsButtonBadge();
+  renderThreadsListRows();
+}
+
+/** The threads-list panel's "[ mark all read ]" button — marks every
+ * currently-unread thread within `scope` (a single room id, or `null` for
+ * the "all threads" view) read in one go, regardless of whatever the
+ * "[ unread ]"/"[ @mentions ]" toggles or search box are currently
+ * filtering the *visible* rows down to; a bulk action like this should
+ * act on everything loaded, not just what happens to still be on screen. */
+function markAllThreadsRead(scope) {
+  for (const [roomId, threads] of Object.entries(state.threadsByRoom)) {
+    if (scope !== null && roomId !== scope) continue;
+    for (const t of threads) {
+      if (isThreadUnread(roomId, t)) markThreadReadLocal(roomId, t);
+    }
+  }
+  updateThreadsButtonBadge();
+  renderThreadsListRows();
+}
+
+/** The open thread panel's own "[ mark read ]" button — opening a thread
+ * no longer marks it read by itself (previously it did, the instant its
+ * events finished loading; see the `ThreadEvents` handler's history),
+ * same as opening a room no longer marks *it* read either — reading the
+ * messages on screen isn't the same as deliberately clearing the badge,
+ * and auto-marking meant a thread you'd merely glanced at (or that
+ * scrolled past while looking for something else) silently lost its
+ * unread state. Marks up through whichever reply is currently the newest
+ * loaded in the panel (`rp.events`' last entry), falling back to the root
+ * itself for a thread with none loaded yet. */
+function markCurrentThreadRead() {
+  const rp = state.rightPanel;
+  if (!rp || rp.kind !== "thread") return;
+  const { roomId, root, events } = rp;
+  const eventId = events.length > 0 ? events[events.length - 1].event_id : root.event_id;
+  send("MarkThreadRead", { room_id: roomId, thread_root_id: root.event_id, event_id: eventId });
+  const key = `${roomId}|${root.event_id}`;
+  state.unreadThreads.delete(key);
+  state.mentionThreads.delete(key);
+  root.is_unread = false;
+  const markRead = (list) => {
+    const found = list?.find((e) => e.event_id === root.event_id);
+    if (found) found.is_unread = false;
+  };
+  markRead(state.threadsByRoom[roomId]);
+  markRead(state.timelines[roomId]);
+  updateThreadsButtonBadge();
+  showToast("thread marked as read");
 }
 
 function navigateThreadsList(key) {
@@ -3954,14 +5687,25 @@ function updateThreadsButtonBadge() {
   const anyUnread = Object.entries(state.threadsByRoom).some(([roomId, threads]) =>
     threads.some((t) => isThreadUnread(roomId, t)),
   );
+  // Red instead of the plain "unread" green whenever at least one of those
+  // unread threads actually pings this account — same grey-vs-red
+  // distinction as the room list's badge (`.room-badge.mention`).
+  const anyMentioned = Object.entries(state.threadsByRoom).some(([roomId, threads]) =>
+    threads.some((t) => isThreadUnread(roomId, t) && isThreadMentioningMe(roomId, t)),
+  );
   el.btnGlobalThreads.textContent = anyUnread ? "[ threads ● ]" : "[ threads ]";
-  el.btnGlobalThreads.style.color = anyUnread ? "#5ac878" : "";
+  el.btnGlobalThreads.style.color = anyMentioned ? "var(--danger)" : anyUnread ? "#5ac878" : "";
 
   const roomUnread = state.selectedRoom
     ? (state.threadsByRoom[state.selectedRoom] || []).some((t) => isThreadUnread(state.selectedRoom, t))
     : false;
+  const roomMentioned = state.selectedRoom
+    ? (state.threadsByRoom[state.selectedRoom] || []).some(
+        (t) => isThreadUnread(state.selectedRoom, t) && isThreadMentioningMe(state.selectedRoom, t),
+      )
+    : false;
   el.btnRoomThreads.textContent = roomUnread ? "[ threads ● ]" : "[ threads ]";
-  el.btnRoomThreads.style.color = roomUnread ? "#5ac878" : "";
+  el.btnRoomThreads.style.color = roomMentioned ? "var(--danger)" : roomUnread ? "#5ac878" : "";
 }
 
 /** Appends exactly one reply to the open thread panel instead of the full
@@ -3987,8 +5731,102 @@ function appendThreadMessage(rootEventId, event) {
   const threadCtx = { roomId: rp.roomId, threadId: rootEventId };
   const wasNearBottom =
     panelBody.scrollHeight - panelBody.scrollTop - panelBody.clientHeight < 120;
-  msgsEl.appendChild(renderMessage(event, threadCtx, { grouped: isGrouped(prevReply, event) }));
+  const grouped = isGrouped(prevReply, event);
+  const lastRow = grouped ? msgsEl.lastElementChild : null;
+  const lastBubble = lastRow?.classList.contains("msg-row") ? lastRow.querySelector(".bubble") : null;
+  if (lastBubble) {
+    lastBubble.appendChild(renderMessageItem(event, threadCtx));
+  } else {
+    msgsEl.appendChild(renderMessageGroup([event], threadCtx));
+  }
   if (wasNearBottom) scrollToBottom(panelBody);
+}
+
+/** The thread panel's first page of replies (`Event::ThreadEvents`,
+ * right after `openThread()`'s own initial `renderSidePanel()` — that one
+ * always renders with `events: []`, so `#thread-messages` is just the
+ * root + a `<hr>` at this point) — appended onto that existing shell
+ * instead of a second full `renderSidePanel()` teardown-and-rebuild for
+ * data that arrives a moment after opening. Returns `false` (caller falls
+ * back to a full render) if the shell isn't there to append onto — e.g.
+ * this event beat `openThread`'s own render, which shouldn't normally
+ * happen but isn't worth a hard assumption. */
+function appendInitialThreadReplies(rootEventId, newEvents) {
+  const rp = state.rightPanel;
+  if (!rp || rp.kind !== "thread" || rp.root.event_id !== rootEventId) return false;
+  const msgsEl = document.getElementById("thread-messages");
+  const panelBody = document.getElementById("side-panel-body");
+  if (!msgsEl || !panelBody) return false;
+
+  const threadCtx = { roomId: rp.roomId, threadId: rootEventId };
+  const frag = document.createDocumentFragment();
+  for (const run of groupIntoRuns(newEvents)) {
+    frag.appendChild(renderMessageGroup(run, threadCtx));
+  }
+  msgsEl.appendChild(frag);
+  scrollToBottom(panelBody);
+  return true;
+}
+
+/** Older replies (`Event::ThreadEventsPrepend`) inserted above whatever's
+ * already rendered, instead of the full `renderSidePanel()` rebuild that
+ * used to run once per page — a long thread's initial open auto-pages
+ * back to `reached_start` (see the `ThreadEvents`/`ThreadEventsPrepend`
+ * handlers below), which meant the *entire* panel — compose textarea,
+ * toolbar, mention state — tore down and rebuilt once per page, visibly
+ * flickering the whole side panel while it caught up. Same scroll-anchor
+ * idea as the main timeline's `prependMessages`: keep the reply the user
+ * was reading pinned in place rather than letting inserted-above content
+ * push it down the screen. `oldEvents` is `rp.events` from *before* the
+ * caller merges `newEvents` into it — needed here to re-derive the old
+ * first reply's grouping now that a new predecessor precedes it, and to
+ * fall back to a full render if the shell isn't in the expected shape. */
+function prependThreadReplies(rootEventId, newEvents, oldEvents) {
+  const rp = state.rightPanel;
+  if (!rp || rp.kind !== "thread" || rp.root.event_id !== rootEventId) return false;
+  const msgsEl = document.getElementById("thread-messages");
+  const panelBody = document.getElementById("side-panel-body");
+  const hr = msgsEl?.querySelector("hr");
+  if (!msgsEl || !panelBody || !hr) return false;
+
+  const threadCtx = { roomId: rp.roomId, threadId: rootEventId };
+  threadScrollAnchor.sync();
+
+  // Same "merge across the page boundary" handling as the main timeline's
+  // `prependMessages` — see its own comment for why this can't just fall
+  // back to a full `renderSidePanel()` (that rebuild also resets scroll,
+  // which was the actual source of the "jumps to newest reply on load
+  // more" complaint this is fixing).
+  let mergeEvent = null;
+  let runEvents = newEvents;
+  if (oldEvents.length > 0 && newEvents.length > 0 && isGrouped(newEvents[newEvents.length - 1], oldEvents[0])) {
+    mergeEvent = newEvents[newEvents.length - 1];
+    runEvents = newEvents.slice(0, -1);
+  }
+  const firstRow = hr.nextSibling;
+
+  const frag = document.createDocumentFragment();
+  for (const run of groupIntoRuns(runEvents)) {
+    frag.appendChild(renderMessageGroup(run, threadCtx));
+  }
+  msgsEl.insertBefore(frag, hr.nextSibling);
+
+  if (mergeEvent && firstRow) {
+    const bubble = firstRow.querySelector(".bubble");
+    const sender = bubble?.querySelector(".sender");
+    const headerTime = sender?.querySelector("time");
+    if (headerTime) headerTime.textContent = formatMessageTimestamp(mergeEvent.timestamp);
+    if (bubble && sender) {
+      bubble.insertBefore(renderMessageItem(mergeEvent, threadCtx), sender.nextSibling);
+      firstRow.dataset.eventId = mergeEvent.event_id;
+    }
+  }
+
+  // Also covers the not-yet-overflowing case the old height-delta fixup
+  // skipped, which left the panel parked at the very top (the oldest
+  // replies) once auto-paging filled it, instead of on the newest one.
+  threadScrollAnchor.sync();
+  return true;
 }
 
 /** Thread-panel counterpart to `rerenderMessageInPlace` — patches one
@@ -4022,17 +5860,19 @@ function rerenderThreadMessageInPlace(eventId) {
   const msgsEl = document.getElementById("thread-messages");
   if (!msgsEl) return;
   const threadCtx = { roomId: rp.roomId, threadId: rp.root.event_id };
-  const row = msgsEl.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`);
-  if (!row) return;
 
+  // The root is always its own single-message group/row (see the "thread"
+  // branch of `renderSidePanel`) — replace the whole row, not a `.msg-item`.
   if (rp.root.event_id === eventId) {
-    row.replaceWith(renderMessage(rp.root, threadCtx));
+    const row = msgsEl.querySelector(`.msg-row[data-event-id="${CSS.escape(eventId)}"]`);
+    if (row) row.replaceWith(renderMessageGroup([rp.root], threadCtx));
     return;
   }
-  const idx = rp.events.findIndex((e) => e.event_id === eventId);
-  if (idx === -1) return;
-  const grouped = isGrouped(idx > 0 ? rp.events[idx - 1] : null, rp.events[idx]);
-  row.replaceWith(renderMessage(rp.events[idx], threadCtx, { grouped }));
+  const event = rp.events.find((e) => e.event_id === eventId);
+  if (!event) return;
+  const itemEl = msgsEl.querySelector(`.msg-item[data-event-id="${CSS.escape(eventId)}"]`);
+  if (!itemEl) return;
+  itemEl.replaceWith(renderMessageItem(event, threadCtx));
 }
 
 /** Renders the threads-list side panel's static shell (header + search
@@ -4052,19 +5892,28 @@ function renderThreadsListPanel() {
     document.getElementById("threads-filter");
   if (!shellReady) {
     el.sidePanel.dataset.threadsListScope = String(rp.scope);
-    el.sidePanel.innerHTML = `<div id="side-panel-header"><span>${rp.scope === null ? "all threads" : "threads"}</span><button id="side-panel-close" class="small-btn">[x]</button></div>
+    el.sidePanel.innerHTML = `<div id="side-panel-header"><span>${rp.scope === null ? "all threads" : "threads"}</span><div style="display:flex;gap:6px;"><button id="threads-mark-all-read" class="small-btn" title="mark every unread thread here as read">[ mark all read ]</button><button id="side-panel-close" class="small-btn">[x]</button></div></div>
       <div id="threads-filter-row">
         <input id="threads-filter" placeholder="search threads..." value="${escapeHtml(state.threadsListFilter)}" />
         <button id="threads-unread-only" class="small-btn${state.threadsListUnreadOnly ? " selected" : ""}">[ unread ]</button>
+        <button id="threads-mentions-only" class="small-btn${state.threadsListMentionsOnly ? " selected" : ""}" title="show only unread threads that ping you">[ @mentions ]</button>
       </div>
       <div id="side-panel-body"></div>`;
     document.getElementById("side-panel-close").addEventListener("click", () => {
       state.rightPanel = null;
       renderSidePanel();
     });
+    document.getElementById("threads-mark-all-read").addEventListener("click", () => {
+      markAllThreadsRead(rp.scope);
+    });
     document.getElementById("threads-unread-only").addEventListener("click", () => {
       state.threadsListUnreadOnly = !state.threadsListUnreadOnly;
       document.getElementById("threads-unread-only").classList.toggle("selected", state.threadsListUnreadOnly);
+      renderThreadsListRows();
+    });
+    document.getElementById("threads-mentions-only").addEventListener("click", () => {
+      state.threadsListMentionsOnly = !state.threadsListMentionsOnly;
+      document.getElementById("threads-mentions-only").classList.toggle("selected", state.threadsListMentionsOnly);
       renderThreadsListRows();
     });
     const filterInput = document.getElementById("threads-filter");
@@ -4106,6 +5955,25 @@ function renderThreadsListPanel() {
  * content out from the shell (see `renderThreadsListPanel`) fixes that
  * at the root instead of trying to save/restore focus around a rebuild
  * that didn't need to touch the input at all. */
+/** A thread-row preview (the root message, or its bundled latest-reply)
+ * as HTML — an actual thumbnail for an image attachment, same fetch/cache
+ * pipeline `renderMessage`'s inline images and the pinned-messages dialog
+ * (`openPinsDialog`, above) already use, instead of just the filename
+ * text `body` alone would show; markdown-rendered text (`renderMarkdown`,
+ * for bold/italic/code/links) for anything else. `null` when `msgType`
+ * isn't `"image"` — callers fall back to their own plain-text render. */
+function threadRowImageHtml(msgType, mediaUrl, mediaMime, mediaEncryption, altText) {
+  if (msgType !== "image" || !mediaUrl) return null;
+  if (mediaMime) state.imageMime[mediaUrl] = mediaMime;
+  if (mediaEncryption) state.imageEncryption[mediaUrl] = mediaEncryption;
+  const cached = state.imageCache[mediaUrl];
+  if (cached) {
+    return `<img src="${cached}" alt="${escapeHtml(altText || "image")}" class="thread-row-thumb" />`;
+  }
+  if (!state.imageRequested.has(mediaUrl)) requestImage(mediaUrl);
+  return loadingHtml("loading image...");
+}
+
 function renderThreadsListRows() {
   const rp = state.rightPanel;
   if (!rp || rp.kind !== "threads-list") return;
@@ -4113,6 +5981,7 @@ function renderThreadsListRows() {
   if (!bodyEl) return;
 
   const unreadOnly = state.threadsListUnreadOnly;
+  const mentionsOnly = state.threadsListMentionsOnly;
   const query = normalizeForSearch(state.threadsListFilter.trim());
   /** A thread matches if the room it's in, its first message, or its
    * latest reply mention the search text — covers "I remember someone
@@ -4129,7 +5998,10 @@ function renderThreadsListRows() {
     .map(([roomId, threads]) => {
       const roomName = state.rooms.find((r) => r.room_id === roomId)?.name || roomId;
       const filtered = threads.filter(
-        (t) => (!unreadOnly || isThreadUnread(roomId, t)) && threadMatches(roomName, t),
+        (t) =>
+          (!unreadOnly || isThreadUnread(roomId, t)) &&
+          (!mentionsOnly || (isThreadUnread(roomId, t) && isThreadMentioningMe(roomId, t))) &&
+          threadMatches(roomName, t),
       );
       return { roomId, roomName, threads: filtered };
     })
@@ -4153,9 +6025,11 @@ function renderThreadsListRows() {
     html += `<div style="color:var(--text-weak)">${
       query
         ? "no threads match your search"
-        : unreadOnly
-          ? "no unread threads"
-          : "no threads yet"
+        : mentionsOnly
+          ? "no unread mentions in threads"
+          : unreadOnly
+            ? "no unread threads"
+            : "no threads yet"
     }</div>`;
   }
   state.visibleThreadRows = [];
@@ -4170,19 +6044,35 @@ function renderThreadsListRows() {
       const rowIndex = state.visibleThreadRows.length;
       state.visibleThreadRows.push({ roomId, eventId: t.event_id });
       const unread = isThreadUnread(roomId, t);
+      const mentioned = unread && isThreadMentioningMe(roomId, t);
       // "First message" is the thread root itself (`t`); "last message"
       // is its bundled latest-reply preview (see `latest_reply_*` on
       // `TimelineEvent` — comes straight off the root event's own
       // server-side aggregation, no per-thread fetch needed just to
       // list them). Absent for a thread with 0 replies.
+      const lastMsgBody =
+        threadRowImageHtml(t.latest_reply_msg_type, t.latest_reply_media_url, t.latest_reply_media_mime, t.latest_reply_media_encryption, t.latest_reply_body) ??
+        renderMarkdownPreview(t.latest_reply_body || "", 80);
       const lastMsgHtml = t.latest_reply_body
-        ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${escapeHtml(truncate(t.latest_reply_body, 80))}</div>`
+        ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${lastMsgBody}</div>`
         : "";
+      const rootBody = threadRowImageHtml(t.msg_type, t.media_url, t.media_mime, t.media_encryption, t.body) ?? renderMarkdownPreview(t.body || "", 80);
+      // Same avatar-left, sender+content-right layout as a message row in
+      // the timeline (`renderMessage`) — reads as "a message that happens
+      // to have a thread on it" instead of a plain unrelated text-list
+      // entry once the rest of the app moved to that flat, avatar-led
+      // message style.
       html += `<div class="thread-row${rowIndex === state.threadsListActiveIndex ? " kbd-active" : ""}" data-room="${roomId}" data-event="${t.event_id}">
-      <div class="sender" style="color:${senderColor(t.sender)}">${unread ? '<span class="unread-dot">●</span> ' : ""}${escapeHtml(t.sender_name)}</div>
-      <div class="thread-row-body">${escapeHtml(truncate(t.body || "", 80))}</div>
-      ${lastMsgHtml}
-      <div class="thread-row-meta">${t.thread_count || 0} replies →</div>
+      ${avatarHtml(t.sender_avatar_url, t.sender_name, t.sender, 28)}
+      <div class="thread-row-content">
+        <div class="sender" style="color:${senderColor(t.sender)}">${mentioned ? '<span class="mention-dot">●</span> ' : unread ? '<span class="unread-dot">●</span> ' : ""}${escapeHtml(t.sender_name)}</div>
+        <div class="thread-row-body">${rootBody}</div>
+        ${lastMsgHtml}
+        <div class="thread-row-meta">
+          <span>${t.thread_count || 0} replies →</span>
+          ${unread ? '<button class="small-btn thread-mark-read-btn" data-mark-read title="mark this thread as read">✓ read</button>' : ""}
+        </div>
+      </div>
     </div>`;
     }
   }
@@ -4200,7 +6090,7 @@ function renderThreadsListRows() {
   const scopedRoom = rp.scope !== null && !query ? rooms[0] : null;
   if (scopedRoom && !state.threadsListReachedEnd.has(rp.scope)) {
     const loading = state.threadsListPaginationInFlight.has(rp.scope);
-    html += `<div id="threads-load-more-row" style="text-align:center;font-size:12px;padding:4px;">${
+    html += `<div id="threads-load-more-row" style="text-align:center;font-size:calc(var(--font-size) - 3px);padding:4px;">${
       loading ? loadingHtml("loading more threads...") : '<button id="threads-load-more-btn" class="small-btn">load more threads</button>'
     }</div>`;
   }
@@ -4213,12 +6103,85 @@ function renderThreadsListRows() {
       if (root) openThread(roomId, root);
     });
   });
+  bodyEl.querySelectorAll(".thread-mark-read-btn").forEach((btn) => {
+    // Stop the click from bubbling up to the row's own listener above —
+    // this button marks the thread read in place, it shouldn't also open
+    // it (that would immediately mark it read too, just less directly).
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const row = btn.closest(".thread-row");
+      const roomId = row.dataset.room;
+      const eventId = row.dataset.event;
+      const root = state.threadsByRoom[roomId]?.find((t) => t.event_id === eventId);
+      if (root) markThreadReadFromList(roomId, root);
+    });
+  });
   document.getElementById("threads-load-more-btn")?.addEventListener("click", () => {
     state.threadsListPaginationInFlight.add(rp.scope);
     send("LoadMoreThreads", { room_id: rp.scope });
     renderThreadsListRows();
   });
 }
+
+/** Keeps `#side-panel`'s inline width and `#resizer-right`'s visibility
+ * matching whichever of the three layouts (phone full-screen overlay /
+ * medium `#main-panel`-covering overlay / desktop 3-pane — see their
+ * matching media queries in style.css) the window's current size falls
+ * into. Below `720px`/`500px` `#side-panel` is a full-screen overlay
+ * (`width: 100%`), and between that and `1100px` it's an overlay
+ * anchored to the right, covering the open conversation while
+ * `#room-list` stays visible on the left, with its own fixed width —
+ * setting an
+ * inline pixel width would outrank either unconditionally (inline styles
+ * beat any stylesheet rule regardless of media query) and break it, so a
+ * custom width is only ever computed for the genuine 3-pane desktop
+ * layout below.
+ *
+ * Called both from `renderSidePanel` (every open/re-render) and, since a
+ * plain OS-level window resize while the panel is already open doesn't
+ * trigger a re-render on its own, from a debounced `resize` listener too
+ * — without that second path, opening the panel at a wide window width
+ * and then resizing/tiling the window down (to "half screen", say) left
+ * that wide layout's inline pixel width in place fighting the
+ * narrow/medium stylesheet rule for the rest of the session, rendering
+ * an overlay far wider than either was ever meant to allow. */
+function syncSidePanelLayoutForViewport() {
+  if (!state.rightPanel) return;
+  const resizerRight = document.getElementById("resizer-right");
+  const narrow = isNarrowLayout();
+  // `!narrow` already excludes every touch device here too (not just
+  // ones outside 721–1100px) — `isNarrowLayout()` matches any touch
+  // device regardless of width, so this stays correctly desktop-only.
+  const isMediumLayout = !narrow && window.matchMedia("(max-width: 1100px)").matches;
+  if (narrow || isMediumLayout) {
+    el.sidePanel.style.width = "";
+    resizerRight.style.display = "none";
+    return;
+  }
+  resizerRight.style.display = "block";
+  if (el.sidePanel.style.display !== "flex") {
+    // Default to splitting the space evenly with the timeline instead of
+    // a fixed width — measured right before `#side-panel` starts taking
+    // up any room, so `#main-panel` (`flex: 1`) still reflects the full
+    // width available to both of them at this instant. Only on the
+    // closed→open transition (this check), not on every subsequent
+    // re-render while it's already showing, so it doesn't fight a resize
+    // the user just did by hand.
+    const availableWidth = el.mainPanel.getBoundingClientRect().width;
+    // `resizerRight` may still be `display: none` at this point, so it
+    // has no measurable width of its own yet — `.resizer`'s CSS width is
+    // a fixed 4px regardless, so just use that directly.
+    const resizerWidth = 4;
+    const min = parseInt(getComputedStyle(el.sidePanel).minWidth, 10) || 220;
+    el.sidePanel.style.width = Math.max(min, (availableWidth - resizerWidth) / 2) + "px";
+  }
+}
+
+let sidePanelResizeDebounceTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(sidePanelResizeDebounceTimer);
+  sidePanelResizeDebounceTimer = setTimeout(syncSidePanelLayoutForViewport, 100);
+});
 
 function renderSidePanel() {
   const rp = state.rightPanel;
@@ -4229,31 +6192,13 @@ function renderSidePanel() {
     resizerRight.style.display = "none";
     return;
   }
-  // Below `720px`/`500px` (see that media query in style.css) `#side-panel`
-  // becomes a full-screen overlay (`width: 100%`) instead of a second
-  // pane next to the timeline — setting an inline pixel width here would
-  // outrank that unconditionally (inline styles beat any stylesheet rule
-  // regardless of media query) and break it, so this only ever applies to
-  // the side-by-side desktop layout.
-  const isNarrowLayout = window.matchMedia("(max-width: 720px), (max-height: 500px)").matches;
-  if (!isNarrowLayout && el.sidePanel.style.display !== "flex") {
-    // Default to splitting the space evenly with the timeline instead of
-    // a fixed width — measured right before `#side-panel` starts taking
-    // up any room, so `#main-panel` (`flex: 1`) still reflects the full
-    // width available to both of them at this instant. Only on the
-    // closed→open transition (this check), not on every subsequent
-    // re-render while it's already showing, so it doesn't fight a resize
-    // the user just did by hand.
-    const availableWidth = el.mainPanel.getBoundingClientRect().width;
-    // `resizerRight` is still `display: none` at this point (set below),
-    // so it has no measurable width of its own yet — `.resizer`'s CSS
-    // width is a fixed 4px regardless, so just use that directly.
-    const resizerWidth = 4;
-    const min = parseInt(getComputedStyle(el.sidePanel).minWidth, 10) || 220;
-    el.sidePanel.style.width = Math.max(min, (availableWidth - resizerWidth) / 2) + "px";
-  }
+  // Before flipping `display` to `"flex"` below — `syncSidePanelLayoutForViewport`'s
+  // desktop-width branch uses "is this element not already `flex`" to
+  // detect a closed→open transition (only then does it compute a fresh
+  // default width), which would never see anything but "already flex"
+  // if this ran after.
+  syncSidePanelLayoutForViewport();
   el.sidePanel.style.display = "flex";
-  resizerRight.style.display = "block";
 
   if (rp.kind === "threads-list") {
     renderThreadsListPanel();
@@ -4270,17 +6215,19 @@ function renderSidePanel() {
     const hadFocus = document.activeElement?.id === "thread-compose-input";
     const priorSelectionStart = hadFocus ? document.activeElement.selectionStart : null;
 
-    let html = `<div id="side-panel-header"><span>thread</span><div style="display:flex;gap:6px;"><button id="thread-btn-summarize" class="small-btn">[ summarize ]</button><button id="side-panel-close" class="small-btn">[x]</button></div></div>
+    let html = `<div id="side-panel-header"><span>thread</span><div style="display:flex;gap:6px;"><button id="thread-btn-mark-read" class="small-btn" title="mark this thread as read">[ mark read ]</button><button id="thread-btn-summarize" class="small-btn">[ summarize ]</button><button id="side-panel-close" class="small-btn">[x]</button></div></div>
       <div id="side-panel-body" tabindex="-1"><div id="thread-messages"></div></div>
       <div id="thread-reply-indicator" style="display:none;"></div>
       <div id="thread-mention-suggestions" style="display:none;"></div>
       <div id="thread-pending-image-preview" style="display:none;padding:6px 12px;"></div>
+      <div id="thread-pending-file-preview" style="display:none;padding:6px 12px;"></div>
       <div id="thread-compose-toolbar" class="compose-toolbar" style="padding:4px 8px 0 8px;border-top:1px solid var(--border);">
         <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
         <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
         <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
         <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
         <button type="button" class="md-btn" data-md="link" title="link">link</button>
+        <button type="button" class="md-btn emoji-btn" title="emoji">🙂</button>
       </div>
       <div id="thread-compose-row" style="padding:8px;display:flex;gap:6px;align-items:flex-end;">
         <button id="thread-btn-attach" class="small-btn">📎</button>
@@ -4295,22 +6242,21 @@ function renderSidePanel() {
       </div>`;
     el.sidePanel.innerHTML = html;
     document.getElementById("side-panel-close").addEventListener("click", () => {
-      state.rightPanel = null;
+      state.rightPanel = rp.cameFrom || null;
       renderSidePanel();
     });
     document.getElementById("thread-btn-summarize").addEventListener("click", () => {
       openSummaryDialog(rp.roomId, rp.root.event_id);
     });
+    document.getElementById("thread-btn-mark-read").addEventListener("click", markCurrentThreadRead);
     const msgsEl = document.getElementById("thread-messages");
     const threadCtx = { roomId: rp.roomId, threadId: rp.root.event_id };
-    msgsEl.appendChild(renderMessage(rp.root, threadCtx));
+    msgsEl.appendChild(renderMessageGroup([rp.root], threadCtx));
     const hr = document.createElement("hr");
     hr.style.borderColor = "var(--border)";
     msgsEl.appendChild(hr);
-    let prevReply = null;
-    for (const ev of rp.events) {
-      msgsEl.appendChild(renderMessage(ev, threadCtx, { grouped: isGrouped(prevReply, ev) }));
-      prevReply = ev;
+    for (const run of groupIntoRuns(rp.events)) {
+      msgsEl.appendChild(renderMessageGroup(run, threadCtx));
     }
     // `#thread-messages` itself doesn't scroll — its parent
     // `#side-panel-body` does (`overflow-y: auto`) — so that's what needs
@@ -4322,10 +6268,15 @@ function renderSidePanel() {
     const threadInputEl = document.getElementById("thread-compose-input");
     wireMentionAutocomplete(threadInputEl, threadSuggestionsEl, () => rp.roomId, state.threadComposeMentions);
     renderPendingImage();
+    renderPendingFile();
 
     const sendThreadMsg = () => {
       if (state.pendingImage && state.pendingImage.threadId === rp.root.event_id) {
         confirmPendingImage();
+        return;
+      }
+      if (state.pendingFile && state.pendingFile.threadId === rp.root.event_id) {
+        confirmPendingFile();
         return;
       }
       const input = document.getElementById("thread-compose-input");
@@ -4356,13 +6307,20 @@ function renderSidePanel() {
       }
       const replyTo =
         state.pendingReply && state.pendingReply.threadId === rp.root.event_id ? state.pendingReply.eventId : null;
+      const localId = crypto.randomUUID();
+      const optimistic = makeOptimisticEvent(localId, body, replyTo, ids);
+      if (optimistic) {
+        state.pendingSends.set(localId, { roomId: rp.roomId, threadId: rp.root.event_id });
+        rp.events.push(optimistic);
+        appendThreadMessage(rp.root.event_id, optimistic);
+      }
       send("SendMessage", {
         room_id: rp.roomId,
         body,
         thread_id: rp.root.event_id,
         mentions: ids,
         html_body: html,
-        local_id: crypto.randomUUID(),
+        local_id: localId,
         reply_to_event_id: replyTo,
       });
       cancelReply();
@@ -4374,14 +6332,29 @@ function renderSidePanel() {
       isSuggestionsOpen: () => threadSuggestionsEl.style.display !== "none",
     });
     wireMarkdownToolbar(document.getElementById("thread-compose-toolbar"), threadInputEl);
-    document.getElementById("thread-btn-attach").addEventListener("click", () => {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = "image/*";
-      input.addEventListener("change", () => {
-        if (input.files[0]) loadPendingImage(input.files[0], rp.roomId, rp.root.event_id);
-      });
-      input.click();
+    document.getElementById("thread-btn-attach").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const pickImage = () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "image/*";
+        input.addEventListener("change", () => {
+          if (input.files[0]) loadPendingImage(input.files[0], rp.roomId, rp.root.event_id);
+        });
+        input.click();
+      };
+      const pickFile = () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.addEventListener("change", () => {
+          if (input.files[0]) loadPendingFile(input.files[0], rp.roomId, rp.root.event_id);
+        });
+        input.click();
+      };
+      openActionsMenu(e.currentTarget, [
+        { label: "📎 image", onClick: pickImage },
+        { label: "📄 file", onClick: pickFile },
+      ]);
     });
     const threadMemePicker = document.getElementById("thread-meme-picker");
     document.getElementById("thread-btn-meme").addEventListener("click", (e) => {
@@ -4424,9 +6397,12 @@ function renderSidePanel() {
           lastRoomId = hit.room_id;
         }
         html += `<div class="thread-row" data-room="${hit.room_id}" data-event="${hit.event.event_id}">
-          <div class="sender" style="color:${senderColor(hit.event.sender)}">${escapeHtml(hit.event.sender_name)}</div>
-          <div class="thread-row-body">${escapeHtml(truncate(hit.event.body || "", 120))}</div>
-          <div class="thread-row-meta">${new Date(hit.event.timestamp).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
+          ${avatarHtml(hit.event.sender_avatar_url, hit.event.sender_name, hit.event.sender, 28)}
+          <div class="thread-row-content">
+            <div class="sender" style="color:${senderColor(hit.event.sender)}">${escapeHtml(hit.event.sender_name)}</div>
+            <div class="thread-row-body">${renderMarkdownPreview(hit.event.body || "", 120)}</div>
+            <div class="thread-row-meta">${new Date(hit.event.timestamp).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</div>
+          </div>
         </div>`;
       }
     }
@@ -4498,6 +6474,25 @@ function renderAvatar(mxcUri, name, idForColor, size = 28) {
   return wrap;
 }
 
+/** String-HTML counterpart to `renderAvatar` just above — for the
+ * threads-list panel's rows, built as one big HTML string
+ * (`renderThreadsListRows`) rather than per-row DOM node construction
+ * like `renderMessage`. Same caching/fallback-initial logic and the same
+ * `data-mxc` hook, so `patchAvatarsWithImage` (which just queries
+ * `.avatar[data-mxc="..."]` anywhere in the document) finds and swaps
+ * these in exactly the same way once the real image loads. */
+function avatarHtml(mxcUri, name, idForColor, size = 28) {
+  const style = `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.45)}px;`;
+  const cached = mxcUri && state.imageCache[mxcUri];
+  if (cached) {
+    return `<div class="avatar" style="${style}"><img src="${escapeHtml(cached)}" alt="${escapeHtml(name || "")}" /></div>`;
+  }
+  if (mxcUri) requestImage(mxcUri);
+  const initial = escapeHtml((name || "?").trim().charAt(0).toUpperCase() || "?");
+  const mxcAttr = mxcUri ? ` data-mxc="${escapeHtml(mxcUri)}"` : "";
+  return `<div class="avatar" style="${style}background:${senderColor(idForColor || name || "")};"${mxcAttr}>${initial}</div>`;
+}
+
 /** Swaps the initials-fallback circle for the real image, in place, on
  * every currently-rendered avatar slot for `mxcUri` — same "patch, don't
  * re-render" reasoning as `patchMessagesWithMedia`. */
@@ -4507,7 +6502,13 @@ function patchAvatarsWithImage(mxcUri) {
   document.querySelectorAll(`.avatar[data-mxc="${CSS.escape(mxcUri)}"]`).forEach((wrap) => {
     delete wrap.dataset.mxc;
     wrap.style.background = "";
-    wrap.textContent = "";
+    // Not `wrap.textContent = ""` — that clears every child, not just the
+    // initials text node, silently taking the presence badge (a real
+    // `<span>`, see `renderMessageGroup`'s `.avatar-presence-dot`) out
+    // with it the moment the real avatar image finished loading.
+    const presenceDot = wrap.querySelector(".avatar-presence-dot");
+    wrap.innerHTML = "";
+    if (presenceDot) wrap.appendChild(presenceDot);
     const img = document.createElement("img");
     img.src = cached;
     wrap.appendChild(img);
@@ -4758,11 +6759,17 @@ function handleBackendEvent(evt) {
     case "LoginError":
       showLoginError(data);
       break;
+    case "SessionExpired":
+      reloadToLogin("your session has expired — please sign in again");
+      break;
+    case "LoggedOut":
+      reloadToLogin(null);
+      break;
     case "RoomListUpdate": {
       const entries = data.list === "Invites" ? state.inviteEntries : state.roomEntries;
       for (const op of data.ops) applyRoomListOp(entries, op);
       rebuildRoomsFromEntries();
-      renderRooms();
+      scheduleRoomsRender();
       if (data.list !== "Invites") scheduleGrowRoomList();
       // First time the room list actually has rooms in it — kick off a
       // one-time background fetch of every room's threads (see
@@ -4830,9 +6837,27 @@ function handleBackendEvent(evt) {
     }
     case "NewMessage": {
       if (!state.timelines[data.room_id]) state.timelines[data.room_id] = [];
-      state.timelines[data.room_id].push(data.event);
-      if (data.room_id === state.selectedRoom) {
-        appendMessage(data.room_id, data.event);
+      // `data.event.local_id` only round-trips down `/sync` to the exact
+      // device that sent it (see `TimelineEvent.local_id`'s doc comment on
+      // the Rust side) — its presence in `state.pendingSends` confirms
+      // this is the real echo of a message *this session* just sent, so
+      // swap it in for the optimistic "sending…" bubble instead of
+      // showing the same message twice.
+      const reconciled =
+        data.event.local_id &&
+        state.pendingSends.delete(data.event.local_id) &&
+        reconcileLocalEcho(
+          state.timelines[data.room_id],
+          data.room_id === state.selectedRoom ? el.timeline : null,
+          data.event.local_id,
+          data.event,
+          { roomId: data.room_id, threadId: null },
+        );
+      if (!reconciled) {
+        state.timelines[data.room_id].push(data.event);
+        if (data.room_id === state.selectedRoom) {
+          appendMessage(data.room_id, data.event);
+        }
       }
       // Update the room list's preview text/ordering/unread badge right
       // as the message arrives, instead of waiting for the backend's own
@@ -4853,12 +6878,41 @@ function handleBackendEvent(evt) {
         // just by a message happening to arrive while the room's open.
         room.unread_count = (room.unread_count || 0) + 1;
         knownUnreadCounts.set(room.room_id, room.unread_count);
-        // Same ordering `refresh_rooms` uses server-side: invites first,
-        // then most recent activity.
-        state.rooms.sort((a, b) => (b.is_invite - a.is_invite) || b.last_message_ts - a.last_message_ts);
+        if (data.event.mentions_me) {
+          room.mention_count = (room.mention_count || 0) + 1;
+          knownMentionCounts.set(room.room_id, room.mention_count);
+        }
+        // Same ordering `sortRoomsList` uses: invites first, then
+        // favorites, then most recent activity.
+        state.rooms.sort(
+          (a, b) => (b.is_invite - a.is_invite) || (b.is_favorite - a.is_favorite) || b.last_message_ts - a.last_message_ts,
+        );
         renderRooms();
       }
       maybeNotify(data.room_id, data.event);
+      break;
+    }
+    // A read receipt landed for this room — including this account's own
+    // receipt echoing back after being sent from a *different* session
+    // (marking read on another device/platform), which is exactly what
+    // this exists to catch: `applyUnreadFloor`'s protection (see its own
+    // comment) would otherwise clamp that drop right back up, since from
+    // its point of view a badge suddenly going down looks exactly like
+    // the stale-diff race it guards against. Treated the same way
+    // `btnMarkRead`'s own click handler exempts itself from that — set
+    // `knownUnreadCounts`/`knownMentionCounts` directly rather than
+    // going through `applyUnreadFloor`, since this value just came
+    // straight from a fresh `num_unread_notifications()` recompute on
+    // the Rust side, not a possibly-stale room-list diff.
+    case "UnreadCountChanged": {
+      const room = state.rooms.find((r) => r.room_id === data.room_id);
+      if (room) {
+        room.unread_count = data.unread_count;
+        room.mention_count = data.mention_count;
+        knownUnreadCounts.set(data.room_id, data.unread_count);
+        knownMentionCounts.set(data.room_id, data.mention_count);
+        renderRooms();
+      }
       break;
     }
     case "ThreadReply": {
@@ -4868,35 +6922,48 @@ function handleBackendEvent(evt) {
         state.rightPanel.kind === "thread" &&
         state.rightPanel.root.event_id === data.thread_root_id;
       if (openHere) {
-        state.rightPanel.events.push(data.event);
+        // Same `local_id` reconciliation as `NewMessage` above, just
+        // against the thread panel's own `events` array/DOM instead of
+        // the main timeline's.
+        const reconciled =
+          data.event.local_id &&
+          state.pendingSends.delete(data.event.local_id) &&
+          reconcileLocalEcho(
+            state.rightPanel.events,
+            document.getElementById("thread-messages"),
+            data.event.local_id,
+            data.event,
+            { roomId: data.room_id, threadId: data.thread_root_id },
+          );
+        if (!reconciled) {
+          state.rightPanel.events.push(data.event);
+          appendThreadMessage(data.thread_root_id, data.event);
+        }
         state.rightPanel.root.thread_count = (state.rightPanel.root.thread_count || 0) + 1;
-        appendThreadMessage(data.thread_root_id, data.event);
-      } else {
-        state.unreadThreads.add(key);
-        updateThreadsButtonBadge();
+      } else if (data.event.local_id) {
+        // The thread panel isn't open (any more) to reconcile into, but
+        // the pending-send entry would otherwise just sit in the map
+        // forever — nothing else ever clears it in that case.
+        state.pendingSends.delete(data.event.local_id);
       }
+      // Same manual-only read-tracking as the room list and this panel's
+      // own "[ mark read ]" button (`markCurrentThreadRead`) — a live
+      // reply counts as unread even if the thread happens to be open on
+      // screen right now; only actually pressing "mark read" clears it,
+      // same as a room's own unread badge keeps climbing while it's the
+      // selected room until "[ mark read ]" is pressed.
+      state.unreadThreads.add(key);
+      if (data.event.mentions_me) state.mentionThreads.add(key);
+      updateThreadsButtonBadge();
       const bump = (list) => {
         const t = list?.find((e) => e.event_id === data.thread_root_id);
         if (t) {
           t.thread_count = (t.thread_count || 0) + 1;
-          // Keep the server-derived unread flag (see `TimelineEvent::is_unread`
-          // in the Rust model) in sync with what just happened, rather than
-          // letting it go stale until the next `ListThreads` re-fetch:
-          // a live reply while the thread isn't open is new unread content;
-          // one that arrived *while* it's open doesn't leave anything
-          // unread behind (see the `MarkThreadRead` call below).
-          t.is_unread = !openHere;
+          t.is_unread = true;
         }
       };
       bump(state.threadsByRoom[data.room_id]);
       bump(state.timelines[data.room_id]);
-      if (openHere) {
-        send("MarkThreadRead", {
-          room_id: data.room_id,
-          thread_root_id: data.thread_root_id,
-          event_id: data.event.event_id,
-        });
-      }
       // The "🧵 N replies →" badge on the thread root as shown in the
       // *main* timeline (not the thread panel — that suppresses its own
       // copy of the badge on the root) — patch just that one row instead
@@ -4918,29 +6985,21 @@ function handleBackendEvent(evt) {
       ) {
         state.rightPanel.events = data.events;
         state.threadPaginationReachedStart.delete(`${data.room_id}|${data.thread_root_id}`);
-        renderSidePanel();
+        // Appends onto the shell `openThread()` already rendered rather
+        // than a second full `renderSidePanel()` teardown — see
+        // `appendInitialThreadReplies`'s own comment for why that used to
+        // flicker the whole panel.
+        if (!appendInitialThreadReplies(data.thread_root_id, data.events)) renderSidePanel();
         // Default to loading the whole thread rather than just the latest
         // page — keep requesting older pages until the server says there's
         // nothing left. `LoadMoreThreadReplies` is a no-op (immediate
         // `reached_start: true`) once the first page already covered the
         // whole thread, so this is safe to always fire.
         send("LoadMoreThreadReplies", { room_id: data.room_id, thread_root_id: data.thread_root_id });
-        // Opening a thread reads it — send the real (server-side,
-        // account-wide) threaded receipt for whatever's the latest reply
-        // in what just loaded, same moment `openThread` already clears
-        // the session-local `unreadThreads` flag. A thread with 0 replies
-        // has nothing to mark: `is_unread` is always `false` for those
-        // already (see `thread_is_unread` in `worker.rs`).
-        if (data.events.length > 0) {
-          const latestEventId = data.events[data.events.length - 1].event_id;
-          send("MarkThreadRead", { room_id: data.room_id, thread_root_id: data.thread_root_id, event_id: latestEventId });
-          const markRead = (list) => {
-            const t = list?.find((e) => e.event_id === data.thread_root_id);
-            if (t) t.is_unread = false;
-          };
-          markRead(state.threadsByRoom[data.room_id]);
-          markRead(state.timelines[data.room_id]);
-        }
+        // Deliberately doesn't auto-mark the thread read just because its
+        // events finished loading — see `markCurrentThreadRead`'s doc
+        // comment. The panel's own "[ mark read ]" button is now the only
+        // way this thread's unread state clears.
       }
       if (
         state.pendingThreadScrollTarget?.roomId === data.room_id &&
@@ -4957,13 +7016,17 @@ function handleBackendEvent(evt) {
         state.rightPanel.roomId === data.room_id &&
         state.rightPanel.root.event_id === data.thread_root_id
       ) {
-        state.rightPanel.events = [...data.events, ...state.rightPanel.events];
+        const oldEvents = state.rightPanel.events;
+        state.rightPanel.events = [...data.events, ...oldEvents];
         if (data.reached_start) {
           state.threadPaginationReachedStart.add(`${data.room_id}|${data.thread_root_id}`);
         } else {
           send("LoadMoreThreadReplies", { room_id: data.room_id, thread_root_id: data.thread_root_id });
         }
-        renderSidePanel();
+        // Inserts above what's already rendered instead of the full
+        // `renderSidePanel()` rebuild that used to run once per
+        // auto-paged-in page — see `prependThreadReplies`'s own comment.
+        if (!prependThreadReplies(data.thread_root_id, data.events, oldEvents)) renderSidePanel();
       }
       if (
         state.pendingThreadScrollTarget?.roomId === data.room_id &&
@@ -4983,8 +7046,19 @@ function handleBackendEvent(evt) {
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
       // Picks up any thread badges the main timeline couldn't show yet —
       // see `renderMessage`'s `threadCount` fallback comment for why the
-      // per-message bundled data alone isn't always enough.
-      if (data.room_id === state.selectedRoom) renderTimeline();
+      // per-message bundled data alone isn't always enough. Patches just
+      // the rows that are actually thread roots (most calls are no-ops —
+      // `rerenderMessageInPlace` itself skips anything not currently
+      // rendered) instead of a full `renderTimeline()` teardown, which
+      // used to fire *again* right on top of `LoadTimeline`'s own render
+      // (and again once more from the `Members` handler below) every
+      // single time a room was opened — three full timeline rebuilds
+      // back to back, each with its own scroll-to-bottom jump and image
+      // reload, is exactly what read as "the whole screen flickering" on
+      // room open.
+      if (data.room_id === state.selectedRoom) {
+        for (const t of data.threads) rerenderMessageInPlace(data.room_id, t.event_id);
+      }
       updateThreadsButtonBadge();
       break;
     case "ThreadsListAppend": {
@@ -4998,11 +7072,15 @@ function handleBackendEvent(evt) {
       if (data.reached_end) state.threadsListReachedEnd.add(data.room_id);
       state.threadsListPaginationInFlight.delete(data.room_id);
       if (state.rightPanel && state.rightPanel.kind === "threads-list") renderSidePanel();
-      if (data.room_id === state.selectedRoom) renderTimeline();
+      // Same in-place patch as `ThreadsList` above, same reasoning.
+      if (data.room_id === state.selectedRoom) {
+        for (const t of fresh) rerenderMessageInPlace(data.room_id, t.event_id);
+      }
       updateThreadsButtonBadge();
       break;
     }
-    case "Members":
+    case "Members": {
+      const hadMembersBefore = !!state.roomMembers[data.room_id];
       state.roomMembers[data.room_id] = data.members;
       // Presence isn't part of `Event::Members` itself (it's a separate,
       // account-wide sync stream — see `Command::GetPresence`'s doc
@@ -5010,7 +7088,38 @@ function handleBackendEvent(evt) {
       // presence dots filled in shortly after opening, without querying
       // presence for every user this session has ever seen a message from.
       send("GetPresence", { user_ids: data.members.map((m) => m[0]) });
+      // `applyMentionPills` (called from `renderMessage`) needs this same
+      // member list to turn a plain "@DisplayName" occurrence into a
+      // highlighted pill — but `Command::LoadTimeline`'s response and this
+      // one race, with no guaranteed order (see `selectRoom`, which fires
+      // both). When `Members` loses that race, whatever was already
+      // rendered went out with mentions un-pill-ified and *stayed* that
+      // way forever — nothing else ever asked `renderMessage` to look
+      // again. Re-rendering once, here, the first time this room's member
+      // list actually arrives (not on every later `ListMembers` — those
+      // are cache hits that skip sending the command at all, see
+      // `selectRoom`'s `if (!state.roomMembers[roomId])` guard) catches it
+      // up — always right around room-open time, before the user's had a
+      // chance to scroll. Patches every already-rendered row in place
+      // (`rerenderMessageInPlace`/`rerenderThreadMessageInPlace`) rather
+      // than a full `renderTimeline()`/`renderSidePanel()` teardown —
+      // those used to run right on top of `LoadTimeline`'s (and
+      // `openThread`'s) own render for every single room/thread open,
+      // which is what made opening one look like the whole screen
+      // flickering: a full rebuild, scroll-to-bottom jump, and every
+      // image reloading from cache, twice over for nothing but adding
+      // mention pills.
+      if (!hadMembersBefore && data.room_id === state.selectedRoom) {
+        for (const ev of state.timelines[data.room_id] || []) {
+          rerenderMessageInPlace(data.room_id, ev.event_id);
+        }
+        if (state.rightPanel?.kind === "thread" && state.rightPanel.roomId === data.room_id) {
+          rerenderThreadMessageInPlace(state.rightPanel.root.event_id);
+          for (const ev of state.rightPanel.events) rerenderThreadMessageInPlace(ev.event_id);
+        }
+      }
       break;
+    }
     case "Summary": {
       const req = state.summaryRequest;
       if (req && req.roomId === data.room_id && req.threadRootId === data.thread_root_id) {
@@ -5048,9 +7157,45 @@ function handleBackendEvent(evt) {
       break;
     }
     case "MessageSent":
-    case "MessageSendFailed":
+    case "MessageSendFailed": {
       if (type === "MessageSendFailed") console.error("send failed:", data.error);
+      // The live `/sync` echo (`NewMessage`/`ThreadReply`, both reconciled
+      // via `reconcileLocalEcho`) usually reaches `app.js` before this
+      // HTTP-response-driven event does and already deletes the
+      // `pendingSends` entry — nothing left to update here in that case,
+      // the placeholder's already gone.
+      const pending = state.pendingSends.get(data.local_id);
+      if (!pending) break;
+      const placeholderId = `local:${data.local_id}`;
+      let events, containerEl, ctx;
+      if (pending.threadId) {
+        if (state.rightPanel?.kind !== "thread" || state.rightPanel.root.event_id !== pending.threadId) break;
+        events = state.rightPanel.events;
+        containerEl = document.getElementById("thread-messages");
+        ctx = { roomId: pending.roomId, threadId: pending.threadId };
+      } else {
+        events = state.timelines[pending.roomId];
+        if (!events) break;
+        containerEl = pending.roomId === state.selectedRoom ? el.timeline : null;
+        ctx = { roomId: pending.roomId, threadId: null };
+      }
+      const idx = events.findIndex((e) => e.event_id === placeholderId);
+      if (idx === -1) break;
+      if (type === "MessageSendFailed") {
+        state.pendingSends.delete(data.local_id);
+        events[idx]._sendStatus = "failed";
+        events[idx]._sendError = data.error;
+      } else {
+        // Leave the `pendingSends` entry in place — the real event still
+        // hasn't arrived yet (that's what actually replaces this
+        // placeholder), this just clears the "sending…" label a little
+        // earlier than waiting for it would.
+        events[idx]._sendStatus = "sent";
+      }
+      const itemEl = containerEl?.querySelector(`.msg-item[data-event-id="${CSS.escape(placeholderId)}"]`);
+      if (itemEl) itemEl.replaceWith(renderMessageItem(events[idx], ctx));
       break;
+    }
     case "ImageBytes": {
       const declaredMime = state.imageMime[data.key];
       const sniffed = declaredMime || sniffImageMime(new Uint8Array(data.bytes));
@@ -5061,7 +7206,7 @@ function handleBackendEvent(evt) {
         // reaches here at all, see the render-time check).
         state.imageUnviewable[data.key] = sniffed;
       } else {
-        state.imageCache[data.key] = bytesToDataUrl(data.bytes, declaredMime);
+        state.imageCache[data.key] = bytesToImageUrl(data.bytes, declaredMime);
       }
       delete imageFetchAttempts[data.key];
       // One image can back several rendered rows — the main timeline,
@@ -5085,6 +7230,18 @@ function handleBackendEvent(evt) {
       if (openThreadMemePicker && openThreadMemePicker.style.display !== "none" && state.rightPanel?.kind === "thread") {
         renderMemePicker(openThreadMemePicker, state.rightPanel.roomId, state.rightPanel.root.event_id);
       }
+      // A pinned image's thumbnail finishing its download — same
+      // "reopen in place" refresh `PinnedEvents`/`EventPreview` use for
+      // this dialog.
+      if (state.pinnedEventsDialogRoomId && document.querySelector(".dialog-box h3")?.textContent === "pinned messages") {
+        closeDialog();
+        openPinsDialog(state.pinnedEventsDialogRoomId);
+      }
+      // A thread-list row's own thumbnail (root message or bundled
+      // latest-reply) finishing its download — same "just re-render the
+      // panel" refresh as everything else above, cheap enough since this
+      // panel is never more than a couple hundred rows.
+      if (state.rightPanel?.kind === "threads-list") renderThreadsListRows();
       break;
     }
     case "ImageFetchFailed": {
@@ -5115,6 +7272,16 @@ function handleBackendEvent(evt) {
       state.notificationModes[data.room_id] = data.mode;
       if (data.room_id === state.selectedRoom) updateNotificationModeUi();
       break;
+    case "RoomFavoriteSet": {
+      const room = state.rooms.find((r) => r.room_id === data.room_id);
+      if (room) {
+        room.is_favorite = data.favorite;
+        sortRoomsList();
+        renderRooms();
+      }
+      if (data.room_id === state.selectedRoom) updateFavoriteButtonLabel(room);
+      break;
+    }
     case "NotificationClicked":
       selectRoom(data.room_id);
       window.focus?.();
@@ -5170,6 +7337,14 @@ function handleBackendEvent(evt) {
         closeDialog();
         openPinsDialog(data.room_id);
       }
+      // Same idea for any shared-link preview card(s) still showing
+      // "loading shared message..." for this exact event — patch them in
+      // place rather than needing a full re-render to pick it up.
+      document
+        .querySelectorAll(
+          `a.shared-link-preview[data-shared-room-id="${CSS.escape(data.room_id)}"][data-shared-event-id="${CSS.escape(data.event_id)}"]`
+        )
+        .forEach((a) => renderSharedLinkPreviewInto(a, data.room_id, data.event_id, state.selectedRoom));
       break;
     }
     case "MessageSearchResult":
@@ -5261,6 +7436,11 @@ function handleBackendEvent(evt) {
       state.allUsers = data.users;
       state.allUsersLoading = false;
       renderUserSearchDialogList();
+      renderInviteDialogList();
+      break;
+    case "DirectoryUsers":
+      state.directorySearch = { query: data.query, users: data.users };
+      renderInviteDialogList();
       break;
     case "UserMessagesSearchResult":
       if (state.rightPanel?.kind === "user-search" && state.rightPanel.userId === data.user_id) {
@@ -5328,6 +7508,34 @@ function handleBackendEvent(evt) {
   }
 }
 
+// A plain `setInterval(pollEvents, 150)` forever, on every platform, was
+// tried as a genuine push-based replacement once already (via Tauri's own
+// `event.listen`/`emit`) — reverted after a real-device test showed it
+// hanging completely at boot: a real race, not a config problem (see
+// `poll_events`'s doc comment in lib.rs for the full story — the short
+// version is that the worker's own unprompted first `SessionChecked`/
+// `LoggedIn` pair routinely fires *before* this script has finished
+// loading far enough to register a listener for it, and `emit()` doesn't
+// replay anything for a listener that subscribes late). Polling stays,
+// but the interval is no longer a flat 150ms everywhere: on Android,
+// where `ForegroundSyncService` deliberately keeps this whole process
+// (webview included) running around the clock so notifications keep
+// arriving while backgrounded, waking something up ~7 times a second, all
+// day, every day, regardless of whether the screen's even on was a real,
+// continuous, reported battery cost ("app cực kỳ tốn pin") — the process
+// never got to reach a deep idle state. `document.visibilityState`
+// slows this down while the page isn't visible (screen off, or another
+// app in front) and speeds back up the moment it is; a slower background
+// tick still delivers a new-message notification within ~1s of it
+// arriving, unnoticeable for a chat app, for a meaningful cut in how
+// often anything wakes up at all while nobody's looking at the screen.
+const POLL_INTERVAL_VISIBLE_MS = 150;
+const POLL_INTERVAL_HIDDEN_MS = 1000;
+let pollIntervalId = null;
+function setPollInterval(ms) {
+  if (pollIntervalId !== null) clearInterval(pollIntervalId);
+  pollIntervalId = setInterval(pollEvents, ms);
+}
 async function pollEvents() {
   try {
     const events = await invoke("poll_events");
@@ -5336,7 +7544,15 @@ async function pollEvents() {
     console.error("poll_events failed:", err);
   }
 }
-setInterval(pollEvents, 150);
+setPollInterval(document.hidden ? POLL_INTERVAL_HIDDEN_MS : POLL_INTERVAL_VISIBLE_MS);
+document.addEventListener("visibilitychange", () => {
+  setPollInterval(document.hidden ? POLL_INTERVAL_HIDDEN_MS : POLL_INTERVAL_VISIBLE_MS);
+  // A message that arrived while backgrounded (polled at the slower
+  // interval) may have been sitting queued for up to
+  // `POLL_INTERVAL_HIDDEN_MS` — catch up immediately on the way back to
+  // visible instead of waiting out whatever's left of that tick.
+  if (!document.hidden) pollEvents();
+});
 
 // =========================================================================
 // Resizable panels
@@ -5347,14 +7563,34 @@ function setupResizer(handle, panel, { fromRight } = {}) {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = panel.getBoundingClientRect().width;
+    // Read once, outside the move handler — `getComputedStyle` forces a
+    // synchronous layout recalculation, and `min-width` doesn't change
+    // mid-drag, so re-reading it on every single mousemove event (every
+    // few pixels of movement) was pure layout-thrashing for no benefit.
+    const min = parseInt(getComputedStyle(panel).minWidth, 10) || 120;
     handle.classList.add("dragging");
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
 
-    function onMove(ev) {
-      const delta = fromRight ? startX - ev.clientX : ev.clientX - startX;
-      const min = parseInt(getComputedStyle(panel).minWidth, 10) || 120;
+    // Throttled to one width write per animation frame — same reasoning
+    // as the room list / timeline scroll handlers elsewhere in this file:
+    // a mouse can fire `mousemove` far faster than the page can usefully
+    // repaint, so writing `style.width` on every one of them just piles
+    // up redundant layout work the browser hasn't even finished from the
+    // last write yet.
+    let pendingEv = null;
+    let rafPending = false;
+    function applyPendingMove() {
+      rafPending = false;
+      if (!pendingEv) return;
+      const delta = fromRight ? startX - pendingEv.clientX : pendingEv.clientX - startX;
       panel.style.width = Math.max(min, startWidth + delta) + "px";
+    }
+    function onMove(ev) {
+      pendingEv = ev;
+      if (rafPending) return;
+      rafPending = true;
+      requestAnimationFrame(applyPendingMove);
     }
     function onUp() {
       handle.classList.remove("dragging");
@@ -5431,7 +7667,14 @@ let jumpHighlightTimer = null;
  * rather than left behind, if another jump happens first). */
 function scrollToMessage(containerId, eventId) {
   const container = document.getElementById(containerId);
-  const target = container?.querySelector(`[data-event-id="${CSS.escape(eventId)}"]`);
+  // `.msg-item`, never the group's own `.msg-row` — the row's own
+  // `data-event-id` is just its *first* message's id (see
+  // `renderMessageGroup`), which for any message past the first in its
+  // group would otherwise resolve to the wrong element (and the wrong
+  // one entirely for a plain `[data-event-id]` query, which matches the
+  // ancestor row before its descendant item in document order). Every
+  // message, first-in-group or not, has its own `.msg-item`.
+  const target = container?.querySelector(`.msg-item[data-event-id="${CSS.escape(eventId)}"]`);
   if (!target) {
     showToast("original message isn't loaded — try loading more history");
     return;
@@ -5449,7 +7692,7 @@ function scrollToMessage(containerId, eventId) {
     // has moved on, so this only matters for a row that's still mounted
     // from before and would otherwise keep showing a stale highlight.
     document
-      .querySelectorAll(`[data-event-id="${CSS.escape(lastJumpHighlightedEventId)}"].jump-highlight`)
+      .querySelectorAll(`.msg-item[data-event-id="${CSS.escape(lastJumpHighlightedEventId)}"].jump-highlight`)
       .forEach((row) => row.classList.remove("jump-highlight"));
   }
   target.classList.add("jump-highlight");
@@ -5458,7 +7701,7 @@ function scrollToMessage(containerId, eventId) {
   if (jumpHighlightTimer) clearTimeout(jumpHighlightTimer);
   jumpHighlightTimer = setTimeout(() => {
     document
-      .querySelectorAll(`[data-event-id="${CSS.escape(eventId)}"].jump-highlight`)
+      .querySelectorAll(`.msg-item[data-event-id="${CSS.escape(eventId)}"].jump-highlight`)
       .forEach((row) => row.classList.remove("jump-highlight"));
     lastJumpHighlightedEventId = null;
     jumpHighlightTimer = null;
@@ -5530,6 +7773,27 @@ document.addEventListener("click", (e) => {
   openMatrixToLink(decodeURIComponent(m[1]), decodeURIComponent(m[2]), threadRootId ? decodeURIComponent(threadRootId) : null);
 });
 
+/** Every other `http(s)://` link `marked`'s autolinker produces inside a
+ * rendered message body — routed to `Command::OpenUrl` (the system
+ * browser) instead of left to the webview's own default navigation.
+ * Without this, clicking one just navigated *this* window's webview to
+ * the target page, replacing the whole app in place — clicking "back"
+ * isn't wired up anywhere, so from the user's side that looked less like
+ * "opened a link" and more like the app breaking. Guarded so it only
+ * fires for a plain external link, never the matrix.to handler above
+ * (that one's already returned by then, via its own `e.preventDefault()`)
+ * or an in-app anchor with no real navigation to hijack (mentions,
+ * "javascript:" markdown-toolbar hooks, ...). */
+document.addEventListener("click", (e) => {
+  if (e.defaultPrevented) return;
+  const a = e.target.closest("a[href]");
+  if (!a) return;
+  const href = a.getAttribute("href") || "";
+  if (!/^https?:\/\//i.test(href)) return;
+  e.preventDefault();
+  send("OpenUrl", { url: href });
+});
+
 /** Scrolls to `eventId` in `roomId`'s main timeline like `scrollToMessage`
  * does, but — unlike that one — doesn't just give up with a toast when the
  * message isn't in whatever page happens to be loaded yet. A shared link
@@ -5538,7 +7802,7 @@ document.addEventListener("click", (e) => {
  * room with no way to tell which message it was is worse than just
  * waiting a moment: this keeps calling `PaginateBack` (via
  * `state.pendingScrollSearch`, resumed from the `TimelinePrepend` handler
- * in `poll_events`) until the target turns up or the room's actual start
+ * in `handleBackendEvent`) until the target turns up or the room's actual start
  * is reached, so the caller only ever needs to fire this once. */
 // Generous upper bound on how many `PaginateBack` pages a "jump to shared
 // message" search will chase before giving up — without this, a search
@@ -5735,6 +7999,21 @@ function openMatrixToLink(roomId, eventId, threadRootId) {
   send("ResolveSharedEvent", { room_id: roomId, event_id: eventId });
 }
 
+// Shows whatever `reloadToLogin` stashed right before this exact reload
+// (a session-expired or logout explanation) on the login form it reloaded
+// onto, then clears it — a fresh reload with nothing stashed (a normal
+// app launch) leaves the login form's error box untouched, same as
+// before this existed.
+try {
+  const postReloadMessage = sessionStorage.getItem("postReloadLoginMessage");
+  if (postReloadMessage) {
+    sessionStorage.removeItem("postReloadLoginMessage");
+    showLoginError(postReloadMessage);
+  }
+} catch {
+  // Same private-browsing-style storage-block tolerance as `reloadToLogin`.
+}
+
 // ---- Boot ----
 // No `send("CheckSession")` here anymore — the Rust worker now runs that
 // check itself the instant it starts (see `matrix/worker.rs::run`), and
@@ -5745,3 +8024,49 @@ function openMatrixToLink(roomId, eventId, threadRootId) {
 // host process restarting doesn't reliably mean the WebView's page came
 // back up fresh with it), so a boot-time `send` from here could simply
 // never fire, leaving a perfectly valid stored session unchecked.
+
+// ---- iOS notification tap (no gen/ios project exists yet — see below) ----
+// Android's notification-tap routing (`Event::NotificationClicked`, handled
+// above in `handleBackendEvent`) goes through a native `MainActivity.kt`
+// workaround re-firing the tap as a `matrixtauriclient://notification`
+// deep link, because tapping an Android notification just relaunches the
+// Activity with no in-process callback of its own (see that file's own
+// comment). iOS has no such gap — `tauri-plugin-notification`'s iOS side
+// (`NotificationHandler.swift::didReceive`) delivers a tap straight to JS
+// as this plugin event, in-process, every time (cold start included) — no
+// deep-link workaround needed there at all.
+//
+// One real gap remains before this actually routes to the right room/
+// thread on iOS, though: `platform.rs::show_notification` attaches
+// `room_id`/`thread_id` as this notification's `extra` payload (same as
+// Android), and the iOS plugin *does* stash that into the system
+// notification's `content.userInfo["__EXTRA__"]` when showing it
+// (`ios/Sources/Notification.swift::makeNotificationContent`) — but its
+// `didReceive` handler's `toActiveNotification()` never reads it back out
+// into the `ActiveNotification` struct this JS event actually receives
+// (`ios/Sources/NotificationHandler.swift`, tauri-plugin-notification
+// 2.3.3). `data.notification` below will have `title`/`body` but no
+// `extra` until that's patched. Once `cargo tauri ios init` has generated
+// `gen/ios` (needs actual Xcode — not possible on this machine, see the
+// conversation this comment was written in), fix it there by:
+//   1. In `NotificationHandler.swift`, add `let extra: [String: Any]?` to
+//      the `ActiveNotification` struct and set it in `toActiveNotification`
+//      from `request.content.userInfo["__EXTRA__"]`.
+//   2. Below, read `data.notification.extra.room_id`/`.thread_id` instead
+//      of the `TODO` placeholders.
+// Left wired up now (rather than skipped entirely) so the one remaining
+// change is a small, obvious Swift edit instead of also having to
+// rediscover this whole plugin-event/room-routing gap from scratch later.
+if (window.__TAURI__?.event?.listen) {
+  window.__TAURI__.event.listen("plugin:notification://actionPerformed", (event) => {
+    const data = event.payload;
+    if (!data || data.actionId !== "tap") return;
+    // TODO(ios): swap these two for data.notification.extra.room_id /
+    // .thread_id once the Swift-side patch above is in — until then this
+    // listener is wired but can't actually know which room to open.
+    const roomId = data.notification?.extra?.room_id;
+    const threadId = data.notification?.extra?.thread_id;
+    if (!roomId) return;
+    handleBackendEvent({ type: "NotificationClicked", data: { room_id: roomId, thread_id: threadId || null } });
+  });
+}

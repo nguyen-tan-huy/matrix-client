@@ -40,7 +40,9 @@
             <button id="btn-user-search" class="small-btn" title="find every message from one user, across all rooms">[ user msgs ]</button>
             <button id="btn-message-search" class="small-btn" title="search message text, across all rooms">[ search ]</button>
             <button id="btn-theme" class="small-btn" title="theme: follows system">[ theme: system ]</button>
+            <button id="btn-font-settings" class="small-btn" title="font family & size for the whole app">[ font ]</button>
             <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ shortcuts ]</button>
+            <button id="btn-logout" class="small-btn" title="sign out of this session">[ logout ]</button>
           </div>
         </div>
       </div>
@@ -49,6 +51,7 @@
     <div id="room-filter-row">
       <input id="room-filter" placeholder="search rooms..." />
       <button id="btn-unread-only" class="small-btn" title="show only rooms with unread messages">[ unread ]</button>
+      <button id="btn-mentions-only" class="small-btn" title="show only rooms with an unread mention of you">[ @mentions ]</button>
     </div>
     <div id="room-list-items"></div>
   </div>
@@ -63,6 +66,7 @@
         <div id="room-menu-wrap">
           <button id="btn-room-menu" class="small-btn">[ ⋯ ]</button>
           <div id="room-menu" style="display:none;">
+            <button id="btn-favorite-room" class="small-btn">[ ☆ favorite ]</button>
             <button id="btn-invite" class="small-btn">[ invite ]</button>
             <button id="btn-leave-room" class="small-btn">[ leave ]</button>
             <select id="notification-mode">
@@ -90,16 +94,18 @@
     <div id="edit-indicator" style="display:none;"></div>
     <div id="mention-suggestions" style="display:none;"></div>
     <div id="pending-image-preview" style="display:none;"></div>
+    <div id="pending-file-preview" style="display:none;"></div>
     <div id="compose-toolbar" class="compose-toolbar" style="display:none;">
       <button type="button" class="md-btn" data-md="bold" title="bold (Ctrl+B)"><b>B</b></button>
       <button type="button" class="md-btn" data-md="italic" title="italic (Ctrl+I)"><i>I</i></button>
       <button type="button" class="md-btn" data-md="code" title="inline code (Ctrl+E)">code</button>
       <button type="button" class="md-btn" data-md="codeblock" title="code block (Ctrl+Shift+E)">{ }</button>
       <button type="button" class="md-btn" data-md="link" title="link">link</button>
+      <button type="button" class="md-btn emoji-btn" title="emoji">🙂</button>
     </div>
     <div id="compose-row" style="display:none;">
       <div id="meme-picker-wrap">
-        <button id="btn-compose-plus" class="small-btn" title="attach image / emoji / voice message / poll">+</button>
+        <button id="btn-compose-plus" class="small-btn" title="attach image / file / emoji / voice message / poll">+</button>
         <div id="meme-picker" style="display:none;"></div>
       </div>
       <div class="compose-editor-wrap">
@@ -107,6 +113,7 @@
       </div>
       <button id="compose-send">send</button>
       <input type="file" id="file-input" accept="image/*" style="display:none;" />
+      <input type="file" id="generic-file-input" style="display:none;" />
       <input type="file" id="import-keys-file-input" accept=".txt" style="display:none;" />
       <input type="file" id="avatar-file-input" accept="image/*" style="display:none;" />
     </div>
@@ -115,6 +122,14 @@
   <div id="side-panel" style="display:none;"></div>
 </div>
 
+<!-- Vendored (not CDN-loaded — this app runs offline besides its actual
+     Matrix API calls) markdown rendering: `marked` parses to HTML, then
+     `DOMPurify` sanitizes it before it ever reaches an `innerHTML` — see
+     `renderMarkdown()` in app.js for why that second step is load-bearing,
+     not optional (marked itself passes raw HTML in the source straight
+     through, and message bodies come from other, untrusted room members). -->
+<script src="marked.min.js"></script>
+<script src="purify.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
