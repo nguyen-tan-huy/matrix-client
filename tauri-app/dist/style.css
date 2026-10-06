@@ -1,30 +1,54 @@
-/* Always dark, near-black terminal-tool look (amber accent) — one fixed
- * palette regardless of OS light/dark setting, rather than the old
- * light-by-default/dark-when-the-OS-says-so pair. */
+/* Two themes only, matching the "liquid glass" shell of swayctl-center
+ * (swayctl_center/themes.py): dark glass with light text (default) and
+ * light glass with black text, selected via `data-theme` on <html> (see
+ * `applyThemeOverride()` in app.js). Panes are translucent over a soft
+ * backdrop with `backdrop-filter`, controls are pills with hairline
+ * borders. */
 :root {
   color-scheme: dark;
-  --bg: #0a0a0c;
-  --bg-alt: #18171b;
-  --border: #2b2930;
-  --text: #e7e4e0;
-  --text-weak: #8d8891;
-  --accent: #d9a441;
-  --accent-strong: #eab659;
-  --danger: #e6919c;
-  --radius: 8px;
+  --bg: #1c1c1e;
+  --bg-alt: #2c2c2e;
+  --border: rgba(255, 255, 255, 0.1);
+  --text: #f5f5f7;
+  --text-weak: #98989d;
+  --accent: #0a84ff;
+  --accent-strong: #409cff;
+  --danger: #ff6961;
+  --radius: 10px;
+  --glass: rgba(44, 44, 46, 0.55);
+  --glass-strong: rgba(36, 36, 38, 0.82);
+  --control: rgba(255, 255, 255, 0.08);
+  --control-hover: rgba(255, 255, 255, 0.14);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  --app-bg:
+    radial-gradient(1200px 700px at 0% 0%, rgba(10, 132, 255, 0.16), transparent 60%),
+    radial-gradient(900px 600px at 100% 100%, rgba(191, 90, 242, 0.12), transparent 60%),
+    #111113;
   /* Overridable via the "[ font ]" settings dialog (see `applyFontSettings()`
-   * in app.js, same `root.style.setProperty` pattern as the theme override
-   * above) — kept as vars rather than hardcoded on `html, body` below so a
+   * in app.js) — kept as vars rather than hardcoded on `html, body` below so a
    * user override doesn't need its own separate CSS rule to win. */
   --font-family: "Inter", "Noto Sans", "DejaVu Sans", sans-serif;
   --font-size: 15px;
 }
-
-@media (prefers-color-scheme: light) {
-  /* Deliberately empty — this theme no longer has a light variant, but an
-   * explicit block (even an empty one) documents that the omission is
-   * intentional rather than a leftover gap, for whoever next touches this
-   * file expecting the old light/dark pair. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f5f7;
+  --bg-alt: #ffffff;
+  --border: rgba(0, 0, 0, 0.1);
+  --text: #1d1d1f;
+  --text-weak: #6e6e73;
+  --accent: #0a84ff;
+  --accent-strong: #0066d6;
+  --danger: #d70015;
+  --glass: rgba(255, 255, 255, 0.6);
+  --glass-strong: rgba(250, 250, 252, 0.88);
+  --control: rgba(0, 0, 0, 0.05);
+  --control-hover: rgba(0, 0, 0, 0.09);
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+  --app-bg:
+    radial-gradient(1200px 700px at 0% 0%, rgba(10, 132, 255, 0.14), transparent 60%),
+    radial-gradient(900px 600px at 100% 100%, rgba(191, 90, 242, 0.1), transparent 60%),
+    #e9e9ee;
 }
 
 * { box-sizing: border-box; }
@@ -69,7 +93,7 @@ html, body {
    * to in the first place.
    */
   height: var(--app-height, 100%);
-  background: var(--bg);
+  background: var(--app-bg);
   color: var(--text);
   font-family: var(--font-family);
   font-size: var(--font-size);
@@ -78,7 +102,7 @@ html, body {
 button, input, textarea {
   font-family: inherit;
   font-size: inherit;
-  background: var(--bg-alt);
+  background: var(--control);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -88,7 +112,7 @@ button, input, textarea {
 button {
   cursor: pointer;
 }
-button:hover { border-color: var(--accent); }
+button:hover { background: var(--control-hover); }
 button:disabled { color: var(--text-weak); cursor: default; }
 
 #login-screen {
@@ -295,6 +319,68 @@ button:disabled { color: var(--text-weak); cursor: default; }
    */
   overflow: hidden;
 }
+/* Desktop-only favorite tabs (see `renderFavoriteTabs()` in app.js) —
+ * favorited rooms live here instead of in the room list. Hidden in the
+ * narrow layout, where favorites stay in the list as before. */
+/* Wraps the tab bar above the timeline + side panel row, so favorite
+ * tabs span both. Flattened with `display: contents` in the narrow
+ * layout, which keeps the original pane structure there. */
+#content-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+#content-row {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+#favorite-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 6px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+#favorite-tabs:empty { display: none; }
+.fav-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 10px;
+  font-size: calc(var(--font-size) - 2px);
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  color: var(--text-weak);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  user-select: none;
+}
+.fav-tab:hover { color: var(--text); background: var(--bg); }
+.fav-tab.selected {
+  color: var(--text);
+  background: var(--bg);
+  border-color: var(--border);
+  margin-bottom: -1px;
+}
+.fav-tab-name { white-space: nowrap; }
+.fav-tab-name.unread { color: var(--text); font-weight: bold; }
+.fav-tab-close {
+  background: none;
+  border: none;
+  color: var(--text-weak);
+  cursor: pointer;
+  padding: 0 2px;
+  opacity: 0;
+}
+.fav-tab:hover .fav-tab-close, .fav-tab.selected .fav-tab-close { opacity: 1; }
+.fav-tab-close:hover { color: var(--danger); }
 #timeline-header {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
@@ -1341,6 +1427,8 @@ button:disabled { color: var(--text-weak); cursor: default; }
  * "medium" breakpoint right below requires the opposite of this pairing
  * for exactly this reason, so the two can never both match at once. */
 @media (max-width: 720px), (max-height: 500px), (hover: none) and (pointer: coarse) {
+  #favorite-tabs { display: none !important; }
+  #content-area, #content-row { display: contents; }
   #room-list {
     width: 100%;
     min-width: 0;
@@ -1640,3 +1728,162 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .poll.ended .poll-option { cursor: default; }
 .poll-list-item { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; margin-bottom: 8px; }
 .poll-list-room { color: var(--text-weak); font-size: calc(var(--font-size) - 4px); margin-bottom: 4px; }
+
+
+/* ---- Liquid glass surfaces (see the theme comment at the top) ---------- */
+.small-btn { border-radius: 999px; }
+input:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+#room-list, #side-panel, #favorite-tabs, #timeline-header, #compose-row, .compose-toolbar {
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  backdrop-filter: blur(30px) saturate(180%);
+}
+#room-list { border-right: 1px solid var(--border); }
+#side-panel { border-left: 1px solid var(--border); }
+.room-row { border-radius: var(--radius); }
+.room-row:hover { background: var(--control); }
+.room-row.selected { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.fav-tab.selected { background: var(--glass-strong); }
+.fav-tab:hover { background: var(--control); }
+#chats-menu, #room-menu, .dialog-box, .actions-menu, .emoji-picker, .reaction-picker, #mention-suggestions {
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  backdrop-filter: blur(30px) saturate(180%);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+.dialog-box { border-radius: 20px; }
+#compose-send { background: var(--accent); color: #fff; border-color: transparent; border-radius: 999px; }
+#compose-send:hover { background: var(--accent-strong); }
+/* Narrow layout: the side panel is a full-screen overlay there, so it
+ * stays opaque instead of showing the timeline through the glass. */
+@media (max-width: 720px), (max-height: 500px), (hover: none) and (pointer: coarse) {
+  #side-panel { background: var(--bg); }
+}
+
+/* ---- Desktop: liquid glass like swayctl-center's settings window --------
+ * Mirrors swayctl_center/modules/components.py::app_glass_css. The Linux
+ * window is transparent (tauri.linux.conf.json) and swayctl-fx puts glass
+ * behind it (`sway_glass.rs` sends the window rule), shaped by what the
+ * page draws — so the window itself draws nothing, and everything visible
+ * sits on a pane of glass: a pill or card with a light tint, a dark
+ * 0.75px edge and a lit top rim. No outer shadows (they would be drawn as
+ * glass too). Desktop-only; the narrow/mobile layout keeps the opaque
+ * look above. */
+@media (min-width: 721px) and (min-height: 501px) and (hover: hover) and (pointer: fine) {
+  :root {
+    /* dark is smoked glass: surface #1c1c1e at swayctl's DARK_SMOKE (0.45) */
+    --g-pane: linear-gradient(180deg, rgba(28, 28, 30, 0.52), rgba(28, 28, 30, 0.405));
+    --g-chip: rgba(28, 28, 30, 0.45);
+    --g-hover: rgba(245, 245, 247, 0.1);
+    --g-edge: 0.75px solid rgba(0, 0, 0, 0.55);
+    --g-rim: inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    --g-popover: rgba(28, 28, 30, 0.9);
+    --g-text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  }
+  :root[data-theme="light"] {
+    /* light is clear glass (swayctl's light tint is ~0): only a whisper
+     * of #f5f5f7, the compositor's glass does the rest */
+    --g-pane: linear-gradient(180deg, rgba(245, 245, 247, 0.1), rgba(245, 245, 247, 0.04));
+    --g-chip: rgba(245, 245, 247, 0.06);
+    --g-hover: rgba(29, 29, 31, 0.07);
+    --g-popover: rgba(245, 245, 247, 0.92);
+    --g-text-shadow: 0 1px 1px rgba(255, 255, 255, 0.45);
+  }
+
+  /* the window draws nothing but the panes */
+  html, body, #chat-screen, #login-screen, #content-area, #content-row, #main-panel,
+  #timeline, #timeline-wrap, #room-list, #room-list-items, #side-panel, #side-panel-body,
+  #favorite-tabs, #compose-row, .compose-toolbar, #room-filter-row, #space-picker {
+    background: none !important;
+    border-color: transparent !important;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+  body { text-shadow: var(--g-text-shadow); }
+
+  /* headers: one pill of glass each, like the settings headerbar */
+  #room-list-header, #timeline-header, #side-panel-header {
+    background: var(--g-pane) !important;
+    border: var(--g-edge) !important;
+    border-radius: 999px;
+    box-shadow: var(--g-rim);
+    margin: 8px 8px 4px;
+    padding: 6px 8px 6px 14px;
+  }
+
+  /* cards: message groups, pinned banner, reply/edit bars, login */
+  .msg-row .bubble, #pinned-banner, #reply-indicator, #edit-indicator, .login-box, #timeline-placeholder {
+    background: var(--g-pane) !important;
+    border: var(--g-edge) !important;
+    border-radius: 18px;
+    box-shadow: var(--g-rim);
+  }
+  .msg-row .bubble { padding: 6px 12px; }
+  #pinned-banner, #reply-indicator, #edit-indicator { margin: 4px 8px; }
+  .login-box { padding: 20px; }
+  #timeline-placeholder { display: table; margin: 40px auto 0; padding: 6px 14px; border-radius: 999px; }
+
+  /* list rows: one pill per row. Spacing via a transparent border, not
+   * margin — the virtualized room list measures rows with
+   * getBoundingClientRect (margins excluded). */
+  /* thread rows: real cards, same as message groups (not virtualized, so
+   * margins are fine) */
+  .thread-row {
+    background: var(--g-pane) !important;
+    border: var(--g-edge) !important;
+    border-radius: 18px;
+    box-shadow: var(--g-rim);
+    margin: 4px 8px;
+    content-visibility: visible;
+  }
+  .thread-row:hover { background: var(--g-hover) !important; }
+  .room-row {
+    background: var(--g-chip) !important;
+    background-clip: padding-box !important;
+    border: 3px solid transparent !important;
+    border-radius: 18px;
+    box-shadow: inset 0 0 0 0.75px rgba(0, 0, 0, 0.55), var(--g-rim);
+    margin: 0 4px;
+  }
+  .room-row:hover { background: var(--g-hover) !important; }
+  .room-row.selected, .fav-tab.selected, #space-picker button.selected {
+    background: rgba(10, 132, 255, 0.85) !important;
+    color: #fff !important;
+    text-shadow: none;
+  }
+  .room-row.selected .room-name, .fav-tab.selected .fav-tab-name { color: #fff; }
+
+  /* controls */
+  button, select, .fav-tab {
+    background: var(--g-chip) !important;
+    border: var(--g-edge) !important;
+    box-shadow: var(--g-rim);
+    border-radius: 999px;
+    color: var(--text);
+  }
+  button:hover, .fav-tab:hover { background: var(--g-hover) !important; }
+  .fav-tab { margin-bottom: 4px; }
+  input, textarea {
+    background: var(--g-chip) !important;
+    border: var(--g-edge) !important;
+    box-shadow: var(--g-rim);
+    border-radius: 12px;
+  }
+  #compose-send, .jump-latest-btn {
+    background: rgba(10, 132, 255, 0.9) !important;
+    color: #fff;
+    text-shadow: none;
+  }
+
+  /* menus/dialogs sit over the page's own content (no glass behind them
+   * there), so they stay near-opaque to keep their text readable */
+  #chats-menu, #room-menu, .dialog-box, .actions-menu, .emoji-picker, .reaction-picker, #mention-suggestions {
+    background: var(--g-popover) !important;
+    border: var(--g-edge);
+    box-shadow: var(--g-rim);
+    text-shadow: none;
+  }
+}

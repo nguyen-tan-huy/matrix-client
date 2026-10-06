@@ -2109,7 +2109,7 @@ async fn handle(
             room.set_is_favourite(favorite, None).await?;
             tx.send(Event::RoomFavoriteSet { room_id, favorite }).ok();
         }
-        Command::ShowNotification { room_id, thread_id, title, body } => {
+        Command::ShowNotification { room_id, thread_id, title, body, icon_mxc, icon_png } => {
             // Only the Linux (D-Bus/xdg) backend has an async API
             // (`show_async`/`wait_for_action_async`) — Windows and macOS's
             // backends in this crate are sync-only (`show`/
@@ -2122,12 +2122,19 @@ async fn handle(
             // clicked/closed, which under swaync's DND is never — leaking
             // connections until dbus-broker ran out of fds and crashed the
             // session. See that module's doc comment.
+            #[cfg(not(target_os = "linux"))]
+            let _ = (icon_mxc, icon_png);
             #[cfg(target_os = "linux")]
             {
+                let image = match (icon_mxc.as_deref(), icon_png.as_deref()) {
+                    (Some(mxc), _) => notification_avatar_path(&state, mxc).await,
+                    (None, Some(png)) => notification_initial_avatar_path(png),
+                    (None, None) => None,
+                };
                 let on_click = move || {
                     tx.send(Event::NotificationClicked { room_id, thread_id }).ok();
                 };
-                if let Err(err) = crate::desktop_notify::show(&title, &body, on_click).await {
+                if let Err(err) = crate::desktop_notify::show(&title, &body, image.as_deref(), on_click).await {
                     tracing::warn!(error = %err, "failed to show desktop notification");
                 }
             }
@@ -4809,6 +4816,87 @@ async fn download_media_bytes(
     let mut decrypted = Vec::new();
     std::io::Read::read_to_end(&mut decryptor, &mut decrypted)?;
     Ok(decrypted)
+}
+
+/// Local file holding a small thumbnail of an avatar, for use as a desktop
+/// notification's `image-path` — notification daemons need a file path
+/// (or raw pixels), not an `mxc://` URI. Cached on disk per `mxc` (avatar
+/// URIs are immutable: a changed avatar gets a new one), so a busy room
+/// doesn't refetch it for every message. `None` on any failure, which
+/// just leaves the notification showing the app icon instead.
+#[cfg(target_os = "linux")]
+async fn notification_avatar_path(state: &Arc<Mutex<WorkerState>>, mxc_uri: &str) -> Option<std::path::PathBuf> {
+    let path = data_dir()
+        .join("notification-avatars")
+        .join(sanitize_filename(mxc_uri.trim_start_matches("mxc://")));
+    if path.exists() {
+        return Some(path);
+    }
+    let fetch = async {
+        let client = get_client(state).await?;
+        let mxc = matrix_sdk::ruma::OwnedMxcUri::from(mxc_uri.to_string());
+        let (server_name, media_id) = mxc.parts()?;
+        let token = client
+            .access_token()
+            .ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        let url = format!(
+            "{}_matrix/client/v1/media/thumbnail/{server_name}/{media_id}?width=96&height=96&method=crop",
+            client.homeserver()
+        );
+        let bytes = media_http_client()
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        // Written under a temp name first so a half-written file never
+        // gets picked up by the `exists()` check above.
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        anyhow::Ok(())
+    };
+    match fetch.await {
+        Ok(()) => Some(path),
+        Err(err) => {
+            tracing::warn!(mxc_uri, error = %err, "failed to fetch notification avatar");
+            None
+        }
+    }
+}
+
+/// Counterpart to `notification_avatar_path` for a sender with no avatar
+/// image: writes the frontend-drawn colored-initial PNG to a file named by
+/// its content hash, so each distinct one is only written once.
+#[cfg(target_os = "linux")]
+fn notification_initial_avatar_path(png_base64: &str) -> Option<std::path::PathBuf> {
+    use base64::Engine as _;
+    use std::hash::{Hash, Hasher};
+    let write = || {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(png_base64)?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let path = data_dir()
+            .join("notification-avatars")
+            .join(format!("initial-{:016x}.png", hasher.finish()));
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let tmp = path.with_extension("part");
+            std::fs::write(&tmp, &bytes)?;
+            std::fs::rename(&tmp, &path)?;
+        }
+        anyhow::Ok(path)
+    };
+    match write() {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to write notification initial avatar");
+            None
+        }
+    }
 }
 
 /// Strips anything that isn't a reasonably safe filename character, so a

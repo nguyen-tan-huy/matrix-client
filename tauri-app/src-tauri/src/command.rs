@@ -319,6 +319,14 @@ pub enum Command {
         thread_id: Option<String>,
         title: String,
         body: String,
+        /// Sender's avatar (`mxc://`), shown as the notification's image
+        /// on desktop Linux. `None` falls back to the app icon.
+        #[serde(default)]
+        icon_mxc: Option<String>,
+        /// Base64 PNG of the sender's colored-initial avatar, sent instead
+        /// of `icon_mxc` for a sender with no avatar image.
+        #[serde(default)]
+        icon_png: Option<String>,
     },
     /// Not sent by the frontend directly — routed here from a
     /// `matrixtauriclient://notification?...` deep link, itself fired by

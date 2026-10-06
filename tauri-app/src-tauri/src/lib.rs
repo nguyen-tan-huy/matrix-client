@@ -9,6 +9,8 @@ mod models;
 mod platform;
 #[cfg(target_os = "linux")]
 mod suspend_watch;
+#[cfg(target_os = "linux")]
+mod sway_glass;
 mod tray;
 
 use command::Command;
@@ -382,6 +384,11 @@ pub fn run() {
             // `suspend_watch.rs`.
             #[cfg(target_os = "linux")]
             tauri::async_runtime::spawn(suspend_watch::watch());
+
+            // Liquid glass behind the (transparent) window on swayctl-fx —
+            // see `sway_glass.rs`. Off the main thread: it shells out.
+            #[cfg(target_os = "linux")]
+            std::thread::spawn(sway_glass::apply);
 
             // Closing the window (the X button) hides it instead of
             // quitting on desktop — the sync loop and tray keep running in

@@ -98,7 +98,7 @@ mod linux {
         }
 
         fn title(&self) -> String {
-            "Matrix".to_string()
+            "ChoSua".to_string()
         }
 
         fn icon_pixmap(&self) -> Vec<Icon> {
@@ -214,7 +214,7 @@ mod desktop {
         TrayIconBuilder::new()
             .icon(icon)
             .menu(&menu)
-            .tooltip("Matrix")
+            .tooltip("ChoSua")
             .on_menu_event(|app, event| match event.id.as_ref() {
                 "show_hide" => toggle(app),
                 "restart" => super::restart_app(),

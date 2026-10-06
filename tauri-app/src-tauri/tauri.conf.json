@@ -1,5 +1,5 @@
 {
-  "productName": "Matrix",
+  "productName": "ChoSua",
   "version": "0.1.0",
   "identifier": "com.example.matrixtauriclient",
   "build": {
@@ -10,7 +10,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Matrix",
+        "title": "ChoSua",
         "width": 1100,
         "height": 720,
         "decorations": false

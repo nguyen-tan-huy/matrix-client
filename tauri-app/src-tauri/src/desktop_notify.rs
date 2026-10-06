@@ -50,6 +50,8 @@ trait Notifications {
     fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
 }
 
+const APP_ICON: &str = "chosua";
+
 type OnClick = Box<dyn FnOnce() + Send>;
 // BTreeMap so the oldest (lowest, server ids only increase) is cheap to evict.
 type Pending = Arc<Mutex<BTreeMap<u32, OnClick>>>;
@@ -109,7 +111,12 @@ static NOTIFIER: tokio::sync::Mutex<Option<Notifier>> = tokio::sync::Mutex::cons
 /// Shows a notification with a "default" action (clicking its body) that
 /// runs `on_click`. Returns as soon as the server has accepted it — nothing
 /// waits on the user.
-pub async fn show(summary: &str, body: &str, on_click: impl FnOnce() + Send + 'static) -> zbus::Result<()> {
+pub async fn show(
+    summary: &str,
+    body: &str,
+    image: Option<&std::path::Path>,
+    on_click: impl FnOnce() + Send + 'static,
+) -> zbus::Result<()> {
     let mut guard = NOTIFIER.lock().await;
     if guard.is_none() {
         *guard = Some(Notifier::connect().await?);
@@ -119,9 +126,20 @@ pub async fn show(summary: &str, body: &str, on_click: impl FnOnce() + Send + 's
     // Without a declared "default" action, clicking the body on mako/swaync
     // just dismisses instead of firing `ActionInvoked` (confirmed via
     // `dbus-monitor`). The label only shows on servers that render a button.
+    // Icon name / desktop entry both match what the Arch package installs
+    // (`/usr/share/icons/hicolor/*/apps/chosua.png`, `chosua.desktop`) —
+    // left empty, notification daemons just show no icon at all.
+    let mut hints = HashMap::new();
+    hints.insert("desktop-entry", Value::from(APP_ICON));
+    // The sender's avatar — shown as the notification's main image, with
+    // the app icon as a small badge on daemons that render both (swaync).
+    let image_path = image.map(|p| p.to_string_lossy().into_owned());
+    if let Some(image_path) = &image_path {
+        hints.insert("image-path", Value::from(image_path.as_str()));
+    }
     let result = notifier
         .proxy
-        .notify(env!("CARGO_PKG_NAME"), 0, "", summary, body, &["default", "Open"], HashMap::new(), -1)
+        .notify("ChoSua", 0, APP_ICON, summary, body, &["default", "Open"], hints, -1)
         .await;
 
     match result {

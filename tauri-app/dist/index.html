@@ -39,7 +39,7 @@
             <button id="btn-security" class="small-btn" title="security">[ security ]</button>
             <button id="btn-user-search" class="small-btn" title="find every message from one user, across all rooms">[ user msgs ]</button>
             <button id="btn-message-search" class="small-btn" title="search message text, across all rooms">[ search ]</button>
-            <button id="btn-theme" class="small-btn" title="theme: follows system">[ theme: system ]</button>
+            <button id="btn-theme" class="small-btn" title="switch dark / light theme">[ theme: dark ]</button>
             <button id="btn-font-settings" class="small-btn" title="font family & size for the whole app">[ font ]</button>
             <button id="btn-shortcuts" class="small-btn" title="keyboard shortcuts (?)">[ shortcuts ]</button>
             <button id="btn-logout" class="small-btn" title="sign out of this session">[ logout ]</button>
@@ -56,6 +56,9 @@
     <div id="room-list-items"></div>
   </div>
   <div id="resizer-left" class="resizer"></div>
+  <div id="content-area">
+  <div id="favorite-tabs"></div>
+  <div id="content-row">
   <div id="main-panel">
     <div id="timeline-header">
       <button id="btn-back-to-rooms" class="small-btn" title="back to room list">[ ‹ ]</button>
@@ -120,6 +123,8 @@
   </div>
   <div id="resizer-right" class="resizer" style="display:none;"></div>
   <div id="side-panel" style="display:none;"></div>
+  </div>
+  </div>
 </div>
 
 <!-- Vendored (not CDN-loaded — this app runs offline besides its actual

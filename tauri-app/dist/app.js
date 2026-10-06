@@ -373,6 +373,7 @@ const el = {
   btnRoomMenu: document.getElementById("btn-room-menu"),
   roomMenu: document.getElementById("room-menu"),
   btnFavoriteRoom: document.getElementById("btn-favorite-room"),
+  favoriteTabs: document.getElementById("favorite-tabs"),
   btnInvite: document.getElementById("btn-invite"),
   btnLeaveRoom: document.getElementById("btn-leave-room"),
   notificationMode: document.getElementById("notification-mode"),
@@ -957,6 +958,10 @@ function renderRoomRow(room, rowIndex) {
  * instead of happening instantly. */
 function renderRooms() {
   renderSpacePicker();
+  renderFavoriteTabs();
+  // Desktop shows favorites as tabs above the timeline (`renderFavoriteTabs`)
+  // instead of in this list; the narrow layout keeps them here as before.
+  const favoritesAsTabs = !isNarrowLayout();
   const filter = normalizeForSearch(state.roomFilter.trim());
   // The invites tab itself only shows up in the picker while there's at
   // least one invite (see `renderSpacePicker`) — if the last one just got
@@ -978,6 +983,7 @@ function renderRooms() {
   const matchedRooms = [];
   for (const room of state.rooms) {
     if (room.is_invite || onInvitesTab || room.is_space) continue;
+    if (favoritesAsTabs && room.is_favorite) continue;
     if (filter && !normalizeForSearch(room.name).includes(filter)) continue;
     if (spaceFilter && !spaceFilter.includes(room.room_id)) continue;
     if (state.unreadOnly && !(room.unread_count > 0)) continue;
@@ -1215,6 +1221,63 @@ el.roomListItems.addEventListener("scroll", () => {
 window.addEventListener("resize", () => {
   if (virtualRoomList) renderRoomListWindow();
 });
+// Crossing the narrow/desktop breakpoint moves favorites between the
+// room list and the tab bar, so the list has to be rebuilt.
+window
+  .matchMedia("(max-width: 720px), (max-height: 500px), (hover: none) and (pointer: coarse)")
+  .addEventListener("change", () => scheduleRoomsRender());
+
+/** Desktop-only tab bar of favorited (`m.favourite`) rooms above the
+ * timeline — clicking a tab opens the room, its `×` unfavorites it
+ * (which drops it back into the room list). Rebuilt wholesale: it's only
+ * ever a handful of tabs. Left empty (and so hidden, via `:empty` in
+ * style.css) in the narrow layout. */
+function renderFavoriteTabs() {
+  const container = el.favoriteTabs;
+  if (!container) return;
+  const favorites = isNarrowLayout()
+    ? []
+    : state.rooms
+        .filter((r) => r.is_favorite && !r.is_invite && !r.is_space)
+        // Fixed alphabetical order — tabs must not jump around as new
+        // messages bump rooms in `state.rooms`' activity order.
+        .sort((a, b) => a.name.localeCompare(b.name, "vi", { sensitivity: "base" }) || a.room_id.localeCompare(b.room_id));
+  const frag = document.createDocumentFragment();
+  for (const room of favorites) {
+    const tab = document.createElement("div");
+    tab.className = "fav-tab" + (room.room_id === state.selectedRoom ? " selected" : "");
+    tab.title = room.name;
+    tab.dataset.roomId = room.room_id;
+    tab.appendChild(renderAvatar(room.avatar_url, room.name, room.room_id, 18));
+    const name = document.createElement("span");
+    name.className = "fav-tab-name" + (room.unread_count > 0 ? " unread" : "");
+    name.textContent = (room.is_encrypted ? "[e] " : "") + room.name;
+    tab.appendChild(name);
+    if (room.unread_count > 0) {
+      const badge = document.createElement("span");
+      badge.className = "room-badge" + (room.mention_count > 0 ? " mention" : "");
+      badge.textContent = room.unread_count > 99 ? "99+" : String(room.unread_count);
+      tab.appendChild(badge);
+    }
+    const close = document.createElement("button");
+    close.className = "fav-tab-close";
+    close.title = "remove from favorites";
+    close.textContent = "×";
+    close.addEventListener("click", (e) => {
+      e.stopPropagation();
+      send("SetRoomFavorite", { room_id: room.room_id, favorite: false });
+    });
+    tab.appendChild(close);
+    tab.addEventListener("click", () => selectRoom(room.room_id));
+    tab.addEventListener("auxclick", (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      send("SetRoomFavorite", { room_id: room.room_id, favorite: false });
+    });
+    frag.appendChild(tab);
+  }
+  container.replaceChildren(frag);
+}
 
 /** Same job as a plain `.room-row.kbd-active` `scrollIntoView()` (see the
  * room-filter arrow-key handler), but works while the list is virtualized
@@ -1505,7 +1568,66 @@ function lightboxKeyHandler(e) {
 // Room selection / header actions
 // =========================================================================
 
+/** Per-room "tab session" for favorite rooms on desktop — switching
+ * between favorite tabs keeps each room exactly as it was left: the
+ * already-rendered timeline DOM (detached into a fragment, so switching
+ * back is a reattach instead of a full `renderTimeline()`), scroll
+ * position, compose draft, pending reply/edit and side panel. `nodes` is
+ * dropped by `invalidateTabSession()` as soon as any backend event for
+ * that room arrives while it's in the background, so a stale DOM is never
+ * shown — the room then just re-renders from `state.timelines` (which is
+ * kept up to date regardless) and the scroll position is still restored. */
+const tabSessions = new Map();
+
+function usesTabSession(roomId) {
+  if (!roomId || isNarrowLayout()) return false;
+  return Boolean(state.rooms.find((r) => r.room_id === roomId)?.is_favorite);
+}
+
+function invalidateTabSession(roomId) {
+  if (roomId === state.selectedRoom) return;
+  const sess = tabSessions.get(roomId);
+  if (sess) sess.nodes = null;
+}
+
+function saveTabSession(roomId) {
+  const c = el.timeline;
+  const atBottom = c.scrollHeight - c.scrollTop - c.clientHeight <= 2;
+  const frag = document.createDocumentFragment();
+  // Only cache a real rendered timeline, not the "loading..." placeholder.
+  const cacheable = state.timelineLoaded.has(roomId) && !c.querySelector("#timeline-placeholder .loading, #timeline-placeholder:only-child");
+  const scrollTop = c.scrollTop;
+  if (cacheable) frag.append(...c.childNodes);
+  tabSessions.set(roomId, {
+    nodes: cacheable ? frag : null,
+    scrollTop,
+    atBottom,
+    draft: el.composeInput.value,
+    reply: state.pendingReply?.roomId === roomId ? state.pendingReply : null,
+    edit: state.pendingEdit?.roomId === roomId ? state.pendingEdit : null,
+    rightPanel: state.rightPanel,
+  });
+}
+
+function restoreTimelineScroll(sess) {
+  const c = el.timeline;
+  if (sess.atBottom) {
+    scrollToBottom(c);
+    return;
+  }
+  c.scrollTop = sess.scrollTop;
+  requestAnimationFrame(() => requestAnimationFrame(() => (c.scrollTop = sess.scrollTop)));
+}
+
 function selectRoom(roomId) {
+  const prevRoom = state.selectedRoom;
+  if (prevRoom === roomId && usesTabSession(roomId)) {
+    el.chatScreen.classList.add("room-open");
+    return;
+  }
+  const leavingSession = usesTabSession(prevRoom);
+  if (leavingSession) saveTabSession(prevRoom);
+  const sess = usesTabSession(roomId) ? tabSessions.get(roomId) : null;
   state.selectedRoom = roomId;
   // Narrow (phone-width) layout shows one pane at a time — see the
   // `#chat-screen.room-open` rules in style.css. Harmless no-op class on
@@ -1523,6 +1645,7 @@ function selectRoom(roomId) {
   const room = state.rooms.find((r) => r.room_id === roomId);
   el.timelineTitle.textContent = room ? room.name : roomId;
   updateFavoriteButtonLabel(room);
+  renderFavoriteTabs();
   el.timelineHeaderActions.style.display = "flex";
   el.composeRow.style.display = "flex";
   el.composeToolbar.style.display = "flex";
@@ -1536,21 +1659,46 @@ function selectRoom(roomId) {
   // tapped to see behind the thread list on every single room open.
   if (isNarrowLayout()) {
     state.rightPanel = null;
+  } else if (sess?.rightPanel && (sess.rightPanel.scope === roomId || sess.rightPanel.roomId === roomId)) {
+    state.rightPanel = sess.rightPanel;
+    if (state.rightPanel.kind === "threads-list") send("ListThreads", { room_id: roomId });
+    else if (state.rightPanel.kind === "thread") {
+      send("LoadThread", { room_id: roomId, thread_root_id: state.rightPanel.root.event_id });
+    }
   } else {
     send("ListThreads", { room_id: roomId });
     state.rightPanel = { kind: "threads-list", scope: roomId };
     state.threadsListActiveIndex = -1;
     state.threadsListFilter = "";
   }
+  // Draft/reply/edit are per tab session: restore the target's, and don't
+  // carry a saved favorite's draft over into some other room.
+  if (sess) {
+    el.composeInput.value = sess.draft || "";
+    if (sess.reply) { state.pendingReply = sess.reply; renderReplyIndicator(); }
+    if (sess.edit) { state.pendingEdit = sess.edit; renderEditIndicator(); }
+    autoResizeTextarea(el.composeInput);
+  } else if (leavingSession) {
+    el.composeInput.value = "";
+    autoResizeTextarea(el.composeInput);
+  }
   renderRooms();
   renderSidePanel();
-  if (!state.timelineLoaded.has(roomId)) {
+  if (sess?.nodes) {
+    // Fast path: reattach the exact DOM this tab was left with.
+    el.timeline.replaceChildren(sess.nodes);
+    sess.nodes = null;
+    restoreTimelineScroll(sess);
+    updateJumpLatestVisibility();
+  } else if (!state.timelineLoaded.has(roomId)) {
     el.timeline.innerHTML = `<div id="timeline-placeholder">${loadingHtml("loading messages...")}</div>`;
     send("LoadTimeline", { room_id: roomId });
   } else {
     renderTimeline();
+    if (sess) restoreTimelineScroll(sess);
     maybeAutoLoadMore(roomId);
   }
+  if (sess) el.composeInput.focus();
   // Deliberately not auto-marking read just for opening the room — read
   // state only ever changes via the explicit "[ mark read ]" button (see
   // `el.btnMarkRead`'s handler), so the unread badge stays put until the
@@ -2205,149 +2353,42 @@ async function toggleVoiceRecording() {
 }
 
 // =========================================================================
-// Theme override (system, plus a curated set of named palettes) — see
-// style.css's comment on the (deliberately empty) light `@media` block for
-// why this lives here as inline custom-property overrides instead.
+// Theme — just two, dark and light, matching swayctl-center's liquid glass
+// look. The palettes live in style.css (`:root` / `:root[data-theme=light]`);
+// this only flips the attribute and persists the choice.
 // =========================================================================
-/** One entry per selectable theme, `id: null` reserved for "system" (drops
- * every override below and lets `Event::SystemTheme`/the plain `:root`
- * defaults take back over — see `applyThemeOverride`). `"dark"` has no
- * palette of its own for the same reason: it just *is* this app's own
- * `:root` defaults (the terminal-tool amber-on-near-black look), so
- * there's nothing to override back to. Every other theme is a genuine,
- * named palette (not GTK-driven), so unlike the old light-only override
- * these also set `--accent-strong`/`--border`/etc. explicitly enough to
- * look coherent rather than just inverted. Colors are each theme's own
- * well-known published values, not approximated. */
-const THEME_PALETTES = {
-  light: {
-    bg: "#f7f5f0", bgAlt: "#ffffff", border: "#d9d3c7",
-    text: "#2a2620", textWeak: "#6e675c", accent: "#b5791c", accentStrong: "#8f5f12",
-    colorScheme: "light",
-  },
-  dracula: {
-    bg: "#282a36", bgAlt: "#343746", border: "#44475a",
-    text: "#f8f8f2", textWeak: "#6272a4", accent: "#bd93f9", accentStrong: "#ff79c6",
-    colorScheme: "dark",
-  },
-  nord: {
-    bg: "#2e3440", bgAlt: "#3b4252", border: "#4c566a",
-    text: "#e5e9f0", textWeak: "#81a1c1", accent: "#88c0d0", accentStrong: "#5e81ac",
-    colorScheme: "dark",
-  },
-  gruvbox: {
-    bg: "#282828", bgAlt: "#3c3836", border: "#504945",
-    text: "#ebdbb2", textWeak: "#a89984", accent: "#fabd2f", accentStrong: "#d79921",
-    colorScheme: "dark",
-  },
-  "solarized-dark": {
-    bg: "#002b36", bgAlt: "#073642", border: "#586e75",
-    text: "#93a1a1", textWeak: "#657b83", accent: "#268bd2", accentStrong: "#2aa198",
-    colorScheme: "dark",
-  },
-  "solarized-light": {
-    bg: "#fdf6e3", bgAlt: "#eee8d5", border: "#c9c2ab",
-    text: "#586e75", textWeak: "#839496", accent: "#268bd2", accentStrong: "#cb4b16",
-    colorScheme: "light",
-  },
-  "one-dark": {
-    bg: "#282c34", bgAlt: "#2c313a", border: "#3e4451",
-    text: "#abb2bf", textWeak: "#5c6370", accent: "#61afef", accentStrong: "#c678dd",
-    colorScheme: "dark",
-  },
-  monokai: {
-    bg: "#272822", bgAlt: "#3e3d32", border: "#49483e",
-    text: "#f8f8f2", textWeak: "#8d8a7d", accent: "#a6e22e", accentStrong: "#f92672",
-    colorScheme: "dark",
-  },
-  "tokyo-night": {
-    bg: "#1a1b26", bgAlt: "#24283b", border: "#414868",
-    text: "#c0caf5", textWeak: "#7982a9", accent: "#7aa2f7", accentStrong: "#bb9af7",
-    colorScheme: "dark",
-  },
-  "catppuccin-mocha": {
-    bg: "#1e1e2e", bgAlt: "#313244", border: "#45475a",
-    text: "#cdd6f4", textWeak: "#a6adc8", accent: "#89b4fa", accentStrong: "#f5c2e7",
-    colorScheme: "dark",
-  },
-  "high-contrast": {
-    bg: "#000000", bgAlt: "#1a1a1a", border: "#ffffff",
-    text: "#ffffff", textWeak: "#d8d8d8", accent: "#ffff00", accentStrong: "#00ffff",
-    colorScheme: "dark",
-  },
-};
 const THEME_OPTIONS = [
-  { id: null, label: "System" },
-  { id: "dark", label: "Dark (default)" },
-  { id: "light", label: "Light" },
-  { id: "dracula", label: "Dracula" },
-  { id: "nord", label: "Nord" },
-  { id: "gruvbox", label: "Gruvbox Dark" },
-  { id: "solarized-dark", label: "Solarized Dark" },
-  { id: "solarized-light", label: "Solarized Light" },
-  { id: "one-dark", label: "One Dark" },
-  { id: "monokai", label: "Monokai" },
-  { id: "tokyo-night", label: "Tokyo Night" },
-  { id: "catppuccin-mocha", label: "Catppuccin Mocha" },
-  { id: "high-contrast", label: "High Contrast" },
+  { id: "dark", label: "dark" },
+  { id: "light", label: "light" },
 ];
-const THEME_VARS = ["--bg", "--bg-alt", "--border", "--text", "--text-weak", "--accent", "--accent-strong"];
+// Older saved choices (the previous palette list) map onto the nearest one.
+const LEGACY_LIGHT_THEMES = new Set(["light", "solarized-light"]);
 function applyThemeOverride() {
-  const root = document.documentElement.style;
-  const palette = THEME_PALETTES[state.themeOverride];
-  if (palette) {
-    root.setProperty("--bg", palette.bg);
-    root.setProperty("--bg-alt", palette.bgAlt);
-    root.setProperty("--border", palette.border);
-    root.setProperty("--text", palette.text);
-    root.setProperty("--text-weak", palette.textWeak);
-    root.setProperty("--accent", palette.accent);
-    root.setProperty("--accent-strong", palette.accentStrong);
-    document.documentElement.style.colorScheme = palette.colorScheme;
-  } else {
-    // "dark" (this app's own `:root` defaults, nothing to override) or
-    // `null`/"system" (drop any override and let the next
-    // `Event::SystemTheme` — Linux/GTK — or, absent that, those same
-    // plain `:root` defaults take over again).
-    THEME_VARS.forEach((v) => root.removeProperty(v));
-    document.documentElement.style.colorScheme = "dark";
-  }
-  const current = THEME_OPTIONS.find((t) => t.id === state.themeOverride);
-  el.btnTheme.textContent = `[ theme: ${current ? current.label : "system"} ]`;
+  const theme = state.themeOverride === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = theme;
+  // Drop any inline vars an older build (or the GTK system theme) set.
+  ["--bg", "--bg-alt", "--border", "--text", "--text-weak", "--accent", "--accent-strong"].forEach((v) =>
+    document.documentElement.style.removeProperty(v)
+  );
+  document.documentElement.style.colorScheme = "";
+  el.btnTheme.textContent = `[ theme: ${theme} ]`;
 }
 function persistThemeOverride() {
   try {
-    if (state.themeOverride) localStorage.setItem("themeOverride", state.themeOverride);
-    else localStorage.removeItem("themeOverride");
+    localStorage.setItem("themeOverride", state.themeOverride);
   } catch (e) {
-    // Private-browsing-style storage block — the override just won't
-    // survive a restart, nothing else depends on it persisting.
+    // Storage blocked — the choice just won't survive a restart.
   }
 }
 el.btnTheme.addEventListener("click", () => {
-  showDialog(`
-    <h3>theme</h3>
-    <label>theme</label>
-    <select id="dlg-theme">
-      ${THEME_OPTIONS.map(
-        (t) =>
-          `<option value="${t.id ? escapeHtml(t.id) : ""}"${t.id === state.themeOverride ? " selected" : ""}>${escapeHtml(t.label)}</option>`
-      ).join("")}
-    </select>
-    <div class="actions">
-      <button id="dlg-cancel">close</button>
-    </div>
-  `);
-  document.getElementById("dlg-theme").addEventListener("change", (e) => {
-    state.themeOverride = e.target.value || null;
-    applyThemeOverride();
-    persistThemeOverride();
-  });
-  document.getElementById("dlg-cancel").addEventListener("click", closeDialog);
+  state.themeOverride = state.themeOverride === "light" ? "dark" : "light";
+  applyThemeOverride();
+  persistThemeOverride();
 });
+state.themeOverride = "dark";
 try {
   const saved = localStorage.getItem("themeOverride");
-  if (THEME_OPTIONS.some((t) => t.id === saved)) state.themeOverride = saved;
+  if (saved) state.themeOverride = LEGACY_LIGHT_THEMES.has(saved) ? "light" : "dark";
 } catch (e) {
   // same as above
 }
@@ -6709,42 +6750,12 @@ el.importKeysFileInput.addEventListener("change", () => {
 // Backend events
 // =========================================================================
 
-/** Overrides the built-in `:root` palette (see `style.css`) with the
- * running GTK/Sway theme's own resolved colors — sent once at startup and
- * again on every live theme switch (see `gtk_theme.rs`, Linux desktop
- * only). Inline styles on `documentElement` outrank the stylesheet
- * regardless of specificity, so this is enough on its own; nothing in
- * `style.css` needs to change. `--danger` and `--radius` are deliberately
- * left alone — GTK themes don't reliably name an equivalent for either,
- * and the built-in values for both already read fine against an
- * arbitrary theme's bg/text. */
-function applySystemTheme(theme) {
-  const root = document.documentElement.style;
-  root.setProperty("--bg", theme.bg);
-  root.setProperty("--bg-alt", theme.bg_alt);
-  root.setProperty("--border", theme.border);
-  root.setProperty("--text", theme.text);
-  root.setProperty("--text-weak", theme.text_weak);
-  root.setProperty("--accent", theme.accent);
-  root.setProperty("--accent-strong", theme.accent_strong);
-  // Native form-control chrome (scrollbars, checkboxes, ...) needs its
-  // own light/dark hint independent of the custom properties above —
-  // derived from the theme's actual background rather than assumed,
-  // since a GTK theme's "dark" *name* and its resolved bg color don't
-  // always agree (a light theme with a dark accent, for instance).
-  const [r, g, b] = [1, 3, 5].map((i) => parseInt(theme.bg.slice(i, i + 2), 16));
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-  document.documentElement.style.colorScheme = luminance < 0.5 ? "dark" : "light";
-}
-
 function handleBackendEvent(evt) {
   const { type, data } = evt;
+  if (data?.room_id && tabSessions.size) invalidateTabSession(data.room_id);
   switch (type) {
     case "SystemTheme":
-      // An explicit user choice (see `applyThemeOverride`) always wins
-      // over the GTK-driven system theme — otherwise every live theme
-      // switch on the Linux desktop build would silently undo it.
-      if (!state.themeOverride) applySystemTheme(data);
+      // Ignored: the app has its own two fixed themes (see `applyThemeOverride`).
       break;
     case "SessionChecked":
       if (data) {
@@ -7636,7 +7647,37 @@ function maybeNotify(roomId, event, threadId = null) {
   const title = room ? `${event.sender_name} (${room.name})` : event.sender_name;
   const body =
     event.msg_type === "image" ? "sent an image" : truncate(event.body || "", 120);
-  send("ShowNotification", { room_id: roomId, thread_id: threadId, title, body });
+  send("ShowNotification", {
+    room_id: roomId,
+    thread_id: threadId,
+    title,
+    body,
+    icon_mxc: event.sender_avatar_url || null,
+    icon_png: event.sender_avatar_url ? null : initialAvatarPng(event.sender_name, event.sender),
+  });
+}
+
+/** The same colored-initial circle `renderAvatar` falls back to for a
+ * sender with no avatar image, drawn as a PNG (base64, no `data:` prefix)
+ * for the desktop notification — otherwise those senders' notifications
+ * showed the app icon instead of anything identifying who sent them. */
+function initialAvatarPng(name, idForColor) {
+  const size = 96;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.fillStyle = senderColor(idForColor || name || "");
+  ctx.beginPath();
+  ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.font = `600 ${Math.round(size * 0.45)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText((name || "?").trim().charAt(0).toUpperCase() || "?", size / 2, size / 2 + 2);
+  return canvas.toDataURL("image/png").split(",")[1] || null;
 }
 
 // The event ID `scrollToMessage` last marked with `.jump-highlight` (see

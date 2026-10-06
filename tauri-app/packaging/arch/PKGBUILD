@@ -1,0 +1,18 @@
+pkgname=chosua
+pkgver=0.1.0
+pkgrel=15
+pkgdesc="ChoSua - Matrix chat client (Tauri)"
+arch=('x86_64')
+license=('custom')
+depends=('webkit2gtk-4.1' 'gtk3')
+options=('!strip' '!debug')
+source=('chosua' 'chosua.desktop' chosua-{32,48,64,128,256,512}.png)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/chosua" "$pkgdir/usr/bin/chosua"
+  install -Dm644 "$srcdir/chosua.desktop" "$pkgdir/usr/share/applications/chosua.desktop"
+  for s in 32 48 64 128 256 512; do
+    install -Dm644 "$srcdir/chosua-$s.png" "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/chosua.png"
+  done
+}
