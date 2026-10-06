@@ -53,6 +53,10 @@ pub enum Event {
     /// overrides so the UI matches the system theme (Sway/GTK) exactly,
     /// auto-dark-mode included, instead of the static built-in palette.
     SystemTheme(crate::models::SystemTheme),
+    /// Liquid glass settings (swayctl-center) and what's behind the window
+    /// (swayctl-fx's glass probe) — see `sway_glass.rs`. Linux/sway only.
+    GlassConfig(crate::models::GlassConfig),
+    GlassBackdrop(crate::models::GlassBackdrop),
 
     /// Incremental room-list change, driven by `RoomListService`'s sliding
     /// sync — replaces the old full-snapshot `Rooms` event so an account

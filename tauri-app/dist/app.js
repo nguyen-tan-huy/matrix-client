@@ -6747,6 +6747,98 @@ el.importKeysFileInput.addEventListener("change", () => {
 });
 
 // =========================================================================
+// Liquid glass ink (swayctl-fx) — text that stands out on what's behind
+// =========================================================================
+// On swayctl-fx with Settings > Liquid glass on, the window is clear and the
+// compositor draws glass behind it. `GlassBackdrop` (src-tauri/src/
+// sway_glass.rs) is a luminance grid of what's *behind* the window (the
+// compositor's glass probe, without our own content); every pane, room row
+// and message gets pure dark or light ink from the part of it under that
+// element — the same rule as swayctl-bar (swayctl-bar/src/ui/backdrop.rs)
+// and tools/liquid-demo.html:
+//   * the panes' white body (Settings opacity) lifts what the text sits on,
+//   * dark ink above ~0.29 (luminance), with a band so it doesn't flicker,
+//   * a halo as strong as the spot is mid-tone / busy, lighter with frost.
+const INK_TARGETS = [
+  // the panes the desktop glass block in style.css draws (one each)
+  "#room-list-header", "#timeline-header", "#side-panel-header",
+  ".msg-row .bubble", ".msg-row .sender", "#pinned-banner", "#reply-indicator", "#edit-indicator",
+  ".login-box", "#timeline-placeholder", ".thread-row", ".room-row", ".fav-tab",
+  // and what sits straight on the glass between them
+  "#room-filter-row", "#space-picker", "#typing-indicator", "#load-more-row",
+  "#compose-toolbar", "#compose-row",
+].join(", ");
+const glassInk = { on: false, tint: 0.04, frost: 0, grid: null, raf: 0 };
+
+function applyGlassConfig(cfg) {
+  glassInk.on = !!cfg?.on;
+  glassInk.tint = cfg?.tint ?? 0.04;
+  glassInk.frost = cfg?.frost ?? 0;
+  const root = document.documentElement;
+  if (glassInk.on) {
+    root.dataset.glass = "on";
+    root.style.setProperty("--lens-tint", String(glassInk.tint));
+    scheduleInkRetag();
+  } else {
+    delete root.dataset.glass;
+    root.style.removeProperty("--lens-tint");
+    glassInk.grid = null;
+    document.querySelectorAll("[data-ink]").forEach((n) => {
+      delete n.dataset.ink;
+      delete n.dataset.halo;
+    });
+  }
+}
+
+// (mean, darkest, brightest) luminance of the grid under a viewport rect
+function inkStats(g, r) {
+  const sx = g.cols / (g.w || window.innerWidth), sy = g.rows / (g.h || window.innerHeight);
+  const cx = (v) => Math.min(g.cols - 1, Math.max(0, Math.floor(v * sx)));
+  const cy = (v) => Math.min(g.rows - 1, Math.max(0, Math.floor(v * sy)));
+  let sum = 0, n = 0, lo = 1, hi = 0;
+  for (let y = cy(r.top); y <= cy(r.bottom - 1); y++) {
+    for (let x = cx(r.left); x <= cx(r.right - 1); x++) {
+      const k = y * g.cols + x;
+      sum += g.lum[k]; n++;
+      lo = Math.min(lo, g.lmin[k]); hi = Math.max(hi, g.lmax[k]);
+    }
+  }
+  return n ? [sum / n, lo, hi] : null;
+}
+
+function retagInk() {
+  glassInk.raf = 0;
+  const g = glassInk.grid;
+  if (!glassInk.on || !g) return;
+  const t = Math.min(1, Math.max(0, glassInk.tint));
+  const through = (l) => l * (1 - t) + t; // the pane's white body
+  const vw = window.innerWidth, vh = window.innerHeight;
+  document.querySelectorAll(INK_TARGETS).forEach((node) => {
+    const r = node.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1 || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) return;
+    const st = inkStats(g, r);
+    if (!st) return;
+    const [mean, lo, hi] = st.map(through);
+    const prev = node.dataset.ink;
+    const dark = prev === "dark" ? mean > 0.255 : prev === "light" ? mean > 0.32 : mean > 0.287;
+    const near = 1 - Math.min(1, Math.abs(Math.log((mean + 0.05) / 0.337)) / 1.2);
+    const spread = Math.max(0, hi - lo) * (1 - 0.7 * glassInk.frost);
+    const halo = Math.round(Math.min(1, 0.25 + near * 0.6 + spread * 0.75) * 4);
+    const ink = dark ? "dark" : "light";
+    if (prev !== ink) node.dataset.ink = ink;
+    if (node.dataset.halo !== String(halo)) node.dataset.halo = String(halo);
+  });
+}
+
+function scheduleInkRetag() {
+  if (glassInk.on && !glassInk.raf) glassInk.raf = requestAnimationFrame(retagInk);
+}
+// what's under each element changes when the page itself moves, too
+document.addEventListener("scroll", scheduleInkRetag, { capture: true, passive: true });
+window.addEventListener("resize", scheduleInkRetag);
+new MutationObserver(scheduleInkRetag).observe(document.documentElement, { childList: true, subtree: true });
+
+// =========================================================================
 // Backend events
 // =========================================================================
 
@@ -6756,6 +6848,13 @@ function handleBackendEvent(evt) {
   switch (type) {
     case "SystemTheme":
       // Ignored: the app has its own two fixed themes (see `applyThemeOverride`).
+      break;
+    case "GlassConfig":
+      applyGlassConfig(data);
+      break;
+    case "GlassBackdrop":
+      glassInk.grid = data;
+      scheduleInkRetag();
       break;
     case "SessionChecked":
       if (data) {

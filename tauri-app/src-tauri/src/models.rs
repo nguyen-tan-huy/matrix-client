@@ -193,6 +193,30 @@ pub struct SystemTheme {
     pub accent_strong: String,
 }
 
+/// swayctl-center's liquid glass settings as the webview needs them (see
+/// `sway_glass.rs`): glass on behind the window, the panes' white body alpha
+/// (effects.glass_opacity) and frost (effects.glass_blur, 0..1).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GlassConfig {
+    pub on: bool,
+    pub tint: f64,
+    pub frost: f64,
+}
+
+/// What's behind the window right now (the compositor's glass probe), as a
+/// `cols` x `rows` grid of relative luminance over a `w` x `h` (logical px)
+/// window, plus each cell's darkest/brightest pixel.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GlassBackdrop {
+    pub w: f64,
+    pub h: f64,
+    pub cols: u32,
+    pub rows: u32,
+    pub lum: Vec<f32>,
+    pub lmin: Vec<f32>,
+    pub lmax: Vec<f32>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReactionSummary {
     pub emoji: String,

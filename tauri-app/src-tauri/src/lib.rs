@@ -191,6 +191,8 @@ pub fn run() {
     // than needing a second one just for this.
     #[cfg(target_os = "linux")]
     let theme_event_tx = event_tx.clone();
+    #[cfg(target_os = "linux")]
+    let glass_event_tx = event_tx.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -389,6 +391,10 @@ pub fn run() {
             // see `sway_glass.rs`. Off the main thread: it shells out.
             #[cfg(target_os = "linux")]
             std::thread::spawn(sway_glass::apply);
+            // ... and the text over it: what's behind the window, for the
+            // light/dark ink per pane (like swayctl-bar).
+            #[cfg(target_os = "linux")]
+            std::thread::spawn(move || sway_glass::watch(glass_event_tx));
 
             // Closing the window (the X button) hides it instead of
             // quitting on desktop — the sync loop and tray keep running in

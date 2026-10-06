@@ -1887,3 +1887,71 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); box-sh
     text-shadow: none;
   }
 }
+
+/* ---- swayctl-fx liquid glass, following the shell (html[data-glass="on"]) --
+ * Set from `Event::GlassConfig` (src-tauri/src/sway_glass.rs) when
+ * swayctl-center's Settings > Liquid glass is on. Same panes as the desktop
+ * block above, but drawn like swayctl-bar's capsules: a thin white body
+ * (--lens-tint = the Settings opacity) with a bright rim instead of the
+ * theme's smoke. The ink isn't the theme's either: every pane carries
+ * `data-ink="dark|light"` + `data-halo="0-4"` from what's behind it
+ * (`retagInk()` in app.js — the swayctl-bar / tools/liquid-demo.html rule):
+ * pure near-black or white text, a halo as strong as the backdrop is busy,
+ * and the colors glide when a pane's side flips. */
+@property --text { syntax: "<color>"; inherits: true; initial-value: #f5f5f7; }
+@property --text-weak { syntax: "<color>"; inherits: true; initial-value: #a1a1a6; }
+@property --halo { syntax: "<color>"; inherits: true; initial-value: rgba(0, 0, 0, 0); }
+
+html[data-glass="on"] {
+  --lens-tint: 0.04;
+  --g-pane: rgba(255, 255, 255, var(--lens-tint));
+  --g-chip: rgba(255, 255, 255, var(--lens-tint));
+  --g-edge: 1px solid rgba(255, 255, 255, 0.55);
+  --g-rim: inset 0 1px 0 rgba(255, 255, 255, 0.55), inset 0 -1px 1px rgba(0, 0, 0, 0.1);
+  --g-text-shadow: none;
+  --g-hover: rgba(255, 255, 255, 0.12);
+}
+html[data-glass="on"] body { text-shadow: none; }
+
+html[data-glass="on"] [data-ink] {
+  color: var(--text);
+  text-shadow: 0 0 1px var(--halo), 0 0 calc(4px + var(--h, 0.5) * 6px) var(--halo),
+    0 0 calc(var(--h, 0.5) * 14px) var(--halo);
+  transition: --text 450ms cubic-bezier(0.32, 0.72, 0, 1),
+    --text-weak 450ms cubic-bezier(0.32, 0.72, 0, 1), --halo 450ms ease;
+}
+html[data-glass="on"] [data-ink="dark"] {
+  --text: #111114;
+  --text-weak: rgba(17, 17, 20, 0.62);
+  --halo: rgba(255, 255, 255, calc(0.35 + var(--h, 0.5) * 0.6));
+  --g-hover: rgba(0, 0, 0, 0.07);
+  --control: rgba(0, 0, 0, 0.06);
+  --border: rgba(0, 0, 0, 0.12);
+}
+html[data-glass="on"] [data-ink="light"] {
+  --text: #ffffff;
+  --text-weak: rgba(255, 255, 255, 0.72);
+  --halo: rgba(0, 0, 0, calc(0.35 + var(--h, 0.5) * 0.6));
+  --g-hover: rgba(255, 255, 255, 0.12);
+  --control: rgba(255, 255, 255, 0.12);
+  --border: rgba(255, 255, 255, 0.22);
+}
+html[data-glass="on"] [data-halo="0"] { --h: 0; }
+html[data-glass="on"] [data-halo="1"] { --h: 0.25; }
+html[data-glass="on"] [data-halo="2"] { --h: 0.5; }
+html[data-glass="on"] [data-halo="3"] { --h: 0.75; }
+html[data-glass="on"] [data-halo="4"] { --h: 1; }
+/* accent-filled things keep their white text, no halo */
+html[data-glass="on"] .room-row.selected,
+html[data-glass="on"] .room-row.selected *,
+html[data-glass="on"] .fav-tab.selected,
+html[data-glass="on"] #compose-send,
+html[data-glass="on"] .jump-latest-btn { color: #fff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25); }
+/* menus/dialogs sit over the page's own content: solid, theme text */
+html[data-glass="on"] #chats-menu,
+html[data-glass="on"] #room-menu,
+html[data-glass="on"] .dialog-box,
+html[data-glass="on"] .actions-menu,
+html[data-glass="on"] .emoji-picker,
+html[data-glass="on"] .reaction-picker,
+html[data-glass="on"] #mention-suggestions { text-shadow: none; }
