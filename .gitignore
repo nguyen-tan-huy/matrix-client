@@ -20,3 +20,9 @@ keystore.properties
 # Local editor/OS cruft.
 .DS_Store
 *.swp
+
+# Arch package build: the binary copied in for makepkg, its output
+tauri-app/packaging/arch/chosua
+tauri-app/packaging/arch/pkg/
+tauri-app/packaging/arch/src/
+tauri-app/packaging/arch/*.pkg.tar.*
