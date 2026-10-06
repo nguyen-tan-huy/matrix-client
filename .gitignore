@@ -26,3 +26,7 @@ tauri-app/packaging/arch/chosua
 tauri-app/packaging/arch/pkg/
 tauri-app/packaging/arch/src/
 tauri-app/packaging/arch/*.pkg.tar.*
+
+# Android / Windows release builds (hundreds of MB; GitHub refuses >100 MB)
+tauri-app/dist-android/
+tauri-app/dist-windows/
