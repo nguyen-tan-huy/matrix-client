@@ -180,8 +180,10 @@ fn backdrop() -> Option<GlassBackdrop> {
 }
 
 /// Mirror the glass settings into the webview and, while glass is on, keep
-/// sending what's behind the window (4x a second; the compositor only has
-/// something new when the backdrop changed under the window).
+/// sending what's behind the window (once a second: what's behind a big
+/// window changes slowly, and every ask costs the compositor a read-back of
+/// the window's backdrop; the compositor only has something new when the
+/// backdrop changed under the window).
 pub fn watch(tx: UnboundedSender<Event>) {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         let _ = tx.send(Event::GlassConfig(GlassConfig { on: false, tint: 0.0, frost: 0.0 }));
@@ -190,7 +192,7 @@ pub fn watch(tx: UnboundedSender<Event>) {
     let mut last: Option<GlassConfig> = None;
     let mut checked = Instant::now() - Duration::from_secs(60);
     loop {
-        // settings: every 2 s (cheap; Settings writes settings.json on change)
+        // settings and the compositor: every 2 s
         if checked.elapsed() >= Duration::from_secs(2) {
             checked = Instant::now();
             let fx = effects();
@@ -215,6 +217,6 @@ pub fn watch(tx: UnboundedSender<Event>) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(1000));
     }
 }
