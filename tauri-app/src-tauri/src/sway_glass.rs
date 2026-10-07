@@ -17,7 +17,6 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -69,10 +68,27 @@ fn effects() -> Effects {
     }
 }
 
+/// The socket of the sway running now. SWAYSOCK first, but it can point at
+/// a sway that's gone: an app opened by a service left running from the last
+/// login inherits that service's environment. Then: the newest live
+/// `sway-ipc.<uid>.<pid>.sock` in XDG_RUNTIME_DIR.
+fn sway_socket() -> Option<UnixStream> {
+    if let Some(s) = std::env::var_os("SWAYSOCK").and_then(|p| UnixStream::connect(p).ok()) {
+        return Some(s);
+    }
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")?;
+    let mut socks: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("sway-ipc."))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    socks.sort_by(|a, b| b.0.cmp(&a.0));
+    socks.into_iter().find_map(|(_, p)| UnixStream::connect(p).ok())
+}
+
 /// One sway IPC request on a fresh connection.
 fn ipc(kind: u32, payload: &str) -> Option<serde_json::Value> {
-    let sock = std::env::var_os("SWAYSOCK")?;
-    let mut s = UnixStream::connect(sock).ok()?;
+    let mut s = sway_socket()?;
     s.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
     let mut msg = b"i3-ipc".to_vec();
     msg.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
@@ -99,7 +115,7 @@ fn has_window_glass() -> bool {
 
 /// Fallback for a system without swayctl-center: the same rule it would send.
 pub fn apply() {
-    if std::env::var_os("SWAYSOCK").is_none() {
+    if sway_socket().is_none() {
         return;
     }
     let fx = effects();
@@ -114,7 +130,7 @@ pub fn apply() {
     // for_window covers windows mapped later; the plain criteria command
     // the one already open (quoted so sway doesn't split at the commas).
     let cmd = format!("for_window {criteria} \"{what}\"; {criteria} {what}");
-    let _ = Command::new("swaymsg").arg(cmd).output();
+    let _ = ipc(0 /* RUN_COMMAND */, &cmd);
 }
 
 /// The shell's capsule body for effects.glass_opacity with glass on
@@ -167,11 +183,10 @@ fn backdrop() -> Option<GlassBackdrop> {
 /// sending what's behind the window (4x a second; the compositor only has
 /// something new when the backdrop changed under the window).
 pub fn watch(tx: UnboundedSender<Event>) {
-    if std::env::var_os("SWAYSOCK").is_none() {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         let _ = tx.send(Event::GlassConfig(GlassConfig { on: false, tint: 0.0, frost: 0.0 }));
         return;
     }
-    let capable = has_window_glass();
     let mut last: Option<GlassConfig> = None;
     let mut checked = Instant::now() - Duration::from_secs(60);
     loop {
@@ -179,6 +194,8 @@ pub fn watch(tx: UnboundedSender<Event>) {
         if checked.elapsed() >= Duration::from_secs(2) {
             checked = Instant::now();
             let fx = effects();
+            // asked every time: sway can start after us, or be restarted
+            let capable = has_window_glass();
             let cfg = GlassConfig {
                 on: capable && fx.glass,
                 tint: lens_tint(fx.opacity),
