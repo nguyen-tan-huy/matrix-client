@@ -19,6 +19,11 @@ pub enum Command {
     /// service, then drops the frontend back to the login screen.
     Logout,
     StartSync,
+    /// The machine just woke from suspend. Every TCP connection the sync
+    /// loop held is dead but the OS never told it, so the pending long-poll
+    /// hangs until a long timeout. Stops and restarts the sync service to
+    /// force fresh connections, without restarting the whole app.
+    ResumeSync,
     /// Under `RoomListService` (sliding sync) there's no "rescan everything"
     /// primitive anymore — the room list is always live. This now just
     /// forces an immediate re-scan of Spaces (see `refresh_spaces`, which
@@ -180,6 +185,26 @@ pub enum Command {
     /// or `Event::Error`.
     ImportRoomKeys {
         bytes: Vec<u8>,
+        passphrase: String,
+    },
+    /// Makes a fresh security (recovery) key: sets up secret storage and the
+    /// key backup if this account has none, otherwise rotates the key and
+    /// re-uploads the secrets under the new one (the old key stops working).
+    /// Answered with `Event::RecoveryKeyCreated` or `Event::RecoveryStatus`.
+    CreateRecoveryKey,
+    /// Starts the account's encryption over: deletes the old key backup and
+    /// secret storage, makes a new cross-signing identity (this device ends
+    /// up verified) and a new security key. Needs the account password for
+    /// the homeserver's interactive-auth step. Answered with
+    /// `Event::RecoveryKeyCreated` or `Event::RecoveryStatus`.
+    ResetIdentity {
+        password: String,
+    },
+    /// Exports every room key this device holds into an Element-compatible
+    /// encrypted file (megolm export, protected by `passphrase`), so the
+    /// user can log out and `ImportRoomKeys` it after logging back in.
+    /// Answered with `Event::RoomKeysExported` or `Event::Error`.
+    ExportRoomKeys {
         passphrase: String,
     },
     /// Downloads an encrypted/auth-required media item's bytes through

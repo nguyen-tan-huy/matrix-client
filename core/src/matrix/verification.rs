@@ -152,6 +152,103 @@ pub async fn recover_with_key(client: &Client, recovery_key: &str) -> anyhow::Re
     Ok(())
 }
 
+/// A new security (recovery) key. With no secret storage yet this turns it (and the key
+/// backup) on; otherwise the existing storage's key is rotated and the secrets this device holds
+/// are re-uploaded under it, so the key the user lost stops mattering.
+pub async fn create_recovery_key(client: &Client) -> Result<String, CreateKeyError> {
+    use matrix_sdk::encryption::recovery::RecoveryState;
+    let recovery = client.encryption().recovery();
+    if recovery.state() != RecoveryState::Disabled {
+        return Ok(recovery.reset_key().await.map_err(anyhow::Error::from)?);
+    }
+    match recovery.enable().await {
+        Ok(key) => Ok(key),
+        // a backup this device can't open (its key is lost) is in the way
+        Err(e) if e.to_string().contains("backup already exists") => Err(CreateKeyError::BackupExists),
+        Err(e) => Err(anyhow::Error::from(e).into()),
+    }
+}
+
+/// Starts over: the old backup and secret storage go, the cross-signing identity is made anew
+/// (this device signs itself, so it is verified again) and a new security key is returned.
+/// `status` is told when the homeserver wants the user to approve the reset in a browser.
+pub async fn reset_identity(client: &Client, password: &str, status: impl Fn(String)) -> anyhow::Result<String> {
+    use matrix_sdk::encryption::CrossSigningResetAuthType;
+    use matrix_sdk::ruma::api::client::uiaa::{AuthData, MatrixUserIdentifier, Password, UserIdentifier};
+    let recovery = client.encryption().recovery();
+    if let Some(handle) = recovery.reset_identity().await? {
+        match handle.auth_type() {
+            CrossSigningResetAuthType::Uiaa(info) => {
+                use matrix_sdk::ruma::api::client::uiaa::{AuthType, FallbackAcknowledgement};
+                let session = info.session.clone().ok_or_else(|| anyhow::anyhow!("máy chủ không gửi phiên xác thực"))?;
+                let offers = |t: AuthType| info.flows.iter().any(|f| f.stages.contains(&t));
+                if offers(AuthType::Password) && !password.is_empty() {
+                    let user = client.user_id().ok_or_else(|| anyhow::anyhow!("not logged in"))?.to_string();
+                    let mut auth = Password::new(UserIdentifier::Matrix(MatrixUserIdentifier::new(user)), password.to_string());
+                    auth.session = Some(session);
+                    handle.reset(Some(AuthData::Password(auth))).await?;
+                } else if offers(AuthType::Sso) {
+                    // SSO/OAuth account, no password: approve in the browser (the homeserver's fallback page),
+                    // then the reset is retried until the homeserver accepts it
+                    let url = format!(
+                        "{}_matrix/client/v3/auth/m.login.sso/fallback/web?session={session}",
+                        client.homeserver().as_str().trim_end_matches('/').to_string() + "/"
+                    );
+                    if crate::platform::open_url(&url).is_ok() {
+                        status("đã mở trình duyệt: hãy đăng nhập/duyệt ở đó, app sẽ tự tiếp tục".to_string());
+                    } else {
+                        status(format!("mở liên kết này để duyệt việc đặt lại: {url}"));
+                    }
+                    let ack = AuthData::FallbackAcknowledgement(FallbackAcknowledgement::new(session));
+                    let mut last = None;
+                    for _ in 0..90 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        match handle.reset(Some(ack.clone())).await {
+                            Ok(()) => {
+                                last = None;
+                                break;
+                            }
+                            Err(e) => last = Some(e),
+                        }
+                    }
+                    if let Some(e) = last {
+                        return Err(anyhow::anyhow!("chưa nhận được xác nhận từ trình duyệt: {e}"));
+                    }
+                } else {
+                    let kinds: Vec<String> = info.flows.iter().map(|f| f.stages.iter().map(|s| s.as_ref().to_string()).collect::<Vec<_>>().join("+")).collect();
+                    return Err(anyhow::anyhow!("máy chủ yêu cầu cách xác thực chưa hỗ trợ ({}); nếu tài khoản có mật khẩu hãy nhập mật khẩu", kinds.join(" | ")));
+                }
+            }
+            CrossSigningResetAuthType::OAuth(info) => {
+                // OAuth/SSO accounts have no password: the homeserver wants the reset approved in a browser
+                let url = info.approval_url.to_string();
+                if crate::platform::open_url(&url).is_ok() {
+                    status("đã mở trình duyệt: hãy duyệt việc đặt lại ở đó, app sẽ tự tiếp tục".to_string());
+                } else {
+                    status(format!("mở liên kết này để duyệt việc đặt lại: {url}"));
+                }
+                handle.reset(None).await?;
+            }
+        }
+    }
+    Ok(match recovery.state() {
+        matrix_sdk::encryption::recovery::RecoveryState::Disabled => recovery.enable().await?,
+        _ => recovery.reset_key().await?,
+    })
+}
+
+pub enum CreateKeyError {
+    /// A key backup exists on the server that this device can't open.
+    BackupExists,
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for CreateKeyError {
+    fn from(e: anyhow::Error) -> Self {
+        CreateKeyError::Other(e)
+    }
+}
+
 /// Imports E2EE room keys from an Element key-export file (Settings →
 /// Security & Privacy → Export keys). `import_room_keys` only takes a
 /// filesystem path, so the bytes the frontend sent over the command
@@ -174,4 +271,21 @@ pub async fn import_room_keys(
 
     let result = result?;
     Ok((result.imported_count, result.total_count))
+}
+
+/// Every room key this device holds, as an encrypted Element-compatible export file.
+pub async fn export_room_keys(client: &Client, passphrase: &str) -> anyhow::Result<Vec<u8>> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!("matrix-key-export-{nanos}.txt"));
+
+    let result = client.encryption().export_room_keys(path.clone(), passphrase, |_| true).await;
+    let bytes = match result {
+        Ok(()) => tokio::fs::read(&path).await.map_err(anyhow::Error::from),
+        Err(e) => Err(e.into()),
+    };
+    let _ = tokio::fs::remove_file(&path).await;
+    bytes
 }

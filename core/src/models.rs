@@ -45,7 +45,7 @@ pub struct RoomSummary {
     pub is_loading: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TimelineEvent {
     pub event_id: String,
     pub sender: String,
@@ -73,6 +73,10 @@ pub struct TimelineEvent {
     /// downloaded bytes instead of handing back raw ciphertext.
     pub media_encryption: Option<String>,
     pub thumbnail_url: Option<String>, // mxc:// of a preview thumbnail, if any (video)
+    /// The sender's declared pixel size of `media_url` (`content.info.w/h`),
+    /// so the UI can reserve the image's box before its bytes arrive instead
+    /// of the list jumping when it pops in.
+    pub media_size: Option<(u32, u32)>,
     pub timestamp: i64,
     pub thread_count: Option<u64>,
     pub is_own: bool,
@@ -150,6 +154,8 @@ pub struct TimelineEvent {
     /// latest reply is an encrypted-room attachment, same role as
     /// `media_encryption` above.
     pub latest_reply_media_encryption: Option<String>,
+    /// `media_size` for `latest_reply_media_url`.
+    pub latest_reply_media_size: Option<(u32, u32)>,
     /// For a thread root only: whether this account's own threaded read
     /// receipt (server state, not a session-local guess — see
     /// `thread_is_unread` in `worker.rs`) is behind the thread's latest
@@ -199,6 +205,10 @@ pub struct SystemTheme {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GlassConfig {
     pub on: bool,
+    /// the compositor inks key-coloured text itself (swayctl-fx "glass-ink",
+    /// `glass text auto`): the app draws its text in the key, nothing more
+    #[serde(default)]
+    pub ink: bool,
     pub tint: f64,
     pub frost: f64,
 }

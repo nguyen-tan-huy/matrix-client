@@ -1,0 +1,22 @@
+# Maintainer: HuyHappy
+pkgname=chosua
+pkgver=0.1.0
+pkgrel=94
+pkgdesc='ChoSua - Matrix chat client (GTK4 + libadwaita)'
+arch=('x86_64')
+license=('custom')
+depends=('gtk4' 'libadwaita' 'gstreamer' 'gst-plugins-base-libs' 'gst-plugin-pipewire' 'sqlite' 'dbus')
+options=('!lto')
+
+build() {
+  cd "$startdir/../.."
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release -p chosua-gtk
+}
+
+package() {
+  install -Dm755 "$srcdir/target/release/chosua-gtk" "$pkgdir/usr/bin/chosua"
+  install -Dm644 "$startdir/chosua.desktop" "$pkgdir/usr/share/applications/chosua.desktop"
+  for s in 32 48 64 128 256 512; do
+    install -Dm644 "$startdir/icons/$s.png" "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/chosua.png"
+  done
+}

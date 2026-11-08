@@ -1281,6 +1281,8 @@ button:disabled { color: var(--text-weak); cursor: default; }
 .thread-row-body p, .thread-row-last p { margin: 0 0 4px 0; }
 .thread-row-body p:last-child, .thread-row-last p:last-child { margin-bottom: 0; }
 .thread-row-thumb { max-width: 160px; max-height: 120px; display: block; border-radius: 6px; object-fit: cover; }
+/* holds the thumbnail's box (inline size from `media_size`) until it loads */
+.thread-row-thumb-pending { display: flex; align-items: center; max-width: 160px; max-height: 120px; overflow: hidden; }
 /* The thread's latest reply, right under its first message — a border-top
  * (not just spacing) reads as "here's what happened since", distinct
  * enough from `.thread-row-body` above it not to blur into one paragraph. */
@@ -1935,6 +1937,18 @@ html[data-glass="on"] [data-ink="light"] {
   --g-hover: rgba(255, 255, 255, 0.12);
   --control: rgba(255, 255, 255, 0.12);
   --border: rgba(255, 255, 255, 0.22);
+}
+/* The compositor shapes the glass from this window's alpha: a halo that
+ * spills past a pane's edge makes the glass bulge out along the text and
+ * bend the wallpaper there (ragged streaks above a tab, over a bubble).
+ * Pills clip their own halo; a bubble can't (its actions gutter sits past
+ * its edge), so its halo stays inside its 6px padding instead. */
+html[data-glass="on"] .fav-tab,
+html[data-glass="on"] .room-row,
+html[data-glass="on"] .thread-row { overflow: hidden; }
+html[data-glass="on"] .msg-row .bubble[data-ink],
+html[data-glass="on"] .msg-row .sender[data-ink] {
+  text-shadow: 0 0 1px var(--halo), 0 0 calc(2px + var(--h, 0.5) * 3px) var(--halo);
 }
 html[data-glass="on"] [data-halo="0"] { --h: 0; }
 html[data-glass="on"] [data-halo="1"] { --h: 0.25; }

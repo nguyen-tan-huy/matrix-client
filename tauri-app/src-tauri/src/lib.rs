@@ -1,16 +1,12 @@
-mod command;
-#[cfg(target_os = "linux")]
-mod desktop_notify;
-mod event;
+// The Matrix worker and its Command/Event protocol live in `chosua-core`,
+// shared with the native GTK desktop app; re-exported so `crate::event`
+// etc. keep resolving here.
+pub use chosua_core::{command, event, matrix, models};
 #[cfg(target_os = "linux")]
 mod gtk_theme;
-mod matrix;
-mod models;
 mod platform;
 #[cfg(target_os = "linux")]
 mod suspend_watch;
-#[cfg(target_os = "linux")]
-mod sway_glass;
 mod tray;
 
 use command::Command;
@@ -390,11 +386,10 @@ pub fn run() {
             // Liquid glass behind the (transparent) window on swayctl-fx —
             // see `sway_glass.rs`. Off the main thread: it shells out.
             #[cfg(target_os = "linux")]
-            std::thread::spawn(sway_glass::apply);
             // ... and the text over it: what's behind the window, for the
             // light/dark ink per pane (like swayctl-bar).
             #[cfg(target_os = "linux")]
-            std::thread::spawn(move || sway_glass::watch(glass_event_tx));
+            std::thread::spawn(move || chosua_core::sway_glass::watch("chosua", glass_event_tx));
 
             // Closing the window (the X button) hides it instead of
             // quitting on desktop — the sync loop and tray keep running in

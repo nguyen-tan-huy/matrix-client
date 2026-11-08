@@ -1,59 +1,36 @@
-//! Per-platform bits that the worker thread needs but can't get on its own:
-//! it runs on a dedicated tokio runtime spawned before `tauri::Builder`
-//! finishes, so it never gets an `AppHandle` naturally. `init` stashes one
-//! (mobile only, see below) plus the resolved data/download directories the
-//! first time it's called from `lib.rs`'s `.setup()`; everything else here
-//! just reads that back.
-//!
-//! Desktop keeps resolving paths via the `directories` crate exactly as
-//! before this refactor (same paths as every existing Linux install, so no
-//! session/store migration) — only mobile needs `AppHandle`-based
-//! resolution, since sandboxed app-data paths there aren't something
-//! `directories` can find on its own.
-
-use std::path::PathBuf;
-use std::sync::OnceLock;
+//! Tauri-side platform setup. The worker (in `chosua-core`) resolves
+//! data/download dirs and opens files/URLs itself on desktop; on mobile
+//! those need an `AppHandle` (sandboxed app-data paths, the opener and
+//! notification plugins), so `init` hands `chosua_core::platform` hooks
+//! backed by one stashed here. Runs before the worker thread starts.
 
 use tauri::AppHandle;
 
-static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-static DOWNLOAD_DIR: OnceLock<PathBuf> = OnceLock::new();
-#[cfg(any(target_os = "android", target_os = "ios"))]
-static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+#[cfg(target_os = "android")]
+pub use chosua_core::platform::data_dir;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn init(_app: &AppHandle) {
-    // Unchanged from the pre-refactor behavior: a fixed identifier
-    // independent of the OS-provided app-data resolution, so existing
-    // installs keep using the same on-disk store.
-    let dir = directories::ProjectDirs::from("com", "example", "matrix-tauri-client")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("./matrix-tauri-client-data"));
-    let _ = DATA_DIR.set(dir);
+pub fn init(_app: &AppHandle) {}
 
-    let download_dir = directories::UserDirs::new()
-        .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
-        .unwrap_or_else(std::env::temp_dir);
-    let _ = DOWNLOAD_DIR.set(download_dir);
-}
+#[cfg(any(target_os = "android", target_os = "ios"))]
+static APP_HANDLE: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn init(app: &AppHandle) {
+    use std::path::PathBuf;
     use tauri::Manager;
 
-    let dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from("./matrix-tauri-client-data"));
-    let _ = DATA_DIR.set(dir);
-
-    let download_dir = app
-        .path()
-        .download_dir()
-        .unwrap_or_else(|_| std::env::temp_dir());
-    let _ = DOWNLOAD_DIR.set(download_dir);
-
     let _ = APP_HANDLE.set(app.clone());
+    chosua_core::platform::set_hooks(chosua_core::platform::Hooks {
+        data_dir: app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| PathBuf::from("./matrix-tauri-client-data")),
+        download_dir: app.path().download_dir().unwrap_or_else(|_| std::env::temp_dir()),
+        open_path,
+        open_url,
+        show_notification: Some(show_notification),
+    });
 
     // Android 13+ (API 33+) treats notifications as a runtime permission
     // (`POST_NOTIFICATIONS`, already declared in AndroidManifest.xml) —
@@ -83,57 +60,24 @@ pub fn init(app: &AppHandle) {
     });
 }
 
-pub fn data_dir() -> PathBuf {
-    DATA_DIR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("./matrix-tauri-client-data"))
-}
-
-pub fn download_dir() -> PathBuf {
-    DOWNLOAD_DIR.get().cloned().unwrap_or_else(std::env::temp_dir)
-}
-
-/// Opens a local file/path in its default application (video player,
-/// image viewer, ...). Desktop: the `open` crate, unchanged. Mobile: the
-/// official `tauri-plugin-opener`, via the `AppHandle` stashed in `init`.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn open_path(path: impl AsRef<std::path::Path>) -> Result<(), String> {
-    open::that(path.as_ref()).map_err(|e| e.to_string())
-}
-
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub fn open_path(path: impl AsRef<std::path::Path>) -> Result<(), String> {
+fn open_path(path: &std::path::Path) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     let app = APP_HANDLE.get().ok_or("app not initialized yet")?;
     app.opener()
-        .open_path(path.as_ref().to_string_lossy(), None::<&str>)
+        .open_path(path.to_string_lossy(), None::<&str>)
         .map_err(|e| e.to_string())
 }
 
-/// Opens a URL in the system browser — used for the OAuth/SSO login step.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn open_url(url: &str) -> Result<(), String> {
-    open::that(url).map_err(|e| e.to_string())
-}
-
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub fn open_url(url: &str) -> Result<(), String> {
+fn open_url(url: &str) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
     let app = APP_HANDLE.get().ok_or("app not initialized yet")?;
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
-/// Shows an OS notification via `tauri-plugin-notification` — mobile only,
-/// see `Command::ShowNotification` in `matrix/worker.rs` for the desktop
-/// path (`notify-rust`). `room_id`/`thread_id` ride along as the
-/// notification's own `extra` payload purely so `MainActivity.kt`'s
-/// `handleNotificationTap` has something to read back out of the tap
-/// intent — this plugin has no click-callback hook the way notify-rust
-/// does, so routing the tap anywhere useful has to happen on the native
-/// side instead, not here.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub fn show_notification(room_id: &str, thread_id: Option<&str>, title: &str, body: &str) -> Result<(), String> {
+fn show_notification(room_id: &str, thread_id: Option<&str>, title: &str, body: &str) -> Result<(), String> {
     use tauri_plugin_notification::NotificationExt;
     let app = APP_HANDLE.get().ok_or("app not initialized yet")?;
     // `icon` (a plain white silhouette, `res/drawable/ic_notification.png`)

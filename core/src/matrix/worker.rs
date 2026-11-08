@@ -868,6 +868,17 @@ async fn handle(
             }
         }
 
+        Command::ResumeSync => {
+            // Clone the Arc out so the state lock is not held across the
+            // stop/start awaits (stop can take a while on a dead socket).
+            let sync_service = state.lock().await.sync_service.clone();
+            if let Some(sync_service) = sync_service {
+                tracing::info!("resume: restarting sync service");
+                sync_service.stop().await;
+                sync_service.start().await;
+            }
+        }
+
         Command::StartSync => {
             // Guards against ever running this handler's body twice in one
             // process lifetime. It's only ever meant to run once (on
@@ -898,6 +909,7 @@ async fn handle(
             register_reaction_handler(&client, tx.clone());
             register_sticker_handler(&client, tx.clone());
             register_receipt_handler(&client, tx.clone());
+            spawn_server_unread_poller(client.clone(), tx.clone());
             register_pinned_events_handler(&client, tx.clone());
             register_poll_handlers(&client, tx.clone());
             register_presence_handler(&client, tx.clone());
@@ -940,7 +952,20 @@ async fn handle(
             // room list on startup — contrast the removed
             // `client.rooms()`-based `refresh_rooms`, which pulled every
             // room in the account on every refresh.
-            let sync_service = SyncService::builder(client.clone()).build().await?;
+            // The room list syncs only the latest event per room by default,
+            // so the SDK's unread count can't see any backlog until a room's
+            // timeline is opened (a room showing 2 unread turned into 31).
+            // A longer window lets it count up to that many per room from
+            // the start; the connection id is bumped so rooms the old
+            // session already knew get re-sent with the longer window.
+            let sync_service = SyncService::builder(client.clone())
+                // After a network drop or resume the SDK keeps probing the
+                // server and restarts sync itself instead of staying stuck.
+                .with_offline_mode()
+                .with_room_list_conn_id("room-list-u50".to_string())
+                .with_room_list_timeline_limit(50)
+                .build()
+                .await?;
             let room_list_service = sync_service.room_list_service();
             sync_service.start().await;
             state.lock().await.sync_service = Some(Arc::new(sync_service));
@@ -1148,16 +1173,33 @@ async fn handle(
             // either the room's start is reached or enough items have
             // accumulated, capped so a slow homeserver can't hang this
             // command forever.
-            for _ in 0..10 {
-                if timeline.items().await.len() >= 20 {
+            //
+            // Counted in real messages (dividers and read markers are items
+            // too), and a call that brought nothing waits a moment before
+            // the next: back-to-back lazy calls used up the whole budget in
+            // milliseconds and left a room with only a few recent messages.
+            let mut idle = 0;
+            for _ in 0..30 {
+                let before = count_events(&timeline).await;
+                if before >= 30 {
                     break;
                 }
-                match timeline.paginate_backwards(20).await {
+                match timeline.paginate_backwards(30).await {
                     Ok(true) => {
                         tracing::info!(room_id, "LoadTimeline: reached room start");
                         break;
                     }
-                    Ok(false) => continue,
+                    Ok(false) => {
+                        if count_events(&timeline).await > before {
+                            idle = 0;
+                        } else {
+                            idle += 1;
+                            if idle >= 8 {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, room_id, "initial backward pagination failed");
                         break;
@@ -1195,18 +1237,23 @@ async fn handle(
             //
             // Same "lazy pagination" looping as `Command::LoadTimeline` —
             // see its comment for why one call isn't enough anymore.
-            let items_before = timeline.items().await.len();
+            let items_before = count_events(&timeline).await;
             let mut reached_start = false;
-            for _ in 0..10 {
-                match timeline.paginate_backwards(20).await {
+            for attempt in 0..30 {
+                match timeline.paginate_backwards(30).await {
                     Ok(true) => {
                         reached_start = true;
                         break;
                     }
                     Ok(false) => {
-                        if timeline.items().await.len() > items_before {
+                        if count_events(&timeline).await > items_before {
                             break;
                         }
+                        // nothing new yet: give the lazy pagination time
+                        if attempt >= 8 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, room_id, "PaginateBack failed");
@@ -1889,7 +1936,22 @@ async fn handle(
                 .get_room(RoomId::parse(&room_id)?.as_ref())
                 .ok_or_else(|| anyhow::anyhow!("room not found"))?;
             let user_id = matrix_sdk::ruma::UserId::parse(&user_id)?;
-            room.invite_user_by_id(&user_id).await?;
+            // Inviting to an encrypted room first shares the room's history
+            // with the invitee (MSC4268), which the SDK only does from a
+            // device that is cross-signed; from an unverified one it fails
+            // *before* the invite is sent ("Encryption failed because your
+            // device is not verified"). The invite itself doesn't need
+            // that: send it directly, the invitee just won't get the
+            // history from before they joined.
+            if let Err(e) = room.invite_user_by_id(&user_id).await {
+                if !e.to_string().contains("not verified") {
+                    return Err(e.into());
+                }
+                tracing::warn!(error = %e, room_id, "InviteUser: history sharing skipped, device not verified");
+                use matrix_sdk::ruma::api::client::membership::invite_user::v3::{InvitationRecipient, InviteUserId, Request};
+                let recipient = InvitationRecipient::UserId(InviteUserId::new(user_id.clone()));
+                client.send(Request::new(room.room_id().to_owned(), recipient)).await?;
+            }
         }
 
         Command::LeaveRoom { room_id } => {
@@ -2536,6 +2598,7 @@ async fn handle(
                     media_mime: None,
                     media_encryption: None,
                     thumbnail_url: None,
+                    media_size: None,
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -2557,6 +2620,7 @@ async fn handle(
                     latest_reply_media_url: None,
                     latest_reply_media_mime: None,
                     latest_reply_media_encryption: None,
+                    latest_reply_media_size: None,
                     is_unread: None,
                     local_id: None,
                 };
@@ -2741,6 +2805,53 @@ async fn handle(
                 }
                 Err(e) => {
                     tx.send(Event::Error(format!("key import failed: {e}"))).ok();
+                }
+            }
+        }
+
+        Command::CreateRecoveryKey => {
+            let client = get_client(&state).await?;
+            use crate::matrix::verification::CreateKeyError;
+            match crate::matrix::verification::create_recovery_key(&client).await {
+                Ok(key) => {
+                    tx.send(Event::RecoveryKeyCreated { key }).ok();
+                    tx.send(Event::RecoveryStatus("đã tạo security key mới".to_string())).ok();
+                }
+                Err(CreateKeyError::BackupExists) => {
+                    tx.send(Event::RecoveryBackupExists).ok();
+                }
+                Err(CreateKeyError::Other(e)) => {
+                    tx.send(Event::RecoveryStatus(format!("không tạo được key: {e}. Hãy xác minh thiết bị này (phần trên) rồi thử lại."))).ok();
+                }
+            }
+        }
+
+        Command::ResetIdentity { password } => {
+            let client = get_client(&state).await?;
+            let notify = tx.clone();
+            let result = crate::matrix::verification::reset_identity(&client, &password, move |m| {
+                notify.send(Event::RecoveryStatus(m)).ok();
+            })
+            .await;
+            match result {
+                Ok(key) => {
+                    tx.send(Event::RecoveryKeyCreated { key }).ok();
+                    tx.send(Event::RecoveryStatus("đã bắt đầu lại, thiết bị này đã được xác minh".to_string())).ok();
+                }
+                Err(e) => {
+                    tx.send(Event::RecoveryStatus(format!("đặt lại thất bại: {e}"))).ok();
+                }
+            }
+        }
+
+        Command::ExportRoomKeys { passphrase } => {
+            let client = get_client(&state).await?;
+            match crate::matrix::verification::export_room_keys(&client, &passphrase).await {
+                Ok(bytes) => {
+                    tx.send(Event::RoomKeysExported { bytes }).ok();
+                }
+                Err(e) => {
+                    tx.send(Event::Error(format!("key export failed: {e}"))).ok();
                 }
             }
         }
@@ -3387,11 +3498,7 @@ async fn entry_to_summary(
     // `num_unread_notifications()` is matrix-sdk's own client-side count
     // (derived from read receipts vs. actual decrypted events), which is
     // what Element itself falls back to for the same reason.
-    let unread_count = room.num_unread_notifications();
-    // Same client-side derivation, scoped to just the messages that
-    // actually ping this account — see `RoomSummary::mention_count`'s doc
-    // comment.
-    let mention_count = room.num_unread_mentions();
+    let (unread_count, mention_count) = room_unread_counts(&room);
 
     RoomSummary {
         room_id: room_id_str,
@@ -3733,11 +3840,16 @@ async fn fetch_threads_page(
     let response = client.send(request).await?;
 
     let room = client.get_room(&parsed_room_id);
+    // several at once (in order): each root may decrypt, look up names and
+    // its unread count over the network — one after the other, a page of
+    // 50 took many seconds
     let mut page = Vec::new();
-    for raw in &response.chunk {
-        if let Some(event) = parse_thread_root(client, room.as_ref(), room_id, raw).await {
-            page.push(event);
-        }
+    for group in response.chunk.chunks(8) {
+        let parsed = futures_util::future::join_all(
+            group.iter().map(|raw| parse_thread_root(client, room.as_ref(), room_id, raw)),
+        )
+        .await;
+        page.extend(parsed.into_iter().flatten());
     }
     // Only sorts within this one page — the server already hands back
     // pages in recency order, so this just normalizes ties, not
@@ -4323,9 +4435,57 @@ async fn fetch_thread_replies_page(
         }
     }
     replies.reverse();
+    attach_reactions(client, room, &mut replies).await;
+    attach_read_receipts(client, room, root_event_id, &mut replies).await;
 
     let next_batch = next_batch.filter(|n| !n.is_empty());
     (replies, next_batch)
+}
+
+/// `read_by` for thread replies, which come from `/relations` rather than a
+/// timeline item: whoever's newest receipt in this thread (threaded, or an
+/// unthreaded one from a client that doesn't send those) is exactly that
+/// reply, from the local store — no request. Excludes our own receipt.
+async fn attach_read_receipts(
+    client: &Client,
+    room: &matrix_sdk::Room,
+    root_id: &matrix_sdk::ruma::EventId,
+    events: &mut [crate::models::TimelineEvent],
+) {
+    use matrix_sdk::ruma::events::receipt::{ReceiptThread, ReceiptType};
+    let own = client.user_id().map(|u| u.to_string());
+    for ev in events.iter_mut() {
+        let Ok(id) = matrix_sdk::ruma::OwnedEventId::try_from(ev.event_id.as_str()) else { continue };
+        for thread in [ReceiptThread::Thread(root_id.to_owned()), ReceiptThread::Unthreaded] {
+            let Ok(found) = room.load_event_receipts(ReceiptType::Read, thread, &id).await else { continue };
+            for (user, _) in found {
+                let user = user.to_string();
+                if Some(&user) != own.as_ref() && !ev.read_by.contains(&user) {
+                    ev.read_by.push(user);
+                }
+            }
+        }
+    }
+}
+
+/// Reactions for events parsed from raw `/relations` / `/threads` JSON:
+/// servers don't bundle `m.annotation`s, so without this a reopened thread
+/// showed none (only the live handler's `Event::Reactions` added them).
+/// One `/relations` call per event, all at once.
+async fn attach_reactions(client: &Client, room: &matrix_sdk::Room, events: &mut [crate::models::TimelineEvent]) {
+    let my_id = client.user_id().map(|u| u.to_string());
+    let fetched = futures_util::future::join_all(events.iter().map(|ev| async move {
+        match matrix_sdk::ruma::OwnedEventId::try_from(ev.event_id.as_str()) {
+            Ok(id) => fetch_reaction_events(client, room, &id).await,
+            Err(_) => Vec::new(),
+        }
+    }))
+    .await;
+    for (ev, raw) in events.iter_mut().zip(fetched) {
+        if !raw.is_empty() {
+            ev.reactions = summarize_reactions(&raw, my_id.as_deref());
+        }
+    }
 }
 
 /// `/relations` (used for thread replies — see `fetch_thread_replies_page`)
@@ -4659,6 +4819,8 @@ async fn parse_raw_message_event(
         latest_reply_media_url,
         latest_reply_media_mime,
         latest_reply_media_encryption,
+        latest_reply_media_size: latest_reply_content.and_then(crate::matrix::convert::media_size),
+        media_size: content.and_then(crate::matrix::convert::media_size),
         is_unread,
         local_id: None,
     })
@@ -4672,6 +4834,8 @@ async fn parse_raw_message_event(
 /// Reads straight from the local sync store (`Room::load_user_receipt`) —
 /// no network round trip, since receipts already flow in continuously as
 /// `m.receipt` ephemeral events over `/sync`.
+/// Whether this account's threaded read receipt (local store, no network)
+/// is behind the thread's latest reply.
 async fn thread_is_unread(
     client: &Client,
     room_id: &str,
@@ -4683,13 +4847,11 @@ async fn thread_is_unread(
     let room = RoomId::parse(room_id).ok().and_then(|id| client.get_room(&id))?;
     let user_id = client.user_id()?;
     let root_event_id = OwnedEventId::try_from(root_event_id).ok()?;
-
     let read = room
         .load_user_receipt(ReceiptType::Read, ReceiptThread::Thread(root_event_id), user_id)
         .await
         .ok()
         .flatten();
-
     Some(match read {
         Some((read_event_id, _)) => read_event_id.as_str() != latest_event_id,
         None => true,
@@ -4953,12 +5115,25 @@ fn chrono_like_timestamp() -> u128 {
 /// so the room list preview / unread state can update even for rooms whose
 /// timeline isn't currently open.
 fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
+    // The room list now syncs a window of recent events per room (for the
+    // unread counts), so on startup this handler sees each room's backlog
+    // too. Those are history, not new messages: no notifications, no
+    // "new reply" bumps. Anything sent before the app started (minus a
+    // little slack for clock skew) is dropped here; opening the room loads
+    // it properly.
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     client.add_event_handler(
         move |ev: matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent,
               room: matrix_sdk::room::Room,
               client: Client| {
             let tx = tx.clone();
             async move {
+                if u64::from(ev.origin_server_ts.get()) + 60_000 < started_ms {
+                    return;
+                }
                 let room_id = room.room_id().to_string();
 
                 // An edit arrives as a brand new `m.room.message` event
@@ -5066,6 +5241,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     media_mime,
                     media_encryption,
                     thumbnail_url,
+                    media_size: crate::matrix::convert::typed_media_size(&ev.content.msgtype),
                     timestamp: ev.origin_server_ts.0.into(),
                     reply_to_event_id,
                     reply_to_preview: None,
@@ -5084,6 +5260,7 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
                     latest_reply_media_url: None,
                     latest_reply_media_mime: None,
                     latest_reply_media_encryption: None,
+                    latest_reply_media_size: None,
                     is_unread: None,
                     // Only ever `Some` down the sync stream reaching the
                     // exact device that sent this — see `local_id`'s doc
@@ -5139,18 +5316,162 @@ fn register_new_message_handler(client: &Client, tx: UnboundedSender<Event>) {
 /// fresh from `room.num_unread_notifications()`/`num_unread_mentions()` —
 /// same client-side derivation `entry_to_summary` uses for the initial
 /// `RoomSummary`, now just re-run on demand instead of only once at load.
+/// The room's unread / mention counts. The SDK's own client-side count is
+/// the better one for encrypted rooms (the server counts every encrypted
+/// event, reactions and edits included), but it only knows the events it
+/// has seen: with a short sync window, messages that arrived while the app
+/// was closed are missing, so it says 0 (or too few) until the room's
+/// timeline is opened and paginated. The server's count is complete, so
+/// whenever it is higher than the client's, the client's count is
+/// incomplete and the server's is the better bound. Both are logged.
+fn room_unread_counts(room: &matrix_sdk::Room) -> (u64, u64) {
+    let client = (room.num_unread_notifications(), room.num_unread_mentions());
+    let sliding = room.unread_notification_counts();
+    let polled = server_unread_map()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(room.room_id().as_str()).copied())
+        .unwrap_or((0, 0));
+    let (server_n, server_m) = (
+        sliding.notification_count.max(polled.0),
+        sliding.highlight_count.max(polled.1),
+    );
+    tracing::debug!(
+        room_id = %room.room_id(),
+        client_unread = client.0,
+        client_mentions = client.1,
+        server_unread = server_n,
+        server_mentions = server_m,
+        "unread counts"
+    );
+    (client.0.max(server_n), client.1.max(server_m))
+}
+
+/// Last unread / mention counts the homeserver reported over `/sync` v2,
+/// keyed by room id. This homeserver sends `0` for every room over sliding
+/// sync (MSC4186) but the real numbers over v2, so the sliding-sync value
+/// the SDK stores is useless and this map is the only server-side source.
+fn server_unread_map() -> &'static std::sync::Mutex<HashMap<String, (u64, u64)>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (u64, u64)>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+/// Polls `/sync` v2 in the background purely for `unread_notifications`.
+/// The first call returns every room (~2 s for 130 rooms); later calls pass
+/// `since` and only return rooms that changed (~0.4 s). Runs off the UI
+/// path, so it never delays the sliding-sync room list.
+fn spawn_server_unread_poller(client: Client, tx: UnboundedSender<Event>) {
+    tokio::spawn(async move {
+        let http = media_http_client();
+        let filter = serde_json::json!({
+            "room": {
+                "timeline": {"limit": 1},
+                "state": {"types": []},
+                "ephemeral": {"types": []},
+                "account_data": {"types": []},
+            },
+            "presence": {"types": []},
+            "account_data": {"types": []},
+        })
+        .to_string();
+        // Wait for sliding sync to know some rooms, so the first (full)
+        // poll's updates are not dropped for rooms that don't exist yet.
+        for _ in 0..30 {
+            if !client.rooms().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let mut since: Option<String> = None;
+        loop {
+            if tx.is_closed() {
+                return;
+            }
+            let Some(token) = client.access_token() else {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            };
+            let mut query = vec![("timeout", "0".to_string()), ("filter", filter.clone())];
+            if let Some(s) = &since {
+                query.push(("since", s.clone()));
+            }
+            let url = format!("{}_matrix/client/v3/sync", client.homeserver());
+            let body = match http.get(&url).bearer_auth(token).query(&query).send().await {
+                Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                Ok(r) => {
+                    tracing::debug!(status = %r.status(), "unread poll rejected");
+                    since = None;
+                    None
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "unread poll failed");
+                    None
+                }
+            };
+            if let Some(body) = body {
+                since = body["next_batch"].as_str().map(str::to_owned);
+                let mut changed = Vec::new();
+                if let Some(joined) = body["rooms"]["join"].as_object() {
+                    if let Ok(mut map) = server_unread_map().lock() {
+                        for (id, room) in joined {
+                            let n = &room["unread_notifications"];
+                            let counts = (
+                                n["notification_count"].as_u64().unwrap_or(0),
+                                n["highlight_count"].as_u64().unwrap_or(0),
+                            );
+                            if map.insert(id.clone(), counts) != Some(counts) {
+                                changed.push(id.clone());
+                            }
+                        }
+                    }
+                }
+                for id in changed {
+                    let Ok(room_id) = matrix_sdk::ruma::RoomId::parse(&id) else { continue };
+                    let Some(room) = client.get_room(&room_id) else { continue };
+                    let (unread_count, mention_count) = room_unread_counts(&room);
+                    tx.send(Event::UnreadCountChanged { room_id: id, unread_count, mention_count })
+                        .ok();
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+}
+
 fn register_receipt_handler(client: &Client, tx: UnboundedSender<Event>) {
     client.add_event_handler(
-        move |_ev: matrix_sdk::ruma::events::SyncEphemeralRoomEvent<
+        move |ev: matrix_sdk::ruma::events::SyncEphemeralRoomEvent<
                   matrix_sdk::ruma::events::receipt::ReceiptEventContent,
               >,
-              room: matrix_sdk::room::Room| {
+              room: matrix_sdk::room::Room,
+              client: Client| {
             let tx = tx.clone();
             async move {
+                use matrix_sdk::ruma::events::receipt::ReceiptType;
+                for (event_id, kinds) in ev.content.iter() {
+                    for (user_id, _) in kinds.get(&ReceiptType::Read).into_iter().flatten() {
+                        if client.user_id() == Some(user_id.as_ref()) {
+                            // Own receipt: the polled server count is now
+                            // stale, drop it until the next poll refreshes.
+                            if let Ok(mut m) = server_unread_map().lock() {
+                                m.insert(room.room_id().to_string(), (0, 0));
+                            }
+                            continue;
+                        }
+                        tx.send(Event::ReadReceipt {
+                            room_id: room.room_id().to_string(),
+                            user_id: user_id.to_string(),
+                            event_id: event_id.to_string(),
+                        })
+                        .ok();
+                    }
+                }
+                let (unread_count, mention_count) = room_unread_counts(&room);
                 tx.send(Event::UnreadCountChanged {
                     room_id: room.room_id().to_string(),
-                    unread_count: room.num_unread_notifications(),
-                    mention_count: room.num_unread_mentions(),
+                    unread_count,
+                    mention_count,
                 })
                 .ok();
             }
@@ -5190,6 +5511,7 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                     media_mime: None,
                     media_encryption: None,
                     thumbnail_url: None,
+                    media_size: ev.content.info.width.zip(ev.content.info.height).and_then(|(w, h)| crate::matrix::convert::sane_size(w.into(), h.into())),
                     timestamp: ev.origin_server_ts.0.into(),
                     reply_to_event_id: None,
                     reply_to_preview: None,
@@ -5208,6 +5530,7 @@ fn register_sticker_handler(client: &Client, tx: UnboundedSender<Event>) {
                     latest_reply_media_url: None,
                     latest_reply_media_mime: None,
                     latest_reply_media_encryption: None,
+                    latest_reply_media_size: None,
                     is_unread: None,
                     local_id: None,
                 };
@@ -5357,4 +5680,10 @@ fn register_presence_handler(client: &Client, tx: UnboundedSender<Event>) {
             }
         },
     );
+}
+
+/// Real messages in a timeline: its items also hold day dividers and the
+/// read marker, which say nothing about how much history has loaded.
+async fn count_events(timeline: &matrix_sdk_ui::timeline::Timeline) -> usize {
+    timeline.items().await.iter().filter(|i| i.as_event().is_some()).count()
 }

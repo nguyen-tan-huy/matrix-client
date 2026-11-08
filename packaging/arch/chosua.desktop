@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ChoSua
+Comment=Matrix chat client
+Exec=chosua
+Icon=chosua
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+StartupNotify=false
+StartupWMClass=chosua

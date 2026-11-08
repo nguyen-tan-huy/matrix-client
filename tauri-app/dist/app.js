@@ -1242,41 +1242,94 @@ function renderFavoriteTabs() {
         // Fixed alphabetical order — tabs must not jump around as new
         // messages bump rooms in `state.rooms`' activity order.
         .sort((a, b) => a.name.localeCompare(b.name, "vi", { sensitivity: "base" }) || a.room_id.localeCompare(b.room_id));
-  const frag = document.createDocumentFragment();
-  for (const room of favorites) {
-    const tab = document.createElement("div");
-    tab.className = "fav-tab" + (room.room_id === state.selectedRoom ? " selected" : "");
-    tab.title = room.name;
-    tab.dataset.roomId = room.room_id;
-    tab.appendChild(renderAvatar(room.avatar_url, room.name, room.room_id, 18));
-    const name = document.createElement("span");
-    name.className = "fav-tab-name" + (room.unread_count > 0 ? " unread" : "");
-    name.textContent = (room.is_encrypted ? "[e] " : "") + room.name;
-    tab.appendChild(name);
-    if (room.unread_count > 0) {
-      const badge = document.createElement("span");
-      badge.className = "room-badge" + (room.mention_count > 0 ? " mention" : "");
-      badge.textContent = room.unread_count > 99 ? "99+" : String(room.unread_count);
-      tab.appendChild(badge);
+  // Updated in place, keyed by room: this runs from every `renderRooms()`
+  // (any new message, unread count, typing... in any room), and rebuilding
+  // every tab each time re-created their avatar <img>s (blank until decoded
+  // again) and dropped their glass ink (`data-ink`, the text color gliding
+  // back over 450 ms) — the favorites strip visibly jumped on every update.
+  // Now only what changed is touched, and nodes stay put.
+  const keep = new Set(favorites.map((r) => r.room_id));
+  for (const [id, tab] of favTabEls) {
+    if (!keep.has(id)) {
+      tab.remove();
+      favTabEls.delete(id);
     }
-    const close = document.createElement("button");
-    close.className = "fav-tab-close";
-    close.title = "remove from favorites";
-    close.textContent = "×";
-    close.addEventListener("click", (e) => {
-      e.stopPropagation();
-      send("SetRoomFavorite", { room_id: room.room_id, favorite: false });
-    });
-    tab.appendChild(close);
-    tab.addEventListener("click", () => selectRoom(room.room_id));
-    tab.addEventListener("auxclick", (e) => {
-      if (e.button !== 1) return;
-      e.preventDefault();
-      send("SetRoomFavorite", { room_id: room.room_id, favorite: false });
-    });
-    frag.appendChild(tab);
   }
-  container.replaceChildren(frag);
+  let prev = null;
+  for (const room of favorites) {
+    let tab = favTabEls.get(room.room_id);
+    if (!tab) {
+      tab = createFavoriteTab(room.room_id);
+      favTabEls.set(room.room_id, tab);
+    }
+    updateFavoriteTab(tab, room);
+    // move only if out of place (moving a node re-lays it out)
+    const want = prev ? prev.nextSibling : container.firstChild;
+    if (want !== tab) container.insertBefore(tab, want);
+    prev = tab;
+  }
+}
+
+const favTabEls = new Map(); // room_id -> .fav-tab, see renderFavoriteTabs
+
+function createFavoriteTab(roomId) {
+  const tab = document.createElement("div");
+  tab.className = "fav-tab";
+  tab.dataset.roomId = roomId;
+  const name = document.createElement("span");
+  name.className = "fav-tab-name";
+  tab.appendChild(name);
+  const badge = document.createElement("span");
+  badge.className = "room-badge";
+  badge.style.display = "none";
+  tab.appendChild(badge);
+  const close = document.createElement("button");
+  close.className = "fav-tab-close";
+  close.title = "remove from favorites";
+  close.textContent = "×";
+  close.addEventListener("click", (e) => {
+    e.stopPropagation();
+    send("SetRoomFavorite", { room_id: roomId, favorite: false });
+  });
+  tab.appendChild(close);
+  tab.addEventListener("click", () => selectRoom(roomId));
+  tab.addEventListener("auxclick", (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    send("SetRoomFavorite", { room_id: roomId, favorite: false });
+  });
+  return tab;
+}
+
+function updateFavoriteTab(tab, room) {
+  const cls = "fav-tab" + (room.room_id === state.selectedRoom ? " selected" : "");
+  if (tab.className !== cls) tab.className = cls;
+  if (tab.title !== room.name) tab.title = room.name;
+  // the avatar only when what it shows changes (a fetched image arriving
+  // changes `renderAvatar`'s output too, hence the cache lookup in the key)
+  const avatarKey = `${room.avatar_url || ""}|${room.name}|${room.avatar_url ? (state.imageCache[room.avatar_url] ? 1 : 0) : 0}`;
+  if (tab.dataset.avatarKey !== avatarKey) {
+    tab.dataset.avatarKey = avatarKey;
+    const avatar = renderAvatar(room.avatar_url, room.name, room.room_id, 18);
+    const old = tab.firstElementChild?.classList.contains("fav-tab-name") ? null : tab.firstElementChild;
+    if (old) old.replaceWith(avatar);
+    else tab.prepend(avatar);
+  }
+  const name = tab.querySelector(".fav-tab-name");
+  const nameCls = "fav-tab-name" + (room.unread_count > 0 ? " unread" : "");
+  if (name.className !== nameCls) name.className = nameCls;
+  const text = (room.is_encrypted ? "[e] " : "") + room.name;
+  if (name.textContent !== text) name.textContent = text;
+  const badge = tab.querySelector(".room-badge");
+  if (room.unread_count > 0) {
+    const bcls = "room-badge" + (room.mention_count > 0 ? " mention" : "");
+    if (badge.className !== bcls) badge.className = bcls;
+    const btext = room.unread_count > 99 ? "99+" : String(room.unread_count);
+    if (badge.textContent !== btext) badge.textContent = btext;
+    if (badge.style.display) badge.style.display = "";
+  } else if (badge.style.display !== "none") {
+    badge.style.display = "none";
+  }
 }
 
 /** Same job as a plain `.room-row.kbd-active` `scrollIntoView()` (see the
@@ -3437,6 +3490,11 @@ function renderMessageItem(event, ctx) {
       wrap.className = "media-wrap";
       const img = document.createElement("img");
       img.alt = event.body || "image";
+      const box = fittedMediaBox(event.media_size, 280, 280);
+      if (box) {
+        img.style.width = `${box.w}px`;
+        img.style.height = `${box.h}px`;
+      }
       img.src = cached;
       img.addEventListener("click", () => openLightbox(cached, event.body));
       wrap.appendChild(img);
@@ -3452,6 +3510,14 @@ function renderMessageItem(event, ctx) {
       const failed = (imageFetchAttempts[event.media_url] || 0) > 0;
       const placeholder = document.createElement("div");
       placeholder.className = "image-placeholder" + (failed ? " failed" : "");
+      // the image's own box (see `fittedMediaBox`), so it swaps in without
+      // changing the row's height
+      const box = fittedMediaBox(event.media_size, 280, 280);
+      if (box) {
+        placeholder.style.width = `${box.w}px`;
+        placeholder.style.height = `${box.h}px`;
+        placeholder.style.boxSizing = "border-box";
+      }
       if (failed) {
         placeholder.textContent = "⟳ image failed to load — click to retry";
       } else {
@@ -5809,6 +5875,49 @@ function appendInitialThreadReplies(rootEventId, newEvents) {
   return true;
 }
 
+// Layout changes inside the thread panel (older pages inserted above,
+// rows re-rendered for a reaction, an image, the member list arriving)
+// are held back while the panel is being scrolled and applied once it has
+// been still for a moment. Each one has to be followed by a scrollTop fix
+// to keep the reader's place (`threadScrollAnchor`), and on WebKitGTK any
+// scrollTop write cuts a touchpad fling short and snaps the view - with a
+// long thread auto-paging in for seconds after it opens, that was a jump
+// every few frames under the user's fingers.
+const THREAD_SCROLL_SETTLE_MS = 250;
+let threadPanelScrolledAt = 0;
+const threadPanelPending = [];
+let threadPanelFlushTimer = 0;
+["scroll", "wheel", "touchmove"].forEach((type) =>
+  el.sidePanel.addEventListener(
+    type,
+    () => {
+      threadPanelScrolledAt = performance.now();
+    },
+    { capture: true, passive: true },
+  ),
+);
+function flushThreadPanelPending() {
+  threadPanelFlushTimer = 0;
+  const wait = THREAD_SCROLL_SETTLE_MS - (performance.now() - threadPanelScrolledAt);
+  if (wait > 0) {
+    threadPanelFlushTimer = setTimeout(flushThreadPanelPending, wait);
+    return;
+  }
+  const jobs = threadPanelPending.splice(0);
+  for (const job of jobs) job();
+}
+/** Runs `job` now, or - while the thread panel is being scrolled - queued
+ * (in order) for when it settles. Returns true if it was queued. */
+function whenThreadPanelSettled(job) {
+  const scrolling = performance.now() - threadPanelScrolledAt < THREAD_SCROLL_SETTLE_MS;
+  if (!scrolling && threadPanelPending.length === 0) return false;
+  threadPanelPending.push(job);
+  if (!threadPanelFlushTimer) {
+    threadPanelFlushTimer = setTimeout(flushThreadPanelPending, THREAD_SCROLL_SETTLE_MS);
+  }
+  return true;
+}
+
 /** Older replies (`Event::ThreadEventsPrepend`) inserted above whatever's
  * already rendered, instead of the full `renderSidePanel()` rebuild that
  * used to run once per page — a long thread's initial open auto-pages
@@ -5822,7 +5931,19 @@ function appendInitialThreadReplies(rootEventId, newEvents) {
  * caller merges `newEvents` into it — needed here to re-derive the old
  * first reply's grouping now that a new predecessor precedes it, and to
  * fall back to a full render if the shell isn't in the expected shape. */
-function prependThreadReplies(rootEventId, newEvents, oldEvents) {
+function prependThreadReplies(rootEventId, newEvents, oldEvents, settled = false) {
+  if (
+    !settled &&
+    whenThreadPanelSettled(() => {
+      const still = state.rightPanel;
+      if (!prependThreadReplies(rootEventId, newEvents, oldEvents, true)
+          && still?.kind === "thread" && still.root.event_id === rootEventId) {
+        renderSidePanel();
+      }
+    })
+  ) {
+    return true;
+  }
   const rp = state.rightPanel;
   if (!rp || rp.kind !== "thread" || rp.root.event_id !== rootEventId) return false;
   const msgsEl = document.getElementById("thread-messages");
@@ -5895,7 +6016,8 @@ function patchMessagesWithMedia(mxcUri) {
   }
 }
 
-function rerenderThreadMessageInPlace(eventId) {
+function rerenderThreadMessageInPlace(eventId, settled = false) {
+  if (!settled && whenThreadPanelSettled(() => rerenderThreadMessageInPlace(eventId, true))) return;
   const rp = state.rightPanel;
   if (!rp || rp.kind !== "thread") return;
   const msgsEl = document.getElementById("thread-messages");
@@ -6003,16 +6125,33 @@ function renderThreadsListPanel() {
  * text `body` alone would show; markdown-rendered text (`renderMarkdown`,
  * for bold/italic/code/links) for anything else. `null` when `msgType`
  * isn't `"image"` — callers fall back to their own plain-text render. */
-function threadRowImageHtml(msgType, mediaUrl, mediaMime, mediaEncryption, altText) {
+/** The box an image of the sender's declared size (`media_size`, from
+ * `content.info.w/h`) will take once fitted into maxW x maxH — set on the
+ * placeholder *and* the `<img>`, so the row is already its final height
+ * while the bytes are still downloading/decoding. Without it every image
+ * popped in at its real size after the row had been laid out small, and
+ * the list jumped under the reader (worst while scrolling, when rows full
+ * of images keep coming into view). `null` if the sender didn't say. */
+function fittedMediaBox(size, maxW, maxH) {
+  if (!Array.isArray(size) || !(size[0] > 0) || !(size[1] > 0)) return null;
+  const k = Math.min(1, maxW / size[0], maxH / size[1]);
+  return { w: Math.max(1, Math.round(size[0] * k)), h: Math.max(1, Math.round(size[1] * k)) };
+}
+
+function threadRowImageHtml(msgType, mediaUrl, mediaMime, mediaEncryption, altText, mediaSize) {
   if (msgType !== "image" || !mediaUrl) return null;
   if (mediaMime) state.imageMime[mediaUrl] = mediaMime;
   if (mediaEncryption) state.imageEncryption[mediaUrl] = mediaEncryption;
   const cached = state.imageCache[mediaUrl];
+  const box = fittedMediaBox(mediaSize, 160, 120);
+  const boxStyle = box ? ` style="width:${box.w}px;height:${box.h}px"` : "";
   if (cached) {
-    return `<img src="${cached}" alt="${escapeHtml(altText || "image")}" class="thread-row-thumb" />`;
+    return `<img src="${cached}" alt="${escapeHtml(altText || "image")}" class="thread-row-thumb"${boxStyle} />`;
   }
   if (!state.imageRequested.has(mediaUrl)) requestImage(mediaUrl);
-  return loadingHtml("loading image...");
+  // patched into an <img> in place when the bytes arrive (`ImageBytes`),
+  // not by re-rendering the whole list
+  return `<span class="thread-row-thumb-pending" data-thumb-key="${escapeHtml(mediaUrl)}" data-alt="${escapeHtml(altText || "image")}"${boxStyle}>${loadingHtml("loading image...")}</span>`;
 }
 
 function renderThreadsListRows() {
@@ -6092,12 +6231,12 @@ function renderThreadsListRows() {
       // server-side aggregation, no per-thread fetch needed just to
       // list them). Absent for a thread with 0 replies.
       const lastMsgBody =
-        threadRowImageHtml(t.latest_reply_msg_type, t.latest_reply_media_url, t.latest_reply_media_mime, t.latest_reply_media_encryption, t.latest_reply_body) ??
+        threadRowImageHtml(t.latest_reply_msg_type, t.latest_reply_media_url, t.latest_reply_media_mime, t.latest_reply_media_encryption, t.latest_reply_body, t.latest_reply_media_size) ??
         renderMarkdownPreview(t.latest_reply_body || "", 80);
       const lastMsgHtml = t.latest_reply_body
         ? `<div class="thread-row-last"><span style="color:${senderColor(t.sender)}">${escapeHtml(t.latest_reply_sender_name || "")}:</span> ${lastMsgBody}</div>`
         : "";
-      const rootBody = threadRowImageHtml(t.msg_type, t.media_url, t.media_mime, t.media_encryption, t.body) ?? renderMarkdownPreview(t.body || "", 80);
+      const rootBody = threadRowImageHtml(t.msg_type, t.media_url, t.media_mime, t.media_encryption, t.body, t.media_size) ?? renderMarkdownPreview(t.body || "", 80);
       // Same avatar-left, sender+content-right layout as a message row in
       // the timeline (`renderMessage`) — reads as "a message that happens
       // to have a thread on it" instead of a plain unrelated text-list
@@ -6813,7 +6952,11 @@ function retagInk() {
   const t = Math.min(1, Math.max(0, glassInk.tint));
   const through = (l) => l * (1 - t) + t; // the pane's white body
   const vw = window.innerWidth, vh = window.innerHeight;
-  document.querySelectorAll(INK_TARGETS).forEach((node) => {
+  inkVisible.forEach((node) => {
+    if (!node.isConnected) {
+      inkVisible.delete(node);
+      return;
+    }
     const r = node.getBoundingClientRect();
     if (r.width < 1 || r.height < 1 || r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) return;
     const st = inkStats(g, r);
@@ -6830,13 +6973,76 @@ function retagInk() {
   });
 }
 
+// Only what is on screen is ever retagged. This used to query *every*
+// ink target in the document (each message bubble and sender, every room
+// and thread row — thousands in a busy account) and read each one's
+// getBoundingClientRect() on every scroll frame: a forced layout of the
+// whole app per frame, the stutter while scrolling. An IntersectionObserver
+// keeps the visible set instead (it reports asynchronously, no forced
+// layout), and scrolling retags it at most ~12 times a second — the ink
+// glides between sides over 450 ms anyway.
+const inkVisible = new Set();
+const inkObserver = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (e.isIntersecting) inkVisible.add(e.target);
+    else inkVisible.delete(e.target);
+  }
+  scheduleInkRetag();
+});
+function observeInkTargets(root) {
+  if (root.nodeType !== 1) return;
+  if (root.matches(INK_TARGETS)) inkObserver.observe(root);
+  root.querySelectorAll(INK_TARGETS).forEach((n) => inkObserver.observe(n));
+}
+let inkLastRetag = 0;
+let inkTimer = 0;
 function scheduleInkRetag() {
-  if (glassInk.on && !glassInk.raf) glassInk.raf = requestAnimationFrame(retagInk);
+  if (!glassInk.on || glassInk.raf || inkTimer) return;
+  const wait = 80 - (performance.now() - inkLastRetag);
+  if (wait > 0) {
+    inkTimer = setTimeout(() => {
+      inkTimer = 0;
+      scheduleInkRetag();
+    }, wait);
+    return;
+  }
+  glassInk.raf = requestAnimationFrame(() => {
+    inkLastRetag = performance.now();
+    retagInk();
+  });
 }
 // what's under each element changes when the page itself moves, too
 document.addEventListener("scroll", scheduleInkRetag, { capture: true, passive: true });
 window.addEventListener("resize", scheduleInkRetag);
-new MutationObserver(scheduleInkRetag).observe(document.documentElement, { childList: true, subtree: true });
+observeInkTargets(document.documentElement);
+new MutationObserver((records) => {
+  for (const r of records) {
+    r.addedNodes.forEach(observeInkTargets);
+    r.removedNodes.forEach((n) => {
+      if (n.nodeType !== 1) return;
+      inkVisible.delete(n);
+      n.querySelectorAll?.(INK_TARGETS).forEach((c) => inkVisible.delete(c));
+    });
+  }
+}).observe(document.documentElement, { childList: true, subtree: true });
+
+/** Swaps a thread-list thumbnail placeholder (`threadRowImageHtml`) for
+ * its image once `ImageBytes` brought it, in place. */
+function patchThreadThumbs(key) {
+  const cached = state.imageCache[key];
+  if (!cached) return;
+  document.querySelectorAll(`.thread-row-thumb-pending[data-thumb-key="${CSS.escape(key)}"]`).forEach((ph) => {
+    const img = document.createElement("img");
+    img.className = "thread-row-thumb";
+    img.alt = ph.dataset.alt || "image";
+    if (ph.style.width) {
+      img.style.width = ph.style.width;
+      img.style.height = ph.style.height;
+    }
+    img.src = cached;
+    ph.replaceWith(img);
+  });
+}
 
 // =========================================================================
 // Backend events
@@ -7351,7 +7557,13 @@ function handleBackendEvent(evt) {
       // latest-reply) finishing its download — same "just re-render the
       // panel" refresh as everything else above, cheap enough since this
       // panel is never more than a couple hundred rows.
-      if (state.rightPanel?.kind === "threads-list") renderThreadsListRows();
+      // A thread-list row's own thumbnail finishing its download: swap
+      // just that placeholder for the <img>. Re-rendering the whole list
+      // here (for *any* image — avatars and timeline images included)
+      // recreated every row's <img> mid-scroll: each one blank until
+      // decoded again, the rows collapsing and regrowing — the threads
+      // list "jumping" while images loaded.
+      if (state.rightPanel?.kind === "threads-list") patchThreadThumbs(data.key);
       break;
     }
     case "ImageFetchFailed": {

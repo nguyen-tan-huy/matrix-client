@@ -1,0 +1,556 @@
+/* ChoSua desktop. Colours come from libadwaita (light/dark follows the
+   system); `.glass` is set while swayctl-fx draws liquid glass behind the
+   window, which then must be see-through. */
+
+/* sway(fx) already rounds and clips the window to its own corner_radius;
+   libadwaita's own window radius (and shadow) on top of it makes two
+   different curves that don't line up, so draw the window square. */
+window,
+window.background,
+window.csd,
+window.solid-csd { border-radius: 0; box-shadow: none; }
+
+.room-row { padding: 6px 4px; }
+
+.unread-badge {
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: alpha(currentColor, 0.15);
+  font-size: smaller;
+  font-weight: bold;
+}
+.unread-badge.mention { background: @accent_bg_color; color: @accent_fg_color; }
+
+.timeline { background: none; }
+.timeline > row { padding: 0; }
+.message { padding: 2px 18px; }
+.message .sender { font-weight: bold; color: @accent_color; margin-top: 8px; }
+.message .media { border-radius: 12px; }
+.message .body { font-size: 1.02em; }
+
+.compose-row { padding: 8px 12px; }
+.composer { border-radius: 999px; padding: 0 12px; min-height: 36px; }
+
+/* glass: the window draws no background at all. swayctl-fx shapes the
+   glass from the window's own alpha (anything above ~0.002), so every
+   element below that paints a faint rounded body becomes its own,
+   separate pane of glass: room rows, message bubbles, titles, composer. */
+window.glass,
+window.glass .timeline,
+window.glass .room-list,
+window.glass scrolledwindow,
+window.glass toolbarview,
+window.glass navigation-view,
+window.glass .sidebar-pane,
+window.glass .content-pane,
+window.glass headerbar,
+window.glass .compose-row,
+window.glass statuspage { background: none; box-shadow: none; }
+window.glass headerbar { color: inherit; }
+window.glass .sidebar-pane { border: none; }
+window.glass separator { background: none; min-height: 0; min-width: 0; }
+/* anything translucent would turn into stray glass: bar shadows, the
+   scroll edge shading, the sidebar's border */
+window.glass toolbarview > .top-bar,
+window.glass toolbarview > .bottom-bar,
+window.glass toolbarview > revealer > .top-bar,
+window.glass toolbarview > revealer > .bottom-bar { background: none; box-shadow: none; border: none; }
+window.glass scrolledwindow > undershoot,
+window.glass scrolledwindow > overshoot { background: none; box-shadow: none; }
+window.glass .navigation-sidebar,
+window.glass navigation-split-view > .sidebar-pane { box-shadow: none; border: none; }
+
+/* the glass bodies: each faint fill becomes its own pane of glass */
+window.glass .room-list > row {
+  background: alpha(white, 0.05);
+  border-radius: 18px;
+  margin: 4px 10px;
+  padding: 4px 8px;
+}
+window.glass .room-list > row:hover { background: alpha(white, 0.09); }
+window.glass .room-list > row:selected { background: alpha(@accent_bg_color, 0.28); }
+
+window.glass .timeline > row,
+window.glass .timeline > row:hover { background: none; }
+window.glass .bubble {
+  background: alpha(white, 0.05);
+  border-radius: 18px;
+  padding: 6px 14px;
+}
+window.glass .message { padding: 2px 18px; }
+window.glass .message.grouped { padding-top: 0; }
+window.glass .message .sender { margin-top: 0; }
+
+window.glass .pane-title {
+  background: alpha(white, 0.05);
+  border-radius: 999px;
+  padding: 6px 18px;
+  font-weight: bold;
+}
+window.glass .composer { background: alpha(white, 0.05); border: none; box-shadow: none; outline: none; }
+window.glass .reaction { background: alpha(white, 0.06); border: none; }
+window.glass .reaction:checked { background: alpha(@accent_bg_color, 0.35); }
+window.glass .unread-badge { background: alpha(white, 0.08); }
+window.glass .unread-badge.mention { background: @accent_bg_color; }
+
+/* text over glass: always light. swayctl-fx's `glass text light` darkens the
+   glass just enough behind it wherever the backdrop is too bright, so the
+   app never has to know what's behind it */
+window.glass { color: rgba(255, 255, 255, 0.95); }
+/* the theme gives a listview its own (dark) text colour: messages and
+   threads take the window's, like everything else on the glass */
+window.glass listview, window.glass listview > row { color: inherit; }
+window.glass .message .sender { color: color-mix(in srgb, @accent_color 55%, white); }
+window.glass entry, window.glass .composer-text { color: inherit; }
+window.glass .dim-label { opacity: 0.72; }
+
+.reply-quote { border-left: 3px solid alpha(currentColor, 0.35); padding-left: 8px; opacity: 0.75; }
+.reaction { padding: 0 8px; min-height: 24px; border-radius: 999px; background: alpha(currentColor, 0.08); }
+.reaction:checked { background: alpha(@accent_bg_color, 0.45); }
+.thread-info { opacity: 0.75; }
+.thread-info.unread { opacity: 1; font-weight: bold; }
+.read-receipts avatar { margin-left: 2px; }
+.reactions { margin-top: 2px; }
+.read-receipts { margin-top: 0; margin-bottom: 1px; min-height: 0; }
+.read-receipts label { font-size: 0.75em; margin: 0; padding: 0; }
+.message .caption { margin: 0; }
+
+/* composer: a multi-line field inside a pill */
+.composer { border-radius: 20px; padding: 0 12px; min-height: 36px; background: alpha(currentColor, 0.06); }
+.composer-text, .composer-text > text { background: none; color: inherit; }
+.compose-banner { padding: 4px 6px 4px 14px; border-radius: 999px; background: alpha(currentColor, 0.06); }
+.typing { padding-left: 14px; opacity: 0.75; }
+window.glass .composer { background: alpha(white, 0.05); }
+window.glass .compose-banner { background: alpha(white, 0.05); }
+/* round icon buttons. A MenuButton is a box around its button: style the
+   inner button, never the (square) box itself */
+button.glass-button,
+menubutton.glass-button > button { border-radius: 9999px; min-width: 34px; min-height: 34px; padding: 0; }
+menubutton.glass-button { background: none; box-shadow: none; padding: 0; }
+window.glass button.glass-button,
+window.glass menubutton.glass-button > button { background: alpha(white, 0.05); }
+window.glass button.glass-button:hover,
+window.glass menubutton.glass-button > button:hover { background: alpha(white, 0.12); }
+
+/* local echo */
+.bubble.pending { opacity: 0.6; }
+.bubble.failed { box-shadow: inset 0 0 0 1px alpha(@error_color, 0.7); }
+.send-status { opacity: 0.7; }
+
+.message-menu .quick-reaction { font-size: 1.3em; min-width: 36px; padding: 2px; }
+.message .body link, .message .body a { color: @accent_color; }
+
+/* side panel (threads) */
+.side-panel { border-left: 1px solid alpha(currentColor, 0.1); }
+.threads-list { background: none; }
+.threads-list > row { background: none; padding: 0; }
+window.glass .side-panel { border: none; background: none; }
+window.glass .threads-list > row:hover { background: none; }
+window.glass .threads-list > row:hover .bubble { background: alpha(white, 0.09); }
+
+/* room tools: search and filter chips */
+.room-tools { padding: 4px 10px 6px; }
+.room-search { border-radius: 999px; }
+.chip { border-radius: 999px; padding: 2px 12px; min-height: 26px; }
+.chip > button { border-radius: 999px; padding: 2px 10px; min-height: 26px; }
+.invite { margin: 4px 10px; padding: 8px; border-radius: 18px; background: alpha(currentColor, 0.06); }
+.invites { background: none; }
+.invites > row { background: none; padding: 0; }
+window.glass .room-search { background: alpha(white, 0.05); }
+window.glass .chip, window.glass .chip > button { background: alpha(white, 0.05); }
+window.glass .chip:checked { background: alpha(@accent_bg_color, 0.35); }
+window.glass .invite { background: alpha(white, 0.05); }
+.recording { color: @error_color; padding-left: 14px; font-weight: bold; }
+
+/* pane dividers: invisible (any paint would turn into a sliver of glass),
+   lit while hovered or dragged */
+paned > separator { min-width: 4px; background: none; }
+window.glass paned > separator { min-width: 4px; background: none; }
+paned > separator:hover,
+window.glass paned > separator:hover { background: alpha(@accent_bg_color, 0.35); }
+
+/* favourite tabs above the room: full names, wrapping onto more lines */
+.fav-tabs { padding: 10px 14px 6px; margin-bottom: 10px; }
+.fav-tabs > flowboxchild { padding: 0; background: none; }
+.fav-tab { padding: 6px 8px 6px 8px; border-radius: 999px; background: alpha(currentColor, 0.06); }
+.fav-tab-name { margin: 0 2px; }
+.fav-tab.selected { background: alpha(@accent_bg_color, 0.28); }
+.fav-tab-name.unread { font-weight: bold; }
+.fav-tab-close { min-width: 22px; min-height: 22px; padding: 0; opacity: 0.55; }
+.fav-tab:hover .fav-tab-close { opacity: 1; }
+window.glass .fav-tab { background: alpha(white, 0.05); }
+window.glass .fav-tab:hover { background: alpha(white, 0.10); }
+window.glass .fav-tab.selected { background: alpha(@accent_bg_color, 0.30); }
+
+/* unread threads: a dot on the threads buttons, a mark on the row */
+.thread-room { margin: 8px 0 0 58px; opacity: 0.8; }
+
+/* per-message action (reply in thread): always there, faint. Not
+   revealed on hovering the message: over glass, every hover change makes
+   the compositor re-render the glass around it (a cursor hitch per
+   message crossed); only hovering the button itself changes anything */
+.message .row-action { opacity: 0.45; min-width: 24px; min-height: 24px; padding: 0; margin: 0; }
+.message .row-action:hover, .message .row-action:focus { opacity: 1; }
+
+/* unread thread replies */
+
+/* markdown toolbar above the composer */
+.md-toolbar { padding: 0 0 0 46px; }
+.md-button { min-height: 26px; min-width: 30px; padding: 0 8px; border-radius: 999px; }
+window.glass .md-button { background: alpha(white, 0.04); }
+window.glass .md-button:hover { background: alpha(white, 0.12); }
+
+/* a message shared by link, shown as a small card */
+.shared-card { padding: 6px 10px; border-radius: 12px; background: alpha(currentColor, 0.07); border-left: 3px solid alpha(@accent_color, 0.7); }
+window.glass .shared-card { background: alpha(white, 0.06); }
+window.glass .shared-card:hover { background: alpha(white, 0.12); }
+
+/* the message a shared link jumped to */
+.bubble.jump-highlight { box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.9); background: alpha(@accent_bg_color, 0.30); }
+
+/* key ink (swayctl-fx `glass text auto`): every text over the glass is drawn
+   in the key colour, #FF00FE, and the compositor inks it light or dark from
+   what's behind the glass at that spot. It finds the key only over clear or
+   faintly white glass, so fills behind text stay white-based here, and what
+   isn't drawn on the window's glass (popovers, dialogs, toasts: their own
+   opaque surfaces) keeps the theme's colours. */
+window.glass.ink-key { color: #FF00FE; }
+window.glass.ink-key .message .sender { color: color-mix(in srgb, @accent_color 60%, white); }
+window.glass.ink-key .room-list > row:selected,
+window.glass.ink-key .chip:checked,
+window.glass.ink-key .reaction:checked,
+window.glass.ink-key .fav-tab.selected {
+  background: alpha(white, 0.16); box-shadow: inset 0 0 0 1.5px alpha(@accent_bg_color, 0.85);
+}
+window.glass.ink-key .bubble.jump-highlight {
+  background: alpha(white, 0.18); box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.9);
+}
+window.glass.ink-key selection { background: alpha(white, 0.28); }
+window.glass.ink-key .unread-badge.mention { color: @accent_fg_color; }
+window.glass.ink-key popover, window.glass.ink-key dialog,
+window.glass.ink-key toast, window.glass.ink-key .dialog-sheet { color: @window_fg_color; }
+window.glass.ink-key popover .dim-label, window.glass.ink-key dialog .dim-label { color: inherit; }
+
+/* the glass rim, as swayctl-bar's capsules (swayctl-center LENS_RIM /
+   LENS_INSET): a bright edge and a specular line on every pane of glass */
+window.glass .room-list > row,
+window.glass .bubble,
+window.glass .pane-title,
+window.glass .composer,
+window.glass .compose-banner,
+window.glass .reaction,
+window.glass button.glass-button,
+window.glass menubutton.glass-button > button,
+window.glass .room-search,
+window.glass .chip,
+window.glass .invite,
+window.glass .fav-tab,
+window.glass .md-button,
+window.glass .shared-card {
+  border: 1.5px solid alpha(white, 0.88);
+  box-shadow: inset 0 1px 0 alpha(white, 0.55), inset 0 -1px 1px alpha(black, 0.10);
+}
+/* a chip's inner button is part of the chip: one rim */
+window.glass .chip > button { border: none; box-shadow: none; }
+
+/* ---- Apple look (no glass): iMessage / macOS Messages ----
+   Flat, system blue, big radii, hairlines instead of shadows. Everything is
+   scoped to `window:not(.glass)` so the liquid-glass look above is untouched. */
+@define-color apple_blue #0a84ff;
+@define-color apple_blue_press #0071e3;
+
+/* the sidebar sits on a faintly tinted sheet, split by a hairline */
+window:not(.glass) .sidebar-pane { background: alpha(currentColor, 0.035); border-right: 1px solid alpha(currentColor, 0.08); }
+window:not(.glass) .pane-title { font-weight: 600; font-size: 1.02em; }
+
+/* search: a flat grey field, radius 10 */
+window:not(.glass) .room-search { background: alpha(currentColor, 0.075); border-radius: 10px; border: none; box-shadow: none; min-height: 34px; }
+window:not(.glass) .room-search:focus-within { box-shadow: 0 0 0 3px alpha(@apple_blue, 0.35); }
+
+/* filters: segmented-control pills */
+window:not(.glass) .chip, window:not(.glass) .chip > button { background: alpha(currentColor, 0.075); box-shadow: none; border-radius: 999px; font-weight: 500; }
+window:not(.glass) .chip:checked, window:not(.glass) .chip:checked > button { background: @apple_blue; color: white; }
+
+/* room list: Messages sidebar. Selected row is solid blue with white text */
+window:not(.glass) .room-list { padding: 4px 0; background: none; }
+window:not(.glass) .room-list > row { margin: 1px 8px; padding: 7px 8px; border-radius: 10px; }
+window:not(.glass) .room-list > row:hover { background: alpha(currentColor, 0.06); }
+window:not(.glass) .room-list > row:selected { background: @apple_blue; box-shadow: none; color: white; }
+window:not(.glass) .room-list > row:selected label { color: white; }
+window:not(.glass) .room-list > row:selected .unread-badge { background: alpha(white, 0.28); color: white; }
+window:not(.glass) .unread-badge { background: @apple_blue; color: white; font-weight: 600; padding: 1px 7px; }
+window:not(.glass) .unread-badge.mention { background: #ff453a; color: white; }
+
+/* favourite tabs: quiet capsules */
+window:not(.glass) .fav-tab { background: alpha(currentColor, 0.065); border: none; box-shadow: none; }
+window:not(.glass) .fav-tab:hover { background: alpha(currentColor, 0.11); }
+window:not(.glass) .fav-tab.selected { background: alpha(@apple_blue, 0.18); box-shadow: inset 0 0 0 1px alpha(@apple_blue, 0.6); }
+
+/* messages: grey iMessage bubbles, ours in blue. No borders or shadows. */
+window:not(.glass) .message { padding: 2px 18px; }
+window:not(.glass) .message.grouped { padding-top: 0; }
+window:not(.glass) .message .sender { margin-top: 0; font-weight: 600; font-size: 0.9em; color: alpha(currentColor, 0.62); }
+window:not(.glass) .bubble { background: alpha(currentColor, 0.075); border: none; box-shadow: none; border-radius: 18px; padding: 6px 14px 7px; }
+window:not(.glass) .bubble.own { background: @apple_blue; color: white; }
+window:not(.glass) .bubble.own .sender,
+window:not(.glass) .bubble.own .dim-label,
+window:not(.glass) .bubble.own .thread-info,
+window:not(.glass) .bubble.own .send-status { color: alpha(white, 0.8); opacity: 1; }
+window:not(.glass) .bubble.own .body link,
+window:not(.glass) .bubble.own .body a { color: white; }
+window:not(.glass) .bubble.own .reply-quote { border-left-color: alpha(white, 0.7); background: alpha(white, 0.14); color: white; }
+window:not(.glass) .bubble.jump-highlight { box-shadow: 0 0 0 2px @apple_blue; }
+window:not(.glass) .message .row-action { opacity: 0.28; background: none; box-shadow: none; }
+window:not(.glass) .message .row-action:hover { background: alpha(currentColor, 0.08); opacity: 1; }
+window:not(.glass) .reply-quote { border-left: 3px solid @apple_blue; background: alpha(@apple_blue, 0.08); border-radius: 4px 10px 10px 4px; padding: 3px 8px; opacity: 1; }
+window:not(.glass) .thread-info { color: @apple_blue; opacity: 1; }
+window:not(.glass) .reaction { background: alpha(currentColor, 0.09); border: none; box-shadow: none; padding: 0 9px; }
+window:not(.glass) .reaction:checked { background: alpha(@apple_blue, 0.22); box-shadow: inset 0 0 0 1px @apple_blue; }
+window:not(.glass) .bubble.own .reaction { background: alpha(white, 0.22); color: white; }
+window:not(.glass) .shared-card { background: alpha(currentColor, 0.07); border-left-color: @apple_blue; }
+
+/* composer: an outlined iMessage field, blue when focused */
+window:not(.glass) .compose-row { padding: 8px 14px 12px; }
+window:not(.glass) .composer { background: none; border: 1px solid alpha(currentColor, 0.22); border-radius: 20px; padding: 2px 14px; box-shadow: none; }
+window:not(.glass) .composer:focus-within { border-color: @apple_blue; box-shadow: none; }
+window:not(.glass) .compose-banner { background: alpha(@apple_blue, 0.1); }
+window:not(.glass) .md-button { background: none; box-shadow: none; opacity: 0.7; border-radius: 8px; }
+window:not(.glass) .md-button:hover { background: alpha(currentColor, 0.08); opacity: 1; }
+
+/* round buttons: soft grey; send is the blue arrow */
+window:not(.glass) button.glass-button,
+window:not(.glass) menubutton.glass-button > button { background: alpha(currentColor, 0.075); box-shadow: none; }
+window:not(.glass) button.glass-button:hover,
+window:not(.glass) menubutton.glass-button > button:hover { background: alpha(currentColor, 0.14); }
+window:not(.glass) button.suggested-action { background: @apple_blue; color: white; box-shadow: none; }
+window:not(.glass) button.suggested-action:hover { background: @apple_blue_press; }
+
+/* threads side panel: same sheet as the sidebar */
+window:not(.glass) .side-panel { background: alpha(currentColor, 0.035); border-left: 1px solid alpha(currentColor, 0.08); }
+
+window:not(.glass) scrollbar.vertical slider { min-width: 5px; border-radius: 999px; }
+/* links stay readable on both light and dark */
+window:not(.glass) .message .body link,
+window:not(.glass) .message .body a { color: @apple_blue; }
+
+/* ---- Modern refresh (no glass): calmer surfaces, softer accents ----
+   Content sits on a clean view-coloured sheet, the sidebar on a faint
+   tint; chips, bubbles and the composer lose their heavy fills in favour
+   of light fills + hairlines. Light/dark follows libadwaita colours. */
+window:not(.glass) .content-pane { background: @view_bg_color; }
+window:not(.glass) .sidebar-pane { background: color-mix(in srgb, @window_bg_color 92%, currentColor 8%); border-right: 1px solid alpha(currentColor, 0.07); }
+window:not(.glass) headerbar { background: none; box-shadow: none; }
+window:not(.glass) .pane-title { font-weight: 700; font-size: 1.05em; letter-spacing: 0.1px; color: @window_fg_color; }
+
+/* favourite tabs: compact chips, one quiet line each */
+window:not(.glass) .fav-tabs { padding: 8px 12px 4px; margin-bottom: 4px; }
+window:not(.glass) .fav-tab { padding: 3px 4px 3px 6px; background: alpha(currentColor, 0.05); }
+window:not(.glass) .fav-tab-name { font-size: 0.88em; margin: 0 1px; }
+window:not(.glass) .fav-tab .unread-badge { font-size: 0.72em; padding: 0 5px; min-width: 14px; }
+window:not(.glass) .fav-tab-close { min-width: 18px; min-height: 18px; }
+window:not(.glass) .fav-tab.selected { background: alpha(@apple_blue, 0.13); box-shadow: inset 0 0 0 1px alpha(@apple_blue, 0.45); }
+
+/* room rows: softer selection with a gentle lift */
+window:not(.glass) .room-list > row { margin: 1px 8px; border-radius: 12px; }
+window:not(.glass) .room-list > row:selected { background: linear-gradient(135deg, #2f9bff, #0a6cf0); box-shadow: 0 2px 8px alpha(@apple_blue, 0.35); }
+window:not(.glass) .room-list > row:selected .dim-label { color: alpha(white, 0.82); opacity: 1; }
+
+/* messages: lighter bubbles, own messages in an accent gradient */
+window:not(.glass) .bubble { background: color-mix(in srgb, @view_bg_color 94%, currentColor 6%); border-radius: 16px; padding: 6px 13px 7px; }
+window:not(.glass) .bubble.own { background: linear-gradient(135deg, #2f9bff, #0a6cf0); box-shadow: 0 1px 4px alpha(@apple_blue, 0.25); }
+window:not(.glass) .message .sender { color: @apple_blue; font-weight: 600; }
+window:not(.glass) .bubble.own .sender { color: alpha(white, 0.85); }
+
+/* thread info: a small pill instead of a loud blue line */
+window:not(.glass) .thread-info { background: alpha(@apple_blue, 0.1); border-radius: 999px; padding: 1px 9px; font-size: 0.88em; font-weight: 500; }
+window:not(.glass) .thread-info.unread { background: alpha(@apple_blue, 0.18); font-weight: 700; }
+window:not(.glass) .bubble.own .thread-info { background: alpha(white, 0.2); }
+
+/* composer: a floating field with a soft shadow; the send button is solid */
+window:not(.glass) .composer { background: @view_bg_color; border: 1px solid alpha(currentColor, 0.14); box-shadow: 0 1px 6px alpha(black, 0.06); border-radius: 22px; }
+window:not(.glass) .composer:focus-within { border-color: @apple_blue; box-shadow: 0 0 0 3px alpha(@apple_blue, 0.18); }
+window:not(.glass) button.glass-button.suggested-action,
+window:not(.glass) .compose-row button.suggested-action { background: linear-gradient(135deg, #2f9bff, #0a6cf0); color: white; box-shadow: 0 2px 6px alpha(@apple_blue, 0.4); }
+
+/* thread side panel and reactions */
+window:not(.glass) .side-panel { background: color-mix(in srgb, @window_bg_color 94%, currentColor 6%); }
+window:not(.glass) .reaction { padding: 0 8px; min-height: 22px; font-size: 0.92em; }
+window:not(.glass) .read-receipts avatar { margin-left: 1px; }
+window:not(.glass) scrollbar.vertical slider { min-width: 4px; background: alpha(currentColor, 0.25); }
+window:not(.glass) scrollbar.vertical slider:hover { background: alpha(currentColor, 0.45); }
+window:not(.glass) .message .body link { text-decoration: none; }
+window:not(.glass) .message .body link:hover { text-decoration: underline; }
+
+/* ---- Flat, Element Classic style (no glass) ----
+   No bubbles and no tinted panels: one surface, messages as plain rows
+   (avatar, bold name + faint time, text below) with a faint hover band;
+   panels are told apart by a hairline only. Overrides the rules above. */
+window:not(.glass) .content-pane,
+window:not(.glass) .sidebar-pane,
+window:not(.glass) .side-panel { background: @view_bg_color; }
+window:not(.glass) .sidebar-pane { border-right: 1px solid alpha(currentColor, 0.08); }
+window:not(.glass) .side-panel { border-left: 1px solid alpha(currentColor, 0.08); }
+window:not(.glass) .pane-title { font-weight: 600; }
+
+/* messages: plain rows */
+window:not(.glass) .timeline > row { border-radius: 0; }
+window:not(.glass) .timeline > row:hover,
+window:not(.glass) .threads-list > row:hover { background: alpha(currentColor, 0.045); }
+window:not(.glass) .message { padding: 3px 20px; }
+window:not(.glass) .message.grouped { padding-top: 0; }
+window:not(.glass) .bubble,
+window:not(.glass) .bubble.own {
+  background: none; background-image: none; box-shadow: none; border: none;
+  border-radius: 0; padding: 2px 4px 3px;
+}
+window:not(.glass) .bubble.own .sender,
+window:not(.glass) .bubble.own .dim-label,
+window:not(.glass) .bubble.own .send-status { color: inherit; }
+window:not(.glass) .bubble.own { color: inherit; }
+window:not(.glass) .bubble.own .dim-label { opacity: 0.6; }
+window:not(.glass) .bubble.own .body link,
+window:not(.glass) .bubble.own .body a { color: @apple_blue; }
+window:not(.glass) .bubble.own .reply-quote { color: inherit; background: alpha(@apple_blue, 0.08); border-left-color: @apple_blue; }
+window:not(.glass) .bubble.own .thread-info { color: @apple_blue; background: alpha(@apple_blue, 0.1); }
+window:not(.glass) .bubble.own .reaction { background: alpha(currentColor, 0.07); color: inherit; }
+window:not(.glass) .message .sender { font-weight: 700; font-size: 1em; }
+window:not(.glass) .bubble.jump-highlight { background: alpha(@apple_blue, 0.12); box-shadow: none; }
+window:not(.glass) .bubble.pending { opacity: 0.55; }
+window:not(.glass) .message .row-action { opacity: 0; }
+window:not(.glass) .timeline > row:hover .row-action,
+window:not(.glass) .message .row-action:focus { opacity: 0.7; }
+
+/* reactions: outlined pills like Element's */
+window:not(.glass) .reaction { background: none; box-shadow: inset 0 0 0 1px alpha(currentColor, 0.18); border-radius: 8px; }
+window:not(.glass) .reaction:checked { background: alpha(@apple_blue, 0.12); box-shadow: inset 0 0 0 1px @apple_blue; }
+window:not(.glass) .thread-info { background: none; padding: 0; font-weight: 500; }
+window:not(.glass) .thread-info.unread { background: none; }
+
+/* room list: flat rows, selected = tint, not a coloured card */
+window:not(.glass) .room-list > row { margin: 0 6px; border-radius: 8px; }
+window:not(.glass) .room-list > row:selected { background: alpha(@apple_blue, 0.14); box-shadow: none; color: inherit; }
+window:not(.glass) .room-list > row:selected label { color: inherit; }
+window:not(.glass) .room-list > row:selected .dim-label { color: inherit; opacity: 0.7; }
+window:not(.glass) .room-list > row:selected .unread-badge { background: @apple_blue; color: white; }
+window:not(.glass) .fav-tab, window:not(.glass) .chip, window:not(.glass) .chip > button { border-radius: 8px; }
+
+/* composer: a plain bordered box */
+window:not(.glass) .compose-row { border-top: 1px solid alpha(currentColor, 0.08); }
+window:not(.glass) .composer { border-radius: 8px; box-shadow: none; border: 1px solid alpha(currentColor, 0.2); }
+window:not(.glass) .composer:focus-within { box-shadow: none; border-color: @apple_blue; }
+
+/* ---- clearer messages: per-person name colours, quiet meta, spacing ---- */
+window:not(.glass) .message .sender.name-0 { color: #368bd6; }
+window:not(.glass) .message .sender.name-1 { color: #ac3ba8; }
+window:not(.glass) .message .sender.name-2 { color: #0a9e72; }
+window:not(.glass) .message .sender.name-3 { color: #e64f7a; }
+window:not(.glass) .message .sender.name-4 { color: #e0701c; }
+window:not(.glass) .message .sender.name-5 { color: #1fa8ab; }
+window:not(.glass) .message .sender.name-6 { color: #5c56f5; }
+window:not(.glass) .message .sender.name-7 { color: #5fa81f; }
+window:not(.glass) .message:not(.grouped) { padding-top: 6px; }
+window:not(.glass) .message.grouped { padding-top: 1px; padding-bottom: 1px; }
+window:not(.glass) .message .body { color: @window_fg_color; font-size: 1em; }
+window:not(.glass) .message .time, window:not(.glass) .message .dim-label { font-size: 0.8em; opacity: 0.55; }
+/* the thread summary and read receipts recede; only the unread dot shouts */
+window:not(.glass) .thread-info { color: alpha(currentColor, 0.62); font-size: 0.85em; margin-top: 0; }
+window:not(.glass) .thread-info.unread { color: @window_fg_color; font-weight: 700; }
+window:not(.glass) .bubble.own .thread-info { color: alpha(currentColor, 0.62); background: none; }
+window:not(.glass) .bubble.own .thread-info.unread { color: @window_fg_color; }
+
+/* ---- Modern Minimal ----
+   The house style: one calm neutral sheet, hairlines instead of fills,
+   a single quiet accent, generous radii and air. Last in the file so it
+   wins over the rules above. */
+window:not(.glass) { --mm-line: alpha(currentColor, 0.07); --mm-soft: alpha(currentColor, 0.045); }
+window:not(.glass) .content-pane,
+window:not(.glass) .side-panel { background: @view_bg_color; }
+window:not(.glass) .sidebar-pane { background: color-mix(in srgb, @view_bg_color 96%, currentColor 4%); border-right: 1px solid alpha(currentColor, 0.06); }
+window:not(.glass) .side-panel { border-left: 1px solid alpha(currentColor, 0.06); }
+window:not(.glass) .pane-title { font-weight: 600; font-size: 1em; letter-spacing: 0; }
+
+/* favourite tabs: text with a thin underline when selected, no chips */
+window:not(.glass) .fav-tabs { padding: 10px 16px 2px; }
+window:not(.glass) .fav-tab { background: none; box-shadow: none; border-radius: 999px; padding: 3px 6px 3px 8px; opacity: 0.78; }
+window:not(.glass) .fav-tab:hover { background: var(--mm-soft); opacity: 1; }
+window:not(.glass) .fav-tab.selected { background: alpha(@apple_blue, 0.1); box-shadow: none; opacity: 1; }
+window:not(.glass) .fav-tab.selected .fav-tab-name { color: @apple_blue; font-weight: 600; }
+
+/* rooms: airy rows, a soft tint for the selected one */
+window:not(.glass) .room-list > row { margin: 1px 10px; border-radius: 12px; }
+window:not(.glass) .room-list > row:hover { background: var(--mm-soft); }
+window:not(.glass) .room-list > row:selected { background: alpha(@apple_blue, 0.1); }
+window:not(.glass) .room-list > row:selected .unread-badge { background: @apple_blue; }
+window:not(.glass) .unread-badge { font-weight: 600; }
+
+/* messages: lots of air, quiet meta */
+window:not(.glass) .timeline > row:hover { background: var(--mm-soft); }
+window:not(.glass) .message { padding-left: 24px; padding-right: 24px; }
+window:not(.glass) .message .sender { font-weight: 600; }
+window:not(.glass) .reaction { border-radius: 999px; box-shadow: inset 0 0 0 1px alpha(currentColor, 0.12); }
+window:not(.glass) .reaction:checked { background: alpha(@apple_blue, 0.1); box-shadow: inset 0 0 0 1px alpha(@apple_blue, 0.6); }
+
+/* composer: a soft rounded field, no hard outline until focused */
+window:not(.glass) .compose-row { border-top: none; padding: 8px 16px 12px; }
+window:not(.glass) .composer { border-radius: 18px; border: 1px solid alpha(currentColor, 0.1); background: var(--mm-soft); }
+window:not(.glass) .composer:focus-within { background: @view_bg_color; border-color: alpha(@apple_blue, 0.7); box-shadow: 0 0 0 3px alpha(@apple_blue, 0.12); }
+window:not(.glass) .compose-row button.suggested-action,
+window:not(.glass) button.glass-button.suggested-action { background: @apple_blue; box-shadow: none; }
+window:not(.glass) scrollbar.vertical slider { background: alpha(currentColor, 0.18); }
+
+/* ---- Modern Minimal, card layout ----
+   A soft grey page with two white rounded cards (rooms, chat) floating on
+   it, pill chips, a quiet grey selection and one dark primary action. */
+window:not(.glass) { background: color-mix(in srgb, @window_bg_color 93%, currentColor 7%); }
+window:not(.glass) .main-split { padding: 8px; background: none; }
+window:not(.glass) .mm-card { background: @view_bg_color; border-radius: 22px; box-shadow: 0 1px 2px alpha(black, 0.04); }
+window:not(.glass) .main-split > separator { min-width: 8px; background: none; }
+window:not(.glass) .content-pane,
+window:not(.glass) .sidebar-pane,
+window:not(.glass) .side-panel { border: none; }
+window:not(.glass) .side-panel { border-left: 1px solid alpha(currentColor, 0.06); }
+window:not(.glass) headerbar { background: none; }
+
+/* chips: outlined pills, the active one filled dark */
+window:not(.glass) .chip, window:not(.glass) .chip > button { border-radius: 999px; background: none; box-shadow: inset 0 0 0 1px alpha(currentColor, 0.14); padding: 4px 14px; }
+window:not(.glass) .chip:checked { background: @window_fg_color; color: @view_bg_color; box-shadow: none; }
+window:not(.glass) .fav-tab { border-radius: 999px; box-shadow: inset 0 0 0 1px alpha(currentColor, 0.12); background: none; opacity: 1; }
+window:not(.glass) .fav-tab:hover { background: alpha(currentColor, 0.05); }
+window:not(.glass) .fav-tab.selected { background: none; box-shadow: inset 0 0 0 1.5px @window_fg_color; }
+window:not(.glass) .fav-tab.selected .fav-tab-name { color: inherit; }
+
+/* search field and composer: soft grey pills */
+window:not(.glass) searchentry, window:not(.glass) entry.search { border-radius: 999px; background: alpha(currentColor, 0.05); box-shadow: none; }
+window:not(.glass) .composer { border-radius: 24px; background: alpha(currentColor, 0.045); border: none; }
+window:not(.glass) .composer:focus-within { background: @view_bg_color; box-shadow: inset 0 0 0 1.5px alpha(currentColor, 0.5); border: none; }
+
+/* rooms: grey selection like a nav item, dark badges */
+window:not(.glass) .room-list > row { border-radius: 14px; }
+window:not(.glass) .room-list > row:selected { background: alpha(currentColor, 0.07); }
+window:not(.glass) .room-list > row:selected .unread-badge { background: @window_fg_color; color: @view_bg_color; }
+window:not(.glass) .unread-badge { background: @window_fg_color; color: @view_bg_color; }
+window:not(.glass) .unread-badge.mention { background: #ff453a; color: white; }
+window:not(.glass) .fav-tab .unread-badge { background: @window_fg_color; color: @view_bg_color; }
+window:not(.glass) .fav-tab .unread-badge.mention { background: #ff453a; color: white; }
+
+/* primary action: solid dark, round */
+window:not(.glass) .compose-row button.suggested-action,
+window:not(.glass) button.glass-button.suggested-action { background: @window_fg_color; color: @view_bg_color; }
+window:not(.glass) .message .sender { font-weight: 600; }
+window:not(.glass) .reaction:checked { background: alpha(currentColor, 0.07); box-shadow: inset 0 0 0 1px alpha(currentColor, 0.5); }
+
+/* favourites strip, room and thread panel are each their own card */
+window:not(.glass) .thread-split > separator { min-width: 8px; background: none; }
+window:not(.glass) .thread-split > separator:hover { background: none; }
+window:not(.glass) .side-panel { border: none; }
+window:not(.glass) .fav-tabs { padding: 10px 14px 8px; margin: 0; }
+window:not(.glass) .main-split > separator:hover { background: none; }
+
+/* clearer cards: a darker page, white cards with a hairline and a soft
+   shadow, wider gaps */
+window:not(.glass) { background: color-mix(in srgb, @view_bg_color 86%, black 14%); }
+window:not(.glass) .mm-card { background: @view_bg_color; border: 1px solid alpha(currentColor, 0.07); box-shadow: 0 2px 8px alpha(black, 0.07); }
+window:not(.glass) .main-split { padding: 12px; }
+window:not(.glass) .main-split > separator,
+window:not(.glass) .thread-split > separator { min-width: 12px; }

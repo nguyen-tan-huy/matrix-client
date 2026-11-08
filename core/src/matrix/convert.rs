@@ -318,6 +318,11 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         .map(|id| id.to_string())
         .collect();
 
+    let media_size = event
+        .latest_json()
+        .and_then(|raw| raw.deserialize_as::<serde_json::Value>().ok())
+        .and_then(|v| v.get("content").and_then(media_size));
+
     Some(TimelineEvent {
         event_id: event.event_id()?.to_string(),
         sender,
@@ -329,6 +334,7 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         media_mime,
         media_encryption,
         thumbnail_url,
+        media_size,
         timestamp: event.timestamp().0.into(),
         thread_count,
         is_own,
@@ -352,6 +358,7 @@ pub async fn convert_item(client: &Client, item: &Arc<TimelineItem>) -> Option<T
         latest_reply_media_url: None,
         latest_reply_media_mime: None,
         latest_reply_media_encryption: None,
+        latest_reply_media_size: None,
         is_unread: None,
         local_id: None,
     })
@@ -534,4 +541,25 @@ pub async fn convert_items<'a>(
         }
     }
     out
+}
+
+/// `content.info.w/h` of a media message (what the sender says the image
+/// measures), when both are there and sane.
+pub(crate) fn media_size(content: &serde_json::Value) -> Option<(u32, u32)> {
+    sane_size(content.pointer("/info/w")?.as_u64()?, content.pointer("/info/h")?.as_u64()?)
+}
+
+/// `media_size` from a typed image message (`info.w/h`), for the paths that
+/// have ruma's `MessageType` rather than the raw JSON.
+pub(crate) fn typed_media_size(
+    msgtype: &matrix_sdk::ruma::events::room::message::MessageType,
+) -> Option<(u32, u32)> {
+    use matrix_sdk::ruma::events::room::message::MessageType;
+    let MessageType::Image(img) = msgtype else { return None };
+    let info = img.info.as_ref()?;
+    sane_size(info.width?.into(), info.height?.into())
+}
+
+pub(crate) fn sane_size(w: u64, h: u64) -> Option<(u32, u32)> {
+    (w > 0 && h > 0 && w <= 100_000 && h <= 100_000).then_some((w as u32, h as u32))
 }

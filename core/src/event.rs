@@ -152,6 +152,14 @@ pub enum Event {
     /// `RoomSummary` itself uses, just without the rest of a full summary
     /// (name/avatar/preview/...), none of which a receipt could have
     /// changed anyway.
+    /// Someone else's read receipt moved: `user_id` has now read up to
+    /// exactly `event_id`. Lets the UI move the "seen by" avatar live
+    /// instead of only when the room's messages are next loaded.
+    ReadReceipt {
+        room_id: String,
+        user_id: String,
+        event_id: String,
+    },
     UnreadCountChanged {
         room_id: String,
         unread_count: u64,
@@ -215,6 +223,19 @@ pub enum Event {
     RoomKeysImported {
         imported: usize,
         total: usize,
+    },
+    /// `Command::CreateRecoveryKey` found a key backup on the server that
+    /// this device can't open; only `Command::ResetIdentity` gets past it.
+    RecoveryBackupExists,
+    /// Result of `Command::CreateRecoveryKey`: the new security key, shown
+    /// to the user once (the server never keeps it).
+    RecoveryKeyCreated {
+        key: String,
+    },
+    /// Result of `Command::ExportRoomKeys`: the encrypted export file's
+    /// bytes, ready for the UI to save where the user chose.
+    RoomKeysExported {
+        bytes: Vec<u8>,
     },
 
     /// Raw image bytes for a message, fetched with proper auth. `key`
